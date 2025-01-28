@@ -5,6 +5,7 @@ import torch
 import constants
 import particles
 import res_field
+import utils
 
 
 def kronecker_product(matrices: list) -> torch.Tensor:
@@ -72,7 +73,13 @@ class SpinSystem:
         self._precompute_all_operators()
 
         self.device = device
-        self.batch_shape = (1, )
+        self.batch_shape = self._get_batch_shape(self.g_tensors[0])
+
+    def _get_batch_shape(self, tensor_component):
+        shape = tensor_component.shape
+        if len(shape) > 2:
+            return shape[:-2]
+        return (1, )
 
     @property
     def dim(self) -> int:
@@ -94,7 +101,7 @@ class SpinSystem:
         for e_idx, n_idx, A in self.hyperfine_interactions:
             A = A.to(torch.complex64)
             F += scalar_tensor_multiplication(self._operator_cache[e_idx], self._operator_cache[n_idx], A)
-        F = F / constants.PLANCK
+        F = F
         return F
 
     def _build_electron_zeeman_terms(self) -> torch.Tensor:
@@ -128,7 +135,8 @@ class SpinSystem:
         """
         electron_contrib = 0
         for idx, e_idx in enumerate(self.electron_indices):
-            electron_contrib += self.particles[e_idx].spin * torch.sum(self.g_tensors[idx][..., :, 0], dim=-1).abs()
+            electron_contrib += self.particles[e_idx].spin * torch.sum(
+                self.g_tensors[idx][..., :, 0], dim=-1, keepdim=True).abs()
 
         nuclei_contrib = 0
         for idx, n_idx in enumerate(self.nucleus_indices):
@@ -141,7 +149,7 @@ class SpinSystem:
     def get_hamiltonian_terms(self) -> tuple:
         """
         Returns F, Gx, Gy, Gz.
-        F is magnetic field term
+        F is magnetic field free term
         Gx, Gy, Gz are terms multiplied to Bx, By, Bz respectively
 
         """
@@ -158,12 +166,24 @@ def system_1():
     )
     return system
 
+def system_3():
+    electron = particles.Electron(spin=1/2)
+    g_isotropic = torch.diag(torch.tensor([2.0, 2.0, 2.0], dtype=torch.float32))
+    g_tensor = torch.stack((g_isotropic, g_isotropic, g_isotropic))
+
+    system = SpinSystem(
+        particles=[electron],
+        electron_indices=[0],
+        g_tensors=[g_tensor]
+    )
+    return system
+
 
 def system_2():
     electron = particles.Electron(spin=1 / 2)
     g_isotropic = torch.diag(torch.tensor([2.0, 2.0, 2.0], dtype=torch.float32))
     nucleus = particles.Nucleus("14N")
-    A = torch.eye(3, dtype=torch.float32) * 0.1
+    A = torch.eye(3, dtype=torch.float32) * 5 * 10**10
 
     system = SpinSystem(
         particles=[electron, nucleus],
@@ -176,12 +196,10 @@ def system_2():
 if __name__ == "__main__":
     resonance_frequency = torch.tensor([9.8 * 1e9])
     B = 0.3  # T
-    B_high = torch.tensor([0.5])
+    B_high = torch.tensor([100.0])
     B_low = torch.tensor([0.2])
-    system = system_1()
+    system = system_2()
     F, Gx, Gy, Gz = system.get_hamiltonian_terms()
-    deriv_max = system.calculate_derivative_max()
-
-    tester = res_field.Tester(F=F, deriv_max=deriv_max, resonance_frequency=resonance_frequency)
-    res_field.get_resonance_intervals(tester=tester, F=F, Gz=Gz, B_low=B_low, B_high=B_high,
+    deriv_max = system.calculate_derivative_max()[..., None]
+    res_field.get_resonance_intervals(F=F, Gz=Gz, B_low=B_low, B_high=B_high, deriv_max=deriv_max,
                                             resonance_frequency=resonance_frequency)
