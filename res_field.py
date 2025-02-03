@@ -53,7 +53,8 @@ def has_sign_change(res_low: torch.Tensor, res_high: torch.Tensor) -> torch.Tens
     where K is spin system dimension
     :param res_high: resonance function for the higher magnetic field in the interval. The shape is [..., K, K],
     where K is spin system dimension
-    :return: mask with the shape [...]. If the value is True, the segment could be bisected further.
+    :return: mask with the shape [...]. If the value is True, the resonance function changes
+    sign and segment can ve bisected further
     """
     mask = ((res_low * res_high) <= 0).any(dim=(-1, -2))
     return mask
@@ -122,9 +123,12 @@ def check_resonance(eig_values_low: torch.Tensor, eig_values_high: torch.Tensor,
         eig_values_low, eig_values_high, resonance_frequency)
 
     mask_delta = has_rapid_variation(res_low, res_high, deriv_max, B_low, B_high)
+    mask_sign_change = has_sign_change(res_low, res_high)
 
-    return torch.logical_and(mask_monotonically, mask_delta)
+    return torch.logical_and(mask_monotonically, torch.where(baseline_sign_mask, mask_delta, mask_sign_change))
 
+def compute_derivative(vector, G):
+    return torch.einsum('...bi,...ij,...bj->...b', torch.conj(vector), G, vector).real
 
 # Must me rebuild to speed up.
 # 1) After each while iteration, it is possible to stack intervals to make bigger batches
@@ -140,6 +144,8 @@ def check_resonance(eig_values_low: torch.Tensor, eig_values_high: torch.Tensor,
 # Если дельта_1N >= u0, то корней может быть несколько, а может и не быть.
 # But it doesn't mean that it must be.
 # I can split the interval one more time. It can speed up the further calculations at next functions.
+# 11) Нужно сделать один базовый класс и относледоваться от него. Разделить алгоритм на случай,
+# когда baseline_sign всегда положительная или отрицательная
 def get_resonance_intervals(F: torch.Tensor, Gz: torch.Tensor,
                             B_low: torch.Tensor, B_high: torch.Tensor,
                             deriv_max: torch.Tensor, resonance_frequency: torch.Tensor):
@@ -154,7 +160,7 @@ def get_resonance_intervals(F: torch.Tensor, Gz: torch.Tensor,
     :param resonance_frequency: The resonance frequency. The shape is []
     :return:
     """
-    r_tol = 1e-4
+    r_tol = 1e-12
     max_iterations = 100
     a_tol = resonance_frequency * r_tol
 
@@ -183,12 +189,12 @@ def get_resonance_intervals(F: torch.Tensor, Gz: torch.Tensor,
         :return: epsilon is epsilon mistake. The tensor with the shape [...]
         """
 
-        derivatives_low = torch.einsum('...bi,...ij,...bj->...b', eig_vectors_low, Gz[indexes], eig_vectors_low)
-        derivatives_high = torch.einsum('...bi,...ij,...bj->...b', eig_vectors_high, Gz[indexes], eig_vectors_high)
+        derivatives_low = compute_derivative(eig_vectors_low, Gz[indexes])
+        derivatives_high = compute_derivative(eig_vectors_high, Gz[indexes])
         eig_values_estimation = 0.5 * (eig_values_high + eig_values_low) +\
                                     (B_high - B_low) / 8 * (derivatives_high - derivatives_low)
         epsilon = 2 * (eig_values_estimation - eig_values_middle).abs().max(dim=-1)[0]
-        return epsilon
+        return epsilon, (derivatives_low, derivatives_high)
 
     def update_batch(batches: list[dict], eig_values_low, eig_values_mid, eig_values_high,
                      eig_vectors_low, eig_vectors_mid, eig_vectors_high,
@@ -314,10 +320,10 @@ def get_resonance_intervals(F: torch.Tensor, Gz: torch.Tensor,
         B_high = torch.where(mask_left, B_mid[mask_xor], B_high[mask_xor])
 
         # Select corresponding eigenvalues/vectors
-        eig_values_low = torch.where(mask_left, eig_values_low[mask_xor], eig_values_mid[mask_xor])
-        eig_values_high = torch.where(mask_left, eig_values_mid[mask_xor], eig_values_high[mask_xor])
-        eig_vectors_low = torch.where(mask_left, eig_vectors_low[mask_xor], eig_vectors_mid[mask_xor])
-        eig_vectors_high = torch.where(mask_left, eig_vectors_mid[mask_xor], eig_vectors_high[mask_xor])
+        eig_values_low = torch.where(mask_left.unsqueeze(1), eig_values_low[mask_xor], eig_values_mid[mask_xor])
+        eig_values_high = torch.where(mask_left.unsqueeze(1), eig_values_mid[mask_xor], eig_values_high[mask_xor])
+        eig_vectors_low = torch.where(mask_left.unsqueeze(-1).unsqueeze(-1), eig_vectors_low[mask_xor], eig_vectors_mid[mask_xor])
+        eig_vectors_high = torch.where(mask_left.unsqueeze(-1).unsqueeze(-1), eig_vectors_mid[mask_xor], eig_vectors_high[mask_xor])
 
         # Update tracking indexes
         indexes = indexes.clone()
@@ -351,7 +357,6 @@ def get_resonance_intervals(F: torch.Tensor, Gz: torch.Tensor,
         warnings.warn("There are no resonance in the interval")
         return None
     final_batches = []
-
     current_batches = [{
         "B": (B_low[active_mask], B_high[active_mask]),
         "values": (eig_values_low[active_mask], eig_values_high[active_mask]),
@@ -373,7 +378,7 @@ def get_resonance_intervals(F: torch.Tensor, Gz: torch.Tensor,
             eig_values_mid, eig_vectors_mid = torch.linalg.eigh(F[indexes] + Gz[indexes] * B_mid)
                                                                             # It is only one single
                                                                             # point where gradient should be calculated
-            error =\
+            error, (derivatives_low, derivatives_high) =\
                 compute_error(eig_values_low, eig_values_high, eig_values_mid,
                             eig_vectors_low, eig_vectors_high,
                             B_low, B_high, indexes
@@ -381,24 +386,22 @@ def get_resonance_intervals(F: torch.Tensor, Gz: torch.Tensor,
 
             converged_mask = (error <= a_tol).any(dim=-1)
             # На этом шаге нужно также разделить инетервал на две части. eig_values_mid, eig_vectors_mid уже посчитаны!!
+            # Но нужно тогда пересчитывать derivatives
             if converged_mask.any():
-
                 indexes_conv = indexes.clone()
                 indexes_conv[indexes_conv == True] = converged_mask
-                update_batch(
-                    final_batches,
-                    eig_values_low[converged_mask], eig_values_mid[converged_mask], eig_values_high[converged_mask],
-                     eig_vectors_low[converged_mask], eig_vectors_mid[converged_mask], eig_vectors_high[converged_mask],
-                     B_low[converged_mask], B_mid[converged_mask], B_high[converged_mask],
-                     deriv_max[converged_mask], baseline_sign[converged_mask], indexes_conv,
-                     resonance_frequency)
-
+                final_batches.append({
+                    "B": (B_low[converged_mask], B_high[converged_mask]),
+                    "values": (eig_values_low[converged_mask], eig_values_high[converged_mask]),
+                    "vectors": (eig_vectors_low[converged_mask], eig_vectors_high[converged_mask]),
+                    "baseline_sign": baseline_sign[converged_mask],
+                    "indexes": indexes_conv,
+                    "derivatives": (derivatives_low, derivatives_high),
+                })
 
             active_mask = ~converged_mask
-
             if not active_mask.any():
                 continue
-
 
             # Update active components.
             B_low = B_low[active_mask]
@@ -432,16 +435,58 @@ def get_resonance_intervals(F: torch.Tensor, Gz: torch.Tensor,
     return final_batches
 
 
-# If baseline_sign == True, than only one single root can be in the interval. No looping roots.
-# Дальше проверяется, что производная не меняет знак: d <= 0
-#
-def newton_raphson_method(B_low):
-    pass
 
-def locate_resonance_fields(final_batches, resonance_frequency):
-    max_iterations = 100
+# Может это нужно делать через разреженные матрицы.... Я не понимаю...
+class ResonanceLocator:
+    def __init__(self, max_iterations=10, tolerance=1e-6, accuracy=0.001):
+        self.max_iterations = max_iterations
+        self.tolerance = tolerance
+        self.accuracy = accuracy
 
-    for batch in final_batches:
+    def _find_resonance_field_newton(self, diff_eig_low, diff_eig_high, diff_deriv_low, diff_deriv_high,
+                                resonance_frequency):
+        """
+        Finds the magnetic field value (B_mid) where a resonance occurs by solving a cubic equation
+        using the Newton–Raphson method. It suggested that the resonance point is just one
+
+        The cubic polynomial is defined by:
+            p3 * t^3 + p2 * t^2 + p1 * t + p0 = 0
+        with coefficients constructed from the input parameters:
+            p3 = 2 * diff_eig_low - 2 * diff_eig_high + diff_deriv_low + diff_deriv_high
+            p2 = -3 * diff_eig_low + 3 * diff_eig_high - 2 * diff_deriv_low - diff_deriv_high
+            p1 = diff_deriv_low
+            p0 = diff_eig_low - target_resonance
+
+        Parameters:
+            diff_eig_low (Tensor): Difference of eigenvalues at B_min for the pair, shape compatible with u and v.
+            diff_eig_high (Tensor): Difference of eigenvalues at B_max for the pair.
+            diff_deriv_low (Tensor): Difference of derivatives at B_min for the pair.
+            diff_deriv_high (Tensor): Difference of derivatives at B_max for the pair.
+            resonance_frequency (float): The resonance frequency (or energy) to be reached.
+
+        Returns:
+            Tensor: Estimated magnetic field values where resonance occurs, shape matching input pair dimensions.
+        """
+        max_iterations = 10
+        tolerance = 1e-6  # small value to avoid division by zero
+
+        coef_3 = 2 * diff_eig_low - 2 * diff_eig_high + diff_deriv_low + diff_deriv_high
+        coef_2 = -3 * diff_eig_low + 3 * diff_eig_high - 2 * diff_deriv_low - diff_deriv_high
+        coef_1 = diff_deriv_low
+        coef_0 = diff_eig_low - resonance_frequency
+
+        t = - diff_eig_low / (diff_eig_high - diff_eig_low)
+        for _ in range(max_iterations):
+            poly_val = coef_3 * t ** 3 + coef_2 * t ** 2 + coef_1 * t + coef_0
+            poly_deriv = 3 * coef_3 * t ** 2 + 2 * coef_2 * t + coef_1
+            t -= poly_val / (poly_deriv + tolerance)
+        return t
+
+    def get_resonance_mask(self, diff_eig_low, diff_eig_high, resonance_frequency):
+        sign_change_mask = ((diff_eig_low - resonance_frequency) * (diff_eig_high - resonance_frequency) <= 0)
+        return sign_change_mask
+
+    def iterate_over_batche(self, batch, resonance_frequency):
         B_low, B_high = batch["B"]
         eig_values_low, eig_values_high = batch["values"]
         eig_vectors_low, eig_vectors_high = batch["vectors"]
@@ -449,29 +494,53 @@ def locate_resonance_fields(final_batches, resonance_frequency):
         baseline_sign = batch["baseline_sign"]
         indexes = batch["indexes"]
         delta_B = B_high - B_low  # [..., 1, 1]
-
-        # Generate all u < v pairs
-        K = eig_values_low.shape[-1]
+        shape = eig_values_low.shape
+        K = shape[-1]
         u, v = torch.triu_indices(K, K, offset=1)
         num_pairs = len(u)
-        print(u.shape)
         eig_values_low = eig_values_low.unsqueeze(-2)  # [..., 1, K]
         eig_values_high = eig_values_high.unsqueeze(-2)
+
+        diff_eig_low = (eig_values_low[..., v] - eig_values_low[..., u]).squeeze(-2)
+        diff_eig_high = (eig_values_high[..., v] - eig_values_high[..., u]).squeeze(-2)
+        mask = self.get_resonance_mask(diff_eig_low, diff_eig_high, resonance_frequency)
+
+        mask = mask.flatten()  # Flatten to ensure compatibility
+        valid_indices = torch.nonzero(mask, as_tuple=True)[0]  # Get valid indices
+
+        diff_eig_low = diff_eig_low.flatten()[valid_indices]
+        diff_eig_high = diff_eig_high.flatten()[valid_indices]
+
+
         deriv_low = deriv_low.unsqueeze(-2)
         deriv_high = deriv_high.unsqueeze(-2)
 
-        a = (eig_values_low[..., v] - eig_values_low[..., u]).squeeze(-2)
-        b = (eig_values_high[..., v] - eig_values_high[..., u]).squeeze(-2)
-        c = delta_B * (deriv_low[..., v] - deriv_low[..., u]).squeeze(-2)
-        d = delta_B * (deriv_high[..., v] - deriv_high[..., u]).squeeze(-2)
-        print(a.shape)
+        diff_deriv_low = (delta_B * (deriv_low[..., v] - deriv_low[..., u])).squeeze(-2).flatten()[valid_indices]
+        diff_deriv_high = (delta_B * (deriv_high[..., v] - deriv_high[..., u])).squeeze(-2).flatten()[valid_indices]
 
-        # Cubic coefficients [p3, p2, p1, p0 - ν₀]
-        p3 = 2 * a - 2 * b + c + d
-        p2 = -3 * a + 3 * b - 2 * c - d
-        p1 = c
-        p0 = a - resonance_frequency
-        coeffs = torch.stack([p3, p2, p1, p0], dim=-1)  # [..., num_pairs, 4]
+        # Correctly apply mask to u and v
+        u = u[valid_indices]
+        v = v[valid_indices]
+        step_B = self._find_resonance_field_newton(diff_eig_low, diff_eig_high,
+                                                  diff_deriv_low, diff_deriv_high,
+                                                  resonance_frequency)
+
+        batch["u"] = u
+        batch["v"] = v
+        batch["B_res"] = B_low + step_B * delta_B
+
+
+
+# If baseline_sign == True, than only one single root can be in the interval. No looping roots.
+# Дальше проверяется, что производная не меняет знак: d <= 0
+# Есть doc документ с описанием логики работы
+def locate_resonance_fields(final_batches, resonance_frequency):
+    max_iterations = 100
+    res_loc = ResonanceLocator()
+    for batch in final_batches:
+        res_loc.iterate_over_batche(batch, resonance_frequency)
+
+
 
 
 

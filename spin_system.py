@@ -181,9 +181,9 @@ def system_3():
 
 def system_2():
     electron = particles.Electron(spin=1 / 2)
-    g_isotropic = torch.diag(torch.tensor([2.0, 2.0, 2.0], dtype=torch.float32))
-    nucleus = particles.Nucleus("14N")
-    A = torch.eye(3, dtype=torch.float32) * 5 * 10**10
+    g_isotropic = torch.diag(torch.tensor([2.0, 2.0, 2.0], dtype=torch.float32)) + torch.linspace(0.01, 0.1, 300)[..., None, None]
+    nucleus = particles.Nucleus("15N")
+    A = torch.eye(3, dtype=torch.float32) * 5 * 10**7
 
     system = SpinSystem(
         particles=[electron, nucleus],
@@ -196,8 +196,8 @@ def system_2():
 if __name__ == "__main__":
     resonance_frequency = torch.tensor([9.8 * 1e9])
     B = 0.3  # T
-    B_high = torch.tensor([100.0])
-    B_low = torch.tensor([0.2])
+    B_high = torch.tensor([100.0]).expand(300)
+    B_low = torch.tensor([0.01]).expand(300)
     system = system_2()
     F, Gx, Gy, Gz = system.get_hamiltonian_terms()
     deriv_max = system.calculate_derivative_max()[..., None]
