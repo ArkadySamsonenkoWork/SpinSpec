@@ -14,6 +14,7 @@ def apply_rotations(R: torch.Tensor, T: torch.Tensor):
     """
     return torch.einsum('rij, ...jk, rlk -> ...ril', R, T, R.transpose(-1, -2))
 
+
 def calculate_deriv_max(g_tensors_el: torch.Tensor, g_factors_nuc: torch.Tensor,
                         el_numbers: torch.Tensor, nuc_numbers: torch.Tensor) -> torch.Tensor:
     """
@@ -28,4 +29,3 @@ def calculate_deriv_max(g_tensors_el: torch.Tensor, g_factors_nuc: torch.Tensor,
     electron_contrib = (constants.BOHR / constants.PLANCK) * g_tensors_el[..., :, 0].sum(dim=-1) * el_numbers
     nuclear_contrib = (constants.NUCLEAR_MAGNETRON / constants.PLANCK) * g_factors_nuc * nuc_numbers
     return nuclear_contrib + electron_contrib
-

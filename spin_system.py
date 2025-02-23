@@ -183,7 +183,7 @@ def system_2():
     electron = particles.Electron(spin=1 / 2)
     g_isotropic = torch.diag(torch.tensor([2.0, 2.0, 2.0], dtype=torch.float32)) + torch.linspace(0.01, 3, 1000)[..., None, None]
     nucleus = particles.Nucleus("15N")
-    A = torch.eye(3, dtype=torch.float32) * 5 * 10**7
+    A = torch.eye(3, dtype=torch.float32) * 7 * 10**7
 
     system = SpinSystem(
         particles=[electron, nucleus],
@@ -201,5 +201,10 @@ if __name__ == "__main__":
     system = system_2()
     F, Gx, Gy, Gz = system.get_hamiltonian_terms()
     deriv_max = system.calculate_derivative_max()[..., None]
-    res_field.get_resonance_intervals(F=F, Gz=Gz, B_low=B_low, B_high=B_high, deriv_max=deriv_max,
-                                            resonance_frequency=resonance_frequency)
+    resonance_interval_finder = res_field.GeneralResonanceIntervalSolver()
+    baselign_sign = res_field.compute_zero_field_resonance(F, resonance_frequency)
+    res_loc = res_field.ResonanceLocator()
+    batches = resonance_interval_finder.get_resonance_intervals(F, Gz, B_low, B_high,
+                                            resonance_frequency, baselign_sign, deriv_max)
+    res_loc.locate_resonance_fields(batches, resonance_frequency)
+
