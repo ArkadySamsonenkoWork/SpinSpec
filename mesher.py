@@ -4,13 +4,25 @@ import numpy as np
 import torch
 from scipy.spatial import Delaunay
 
+# Пока реализована линейная интерполяция.
+# Как вариант - сделать интерполяцию по phi - кубическую. В таком случае удобно ввести граничные условия
+# Потом сделать интерполяцию по тета на оценках
 class Mesh(ABC):
     @abstractmethod
-    def __init__(self, eps: float = 1e-5, phi_limit: float = 2 * np.pi,
-                 initial_grid_frequency: int = 10, interpolation_grid_frequency: int = 50):
+    def __init__(self, *args, **kwargs):
         pass
 
-    def create_rotation_matrices(self, grid):
+    @property
+    @abstractmethod
+    def grid(self):
+        pass
+
+    @property
+    @abstractmethod
+    def size(self):
+        return self.grid.size()
+
+    def create_rotation_matrices(self):
         """
         Given tensors phi and theta (of the same shape), returns a tensor
         of shape (..., 3, 3) where each 3x3 matrix rotates the z-axis to the direction
@@ -24,8 +36,8 @@ class Mesh(ABC):
                         [         0, 1,          0],
                         [-sin(theta), 0, cos(theta)]]
         """
-        phi = grid[..., 0]
-        theta = grid[..., 1]
+        phi = self.grid[..., 0]
+        theta = self.grid[..., 1]
         cos_phi = torch.cos(phi)
         sin_phi = torch.sin(phi)
         cos_theta = torch.cos(theta)
@@ -48,6 +60,7 @@ class Mesh(ABC):
 
         return R
 
+
     @abstractmethod
     def interpolate(self, f_values: torch.Tensor):
         pass
@@ -59,7 +72,7 @@ class Mesh(ABC):
 
 class DelaunayMesh(Mesh):
     def __init__(self, eps: float = 1e-5, phi_limit: float = 2 * np.pi,
-                 initial_grid_frequency: int = 10, interpolation_grid_frequency: int = 50):
+                 initial_grid_frequency: int = 30, interpolation_grid_frequency: int = 20):
         """
         :param eps:
         """
@@ -78,13 +91,23 @@ class DelaunayMesh(Mesh):
         interpolation_tri = self._triangulate(interpolation_grid)
         final_simplices = interpolation_tri.simplices
         interpolation_indexes, bary_coords = self._get_interpolation_coeffs(interpolation_grid, initial_tri)
+        self.initial_simpleces = initial_tri.simplices #ПОТОМ УДАЛИТЬ!!!!!!
 
         initial_grid = torch.as_tensor(initial_grid)
         interpolation_indexes = torch.as_tensor(interpolation_indexes)
-        bary_coords = torch.as_tensor(bary_coords)
+        bary_coords = torch.as_tensor(bary_coords, dtype=torch.float32)
         final_simplices = torch.as_tensor(final_simplices)
         return initial_grid, interpolation_grid, interpolation_indexes, bary_coords, final_simplices
 
+    @property
+    def grid(self):
+        return self.initial_grid
+
+
+    #ПЕРЕДЕЛАТЬ!!!!!!!!
+    @property
+    def size(self):
+        return self.grid.size()[:-1]
 
     def create_grid(self, grid_frequency: int = 10, phi_limit: float = 2 * np.pi):
         """
@@ -95,9 +118,9 @@ class DelaunayMesh(Mesh):
         For k == 0, we only have one point (q==0).
         """
         self.phi_limit = phi_limit
-        vertices = [(0.0, 0.0), (phi_limit, 0)] +\
+        vertices = [(0.0, 0.0), (0.0, 0.001), (phi_limit, 0.001), (0.0, 0.005), (phi_limit, 0.005)] +\
                    [(phi_limit * (q / k), (np.pi / 2) * (k / (grid_frequency - 1)))
-                    for k in range(grid_frequency) for q in range(k+1)]
+                    for k in range(1, grid_frequency) for q in range(k+1)]
         return vertices
 
     def _triangulate(self, vertices):
@@ -164,7 +187,6 @@ class DelaunayMesh(Mesh):
         qp_np = qp.detach().cpu().numpy()
         simplex_indices = self._get_simplex_indexes(qp_np, tri)
 
-
         simplices = tri.simplices[simplex_indices]
         T = tri.transform[simplex_indices, :2, :]
         r = qp_np - tri.transform[simplex_indices, 2, :]
@@ -179,8 +201,8 @@ class DelaunayMesh(Mesh):
         where M is the mesh at the initial points
         :return: f_interpolated
         """
-        f_verts = f_values[self.interpolation_indexes]
-        return (f_verts * self.bary_coords).sum(dim=1)
+        f_verts = f_values[..., self.interpolation_indexes]
+        return (f_verts * self.bary_coords).sum(dim=-1)
 
     def to_delaunay(self, f_interpolated: torch.Tensor):
         """
@@ -188,7 +210,9 @@ class DelaunayMesh(Mesh):
         where M is the mesh at the initial points
         :return: f_delaunay: The shape is [..., K, 3]. Transform data into Delaunay triangulation
         """
-        return f_interpolated[self.final_simplices]
+        return f_interpolated[..., self.initial_simpleces]  # ПОТОМ УДАЛИТЬ!!!!
+
+        #return f_interpolated[..., self.final_simplices]
 
     def _angle_between(self, u, v):
         dot = (u * v).sum(dim=1)
@@ -207,10 +231,10 @@ class DelaunayMesh(Mesh):
         """
         phi = vertices[:, 0]
         theta = vertices[:, 1]
-        x = torch.cos(theta) * torch.cos(phi)
-        y = torch.cos(theta) * torch.sin(phi)
-        z = torch.sin(theta)
-        xyz = torch.stack([x, y, z], dim=1)  # shape (N, 3)
+        x = torch.sin(theta) * torch.cos(phi)
+        y = torch.sin(theta) * torch.sin(phi)
+        z = torch.cos(theta)
+        xyz = torch.stack([x, y, z], dim=1)
 
         v0 = xyz[triangles[:, 0]]
         v1 = xyz[triangles[:, 1]]
@@ -220,15 +244,16 @@ class DelaunayMesh(Mesh):
         b = self._angle_between(v2, v0)
         c = self._angle_between(v0, v1)
 
+        #It is so-called Spherical law of cosines
         alpha = torch.acos(
             torch.clamp((torch.cos(a) - torch.cos(b) * torch.cos(c)) / (torch.sin(b) * torch.sin(c)), -1.0, 1.0))
         beta = torch.acos(
             torch.clamp((torch.cos(b) - torch.cos(c) * torch.cos(a)) / (torch.sin(c) * torch.sin(a)), -1.0, 1.0))
         gamma = torch.acos(
             torch.clamp((torch.cos(c) - torch.cos(a) * torch.cos(b)) / (torch.sin(a) * torch.sin(b)), -1.0, 1.0))
-
         excess = (alpha + beta + gamma) - torch.pi
-
+        excess = torch.nan_to_num(excess, 0.00)  # НАДО РАЗОБРАТЬСЯ, ПОЧЕМУ ЕСТЬ БИТЫЕ УЧАСТКИ ПЛОЩАДИ
+        print(excess.sum())
         return excess
 
 

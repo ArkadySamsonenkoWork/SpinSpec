@@ -4,7 +4,7 @@ NUCLEAR_MAGNETRON = 5.0507837393 * 1e-27  # J * T-1
 BOLTZMANN = 1.380649 * 1e-23  # J * K-1
 
 
-def unit_converter(values, conversion=""):
+def unit_converter(values, conversion="Hz_to_K"):
     if conversion == "Hz_to_K":
         return values * PLANCK / BOLTZMANN
 

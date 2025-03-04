@@ -5,14 +5,28 @@ import torch
 import constants
 
 
-def apply_rotations(R: torch.Tensor, T: torch.Tensor):
+def apply_expanded_rotations(R: torch.Tensor, T: torch.Tensor):
     """
     Rotate tensor T with respect to rotation matrices R according formula T' = RTR'
     :param R: the rotation matrices. R' = R. The shape is [rotation_dim, 3, 3]
     :param T: tensor that must be rotated. The shape is [... 3, 3]
     :return: The rotated tensors with the shape [..., rotation_dim, 3, 3]
     """
-    return torch.einsum('rij, ...jk, rlk -> ...ril', R, T, R.transpose(-1, -2))
+    return torch.einsum('rij, ...jk, rlk -> ...ril', R, T, R)
+
+
+def apply_single_rotation(R: torch.Tensor, T: torch.Tensor):
+    """
+    Rotate tensor T with respect to rotation matrices R according formula T' = RTR'
+
+    Applies a single rotation matrix (or a batch of rotation matrices) to a tensor
+    using the transformation T' = R T R^T.
+
+    :param R: the rotation matrices. R' = R. The shape is [..., 3, 3]
+    :param T: tensor that must be rotated. The shape is [... 3, 3]
+    :return: The rotated tensors with the shape [..., 3, 3]
+    """
+    return torch.einsum('...ij, ...jk, ...lk -> ...il', R, T, R)
 
 
 def calculate_deriv_max(g_tensors_el: torch.Tensor, g_factors_nuc: torch.Tensor,
@@ -29,3 +43,4 @@ def calculate_deriv_max(g_tensors_el: torch.Tensor, g_factors_nuc: torch.Tensor,
     electron_contrib = (constants.BOHR / constants.PLANCK) * g_tensors_el[..., :, 0].sum(dim=-1) * el_numbers
     nuclear_contrib = (constants.NUCLEAR_MAGNETRON / constants.PLANCK) * g_factors_nuc * nuc_numbers
     return nuclear_contrib + electron_contrib
+
