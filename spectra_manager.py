@@ -187,50 +187,10 @@ class SpectraIntegrator:
         self.sqrt_pi = torch.tensor(math.sqrt(math.pi))
         self.two_sqrt = torch.tensor(math.sqrt(2.0))
         self.sqrt_2 = torch.sqrt(torch.tensor(2.0))
-        self.eps_val = torch.tensor(1e-12)
+        self.eps_val = torch.tensor(1e-10)
+        self.threshold = torch.tensor(1e-12)
         self.const_factor = torch.sqrt(torch.tensor(2.0 / math.pi))
-
-
-    def __integrate(self, res_fields, width, A_mean, area, B):
-        r"""
-        Computes the integral
-            I(B) = sqrt(2/pi) * (1/width) * A_mean * I_triangle(B) * area,
-        where
-        :param res_fields: The resonance fields with the shape [..., M, 3]
-        :param width: The width of transitions. The shape is [..., M]
-        :param A_mean: The intensities of transitions. The shape is [..., M]
-        :param area: The area of transitions. The shape is [M]. It is the same for all batch dimensions
-        :param B: The magnetic fields where spectra should be created.
-        :return: result: Tensor of shape (..., N) with the value of the integral for each B
-        """
-        #B = B[:10]
-
-        width = width / 1000000
-        width = self.eps_val + width * constants.PLANCK / constants.BOHR
-        res_fields, _ = torch.sort(res_fields, dim=-1, descending=True)
-        B1, B2, B3 = torch.unbind(res_fields, dim=-1)
-
-        d13 = (B1 - B3).unsqueeze(-1)
-        d23 = (B2 - B3).unsqueeze(-1)
-        d12 = (B1 - B2).unsqueeze(-1)
-
-        c = self.two_sqrt / width
-        c_exp = c.unsqueeze(-1)
-        width_exp = width.unsqueeze(-1)
-        def F(x):
-            return x * torch.erf(c_exp * x) + (width_exp / (self.two_sqrt * self.sqrt_pi)) * torch.exp(
-                - (c_exp * x) ** 2)
-
-
-        X1 = F(B1.unsqueeze(-1) - B)
-        X2 = F(B2.unsqueeze(-1) - B)
-        X3 = F(B3.unsqueeze(-1) - B)
-        term = (X1 * d23 - X2 * d13 + X3 * d12) / (d12 * d23 * d13 + self.eps_val)
-
-
-        factor = A_mean
-        result = torch.einsum('...mn,m->...n', term * factor.unsqueeze(-1), area)
-        return result
+        self.clamp = torch.tesnor(50)
 
 
     def integrate(self, res_fields, width, A_mean, area, B):
@@ -242,54 +202,42 @@ class SpectraIntegrator:
         :param width: The width of transitions. The shape is [..., M]
         :param A_mean: The intensities of transitions. The shape is [..., M]
         :param area: The area of transitions. The shape is [M]. It is the same for all batch dimensions
-        :param B: The magnetic fields where spectra should be created.
+        :param B: The magnetic fields where spectra should be created. The shape is [...., N]
         :return: result: Tensor of shape (..., N) with the value of the integral for each B
         """
-        #B = B[:10]
         width = width / 1000000
         width = self.eps_val + width * constants.PLANCK / constants.BOHR
-        res_fields, _ = torch.sort(res_fields, dim=-1, descending=True)
         B1, B2, B3 = torch.unbind(res_fields, dim=-1)
 
-        d13 = (B1 - B3).unsqueeze(-1)
-        d23 = (B2 - B3).unsqueeze(-1)
-        d12 = (B1 - B2).unsqueeze(-1)
+        d13 = (B1 - B3)
+        d23 = (B2 - B3)
+        d12 = (B1 - B2)
 
         c = self.two_sqrt / width
-        c_exp = c.unsqueeze(-1)
-        width_exp = width.unsqueeze(-1)
-        CLAMP_MIN = -50.0
-        CLAMP_MAX = 50.0
-
-        def F(x):
-            # x will be broadcast to shape compatible with c_exp
-            arg = torch.clamp(c_exp * x, CLAMP_MIN, CLAMP_MAX)
-            erf_val = torch.erf(arg)
-            exp_val = torch.exp(- arg**2)
-            return x * erf_val + (width_exp / (self.two_sqrt * self.sqrt_pi)) * exp_val
-
-        # Evaluate function F at the differences between resonance fields and magnetic fields
-        X1 = F(B1.unsqueeze(-1) - B)
-        X2 = F(B2.unsqueeze(-1) - B)
-        X3 = F(B3.unsqueeze(-1) - B)
-
-        # Compute numerator and denominator for the term of the integral
-        numerator = (X1 * d23 - X2 * d13 + X3 * d12)
         denominator = d12 * d23 * d13
 
-        # Avoid division by a near-zero denominator using a conditional threshold
-        threshold = 1e-12
-        safe_denominator = torch.where(torch.abs(denominator) < self.eps_val,
+        safe_denom = torch.where(torch.abs(denominator) < self.threshold,
                                        denominator + self.eps_val,
                                        denominator)
-        term = numerator / safe_denominator
 
-        # Multiply by the intensity factor and perform the weighted sum over transitions
-        result = torch.einsum('...mn,m->...n', term * A_mean.unsqueeze(-1), area)
+        def F(x, c_val, width_val):
+            arg = torch.clamp(c_val * x, -self.clamp, self.clamp)
+            erf_val = torch.erf(arg)
+            exp_val = torch.exp(-arg ** 2)
+            return x * erf_val + (width_val / (self.two_sqrt * self.sqrt_pi)) * exp_val
+
+        def integrand(B_val):
+            X1 = F(B1 - B_val, c, width)
+            X2 = F(B2 - B_val, c, width)
+            X3 = F(B3 - B_val, c, width)
+            num = X1 * d23 - X2 * d13 + X3 * d12
+            term = num / safe_denom
+            return (term * (A_mean * area)).sum(dim=-1)
+
+        result = torch.vmap(integrand)(B)
         return result
 
-
-    def dfgntegrate(self, res_fields, width, A_mean, area, B):
+    def ___integrate(self, res_fields, width, A_mean, area, B):
         r"""
         Computes the integral
             I(B) = sqrt(2/pi) * (1/width) * A_mean * I_triangle(B) * area,
@@ -298,42 +246,44 @@ class SpectraIntegrator:
         :param width: The width of transitions. The shape is [..., M]
         :param A_mean: The intensities of transitions. The shape is [..., M]
         :param area: The area of transitions. The shape is [M]. It is the same for all batch dimensions
-        :param B: The magnetic fields where spectra should be created.
+        :param B: The magnetic fields where spectra should be created. The shape is [...., N]
         :return: result: Tensor of shape (..., N) with the value of the integral for each B
         """
-        B = B[:10]
+        width = width / 1000000
         width = self.eps_val + width * constants.PLANCK / constants.BOHR
-        res_fields, _ = torch.sort(res_fields, dim=-1, descending=False)
+        #res_fields, _ = torch.sort(res_fields, dim=-1, descending=True)
         B1, B2, B3 = torch.unbind(res_fields, dim=-1)
 
-        d1 = B1 - B3
-        d2 = B2 - B3
-
-        denom1 = (d1 - d2) + self.eps_val
-        denom2 = d1 + self.eps_val
-        d2_safe = (d2 + self.eps_val)
+        d13 = (B1 - B3).unsqueeze(-1)
+        d23 = (B2 - B3).unsqueeze(-1)
+        d12 = (B1 - B2).unsqueeze(-1)
 
         c = self.two_sqrt / width
         c_exp = c.unsqueeze(-1)
-        width_exp = width.unsqueeze(-1)
-        def F(x):
-            return x * torch.erf(c_exp * x) + (width_exp / (self.two_sqrt * self.sqrt_pi)) * torch.exp(
-                - (c_exp * x) ** 2)
+        width_exp = width.unsqueeze(-1),
+        denominator = d12 * d23 * d13
 
+        safe_denominator = torch.where(torch.abs(denominator) < self.threshold,
+                                       denominator + self.eps_val,
+                                       denominator)
+
+        def F(x):
+            # x will be broadcast to shape compatible with c_exp
+            arg = torch.clamp(c_exp * x, -self.clamp, self.clamp)
+            erf_val = torch.erf(arg)
+            exp_val = torch.exp(- arg**2)
+            return x * erf_val + (width_exp / (self.two_sqrt * self.sqrt_pi)) * exp_val
 
         X1 = F(B1.unsqueeze(-1) - B)
         X2 = F(B2.unsqueeze(-1) - B)
         X3 = F(B3.unsqueeze(-1) - B)
+        numerator = (X1 * d23 - X2 * d13 + X3 * d12)
+        term = numerator / safe_denominator
 
-        term1 = (X1 - X2) / denom1.unsqueeze(-1)
-        term2 = (X1 - X3) / denom2.unsqueeze(-1)
-        term = term1 - term2
-        factor = A_mean / d2_safe
-        print(term * factor.unsqueeze(-1))
-        print((term1 < 0).sum())
-        print((term2 < 0).sum())
-        result = torch.einsum('...mn,m->...n', term * factor.unsqueeze(-1), area)
+        result = (term * (A_mean * area).unsqueeze(-1)).sum(dim=-2)
         return result
+
+
 
 
 
