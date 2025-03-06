@@ -13,12 +13,6 @@ class Mesh(ABC):
         pass
 
     @property
-    @abstractmethod
-    def grid(self):
-        pass
-
-    @property
-    @abstractmethod
     def size(self):
         return self.grid.size()
 
@@ -28,7 +22,7 @@ class Mesh(ABC):
         of shape (..., 3, 3) where each 3x3 matrix rotates the z-axis to the direction
         defined by the spherical angles (phi, theta).
 
-        The rotation is computed as R = R_z(phi) @ R_y(theta), where:
+        The rotation is computed as R =  R_y(theta) @ R_z(phi), where:
           R_z(phi) = [[cos(phi), -sin(phi), 0],
                       [sin(phi),  cos(phi), 0],
                       [      0,         0, 1]]
@@ -46,65 +40,150 @@ class Mesh(ABC):
         R = torch.empty(*phi.shape, 3, 3, dtype=phi.dtype, device=phi.device)
 
         R[..., 0, 0] = cos_phi * cos_theta
-        R[..., 0, 1] = -sin_phi
-        R[..., 0, 2] = cos_phi * sin_theta
+        R[..., 0, 1] = -sin_phi * cos_theta
+        R[..., 0, 2] = sin_theta
 
-        R[..., 1, 0] = sin_phi * cos_theta
+        R[..., 1, 0] = sin_phi
         R[..., 1, 1] = cos_phi
-        R[..., 1, 2] = sin_phi * sin_theta
+        R[..., 1, 2] = 0
 
         # Third row
-        R[..., 2, 0] = -sin_theta
-        R[..., 2, 1] = 0.0
+        R[..., 2, 0] = -sin_theta * cos_phi
+        R[..., 2, 1] = sin_theta * sin_phi
         R[..., 2, 2] = cos_theta
-
         return R
 
+    @staticmethod
+    def spherical_triangle_areas(vertices, triangles):
+        """
+        vertices: tensor of shape (N,2), each row is [phi, theta]
+        triangles: tensor of shape (M,3) with indices into vertices defining the triangles.
+
+        Returns:
+           areas: tensor of shape (M,) with the spherical areas of the triangles (for unit sphere).
+                  For a sphere of radius R, multiply each area by R**2.
+        """
+
+        def _angle_between(u, v):
+            dot = (u * v).sum(dim=1)
+            # Clamp the dot product to avoid numerical errors outside [-1, 1]
+            dot = torch.clamp(dot, -1.0, 1.0)
+            return torch.acos(dot)
+
+        phi = vertices[:, 0]
+        theta = vertices[:, 1]
+        x = torch.sin(theta) * torch.cos(phi)
+        y = torch.sin(theta) * torch.sin(phi)
+        z = torch.cos(theta)
+        xyz = torch.stack([x, y, z], dim=1)
+
+        v0 = xyz[triangles[:, 0]]
+        v1 = xyz[triangles[:, 1]]
+        v2 = xyz[triangles[:, 2]]
+
+        a = _angle_between(v1, v2)
+        b = _angle_between(v2, v0)
+        c = _angle_between(v0, v1)
+
+        # It is so-called Spherical law of cosines
+        alpha = torch.acos(
+            torch.clamp((torch.cos(a) - torch.cos(b) * torch.cos(c)) / (torch.sin(b) * torch.sin(c)), -1.0, 1.0))
+        beta = torch.acos(
+            torch.clamp((torch.cos(b) - torch.cos(c) * torch.cos(a)) / (torch.sin(c) * torch.sin(a)), -1.0, 1.0))
+        gamma = torch.acos(
+            torch.clamp((torch.cos(c) - torch.cos(a) * torch.cos(b)) / (torch.sin(a) * torch.sin(b)), -1.0, 1.0))
+        excess = (alpha + beta + gamma) - torch.pi
+        excess = torch.nan_to_num(excess, 0.0)  # НАДО РАЗОБРАТЬСЯ, ПОЧЕМУ ЕСТЬ БИТЫЕ УЧАСТКИ ПЛОЩАДИ
+        return excess
+
+    @property
+    @abstractmethod
+    def initial_mesh(self):
+        pass
+
+    @property
+    @abstractmethod
+    def grid(self):
+        pass
+
+    @property
+    @abstractmethod
+    def interpolated_mesh(self):
+        pass
 
     @abstractmethod
     def interpolate(self, f_values: torch.Tensor):
         pass
 
     @abstractmethod
-    def to_delaunay(self, f_interpolated: torch.Tensor):
+    def to_delaunay(self, f_interpolated: torch.Tensor, simplices: torch.Tensor):
         pass
 
 
 class DelaunayMesh(Mesh):
-    def __init__(self, eps: float = 1e-5, phi_limit: float = 2 * np.pi,
-                 initial_grid_frequency: int = 30, interpolation_grid_frequency: int = 20):
+    """Delaunay triangulation-based spherical mesh implementation."""
+
+    def __init__(self,
+                 eps: float = 1e-7,
+                 phi_limit: float = 2 * np.pi,
+                 initial_grid_frequency: int = 40,
+                 interpolation_grid_frequency: int = 20):
         """
-        :param eps:
+        Initialize Delaunay mesh parameters.
+
+        Args:
+            eps: Small epsilon value for numerical stability
+            phi_limit: Maximum value for phi coordinate (default: full circle)
+            initial_grid_frequency: Resolution of initial grid
+            interpolation_grid_frequency: Resolution of interpolation grid
         """
-        self.eps = np.array(eps)
+        super().__init__()
+        self.eps = eps
         self.phi_limit = phi_limit
         self.initial_grid_frequency = initial_grid_frequency
         self.interpolation_grid_frequency = interpolation_grid_frequency
-        self.initial_grid, self.interpolation_grid, self.interpolation_indexes,\
-            self.bary_coords, self.final_simplices = \
-            self.create_initial_cash_data()
 
-    def create_initial_cash_data(self):
+        # Initialize mesh data structures
+        (self._initial_grid,
+         self._initial_simplices,
+         self._interpolation_grid,
+         self._interpolation_indices,
+         self._barycentric_coords,
+         self._interpolation_simplices) = self.create_initial_cache_data()
+
+    def create_initial_cache_data(self) -> tuple:
+        """Create and cache initial mesh data structures."""
         initial_grid = self.create_grid(self.initial_grid_frequency, self.phi_limit)
         initial_tri = self._triangulate(initial_grid)
+
         interpolation_grid = self.create_grid(self.interpolation_grid_frequency, self.phi_limit)
         interpolation_tri = self._triangulate(interpolation_grid)
-        final_simplices = interpolation_tri.simplices
-        interpolation_indexes, bary_coords = self._get_interpolation_coeffs(interpolation_grid, initial_tri)
-        self.initial_simpleces = initial_tri.simplices #ПОТОМ УДАЛИТЬ!!!!!!
 
-        initial_grid = torch.as_tensor(initial_grid)
-        interpolation_indexes = torch.as_tensor(interpolation_indexes)
-        bary_coords = torch.as_tensor(bary_coords, dtype=torch.float32)
-        final_simplices = torch.as_tensor(final_simplices)
-        return initial_grid, interpolation_grid, interpolation_indexes, bary_coords, final_simplices
+        # Convert to tensors
+        return (
+            torch.as_tensor(initial_grid),
+            torch.as_tensor(initial_tri.simplices),
+            torch.as_tensor(interpolation_grid),
+            *self.get_interpolation_coefficients(interpolation_grid, initial_tri),
+            torch.as_tensor(interpolation_tri.simplices)
+        )
+
+    def _triangulate(self, vertices: np.ndarray) -> Delaunay:
+        """Perform Delaunay triangulation on given vertices."""
+        return Delaunay(vertices)
+
+    @property
+    def initial_mesh(self):
+        return self._initial_grid, self._initial_simplices
+
+    @property
+    def interpolated_mesh(self):
+        return self._interpolation_grid, self._interpolation_simplices
 
     @property
     def grid(self):
-        return self.initial_grid
+        return self._initial_grid
 
-
-    #ПЕРЕДЕЛАТЬ!!!!!!!!
     @property
     def size(self):
         return self.grid.size()[:-1]
@@ -118,142 +197,124 @@ class DelaunayMesh(Mesh):
         For k == 0, we only have one point (q==0).
         """
         self.phi_limit = phi_limit
-        vertices = [(0.0, 0.0), (0.0, 0.001), (phi_limit, 0.001), (0.0, 0.005), (phi_limit, 0.005)] +\
+        vertices = [(0.0, 0.0), (phi_limit, 0.001), (0.0, 0.005), (phi_limit, 0.005)] +\
                    [(phi_limit * (q / k), (np.pi / 2) * (k / (grid_frequency - 1)))
                     for k in range(1, grid_frequency) for q in range(k+1)]
+        #N = 20
+        #M = 40
+        #phi_ar = [2 * self.phi_limit * n / (N-1) for n in range(N)]
+        #theta_ar = [(np.pi / 2) * m / (M-1) for m in range(M)]
+        #vertices = [(phi, theta) for phi in phi_ar for theta in theta_ar]
         return vertices
 
-    def _triangulate(self, vertices):
+    def reflect_coordinate(self, x: torch.Tensor,
+                           lower: float, upper: float) -> torch.Tensor:
         """
-        Given an array of vertices (phi, theta), build a Delaunay triangulation.
-        """
-        tri = Delaunay(vertices)
-        return tri
+        Reflect coordinates into [lower, upper] interval.
 
-    def _get_simplex_indexes(self, qp_np: np.array, tri: Delaunay):
-        """
-        :param qp_np: array of new phi, theta points
-        :param tri: Delaunay triangulation
-        :return: indexes of Delaunay triangulation of the original mesh
-        """
-        qp_np_search = qp_np.copy()
-        mask = qp_np_search[:, 0] == 0
-        qp_np_search[mask, 0] += self.eps
-        mask = qp_np_search[:, 0] == np.pi / 2
-        qp_np_search[mask] -= self.eps
-        mask = qp_np_search[:, 1] == 0
-        qp_np_search[mask] += self.eps
-        mask = qp_np_search[:, 1] == np.pi / 2
-        qp_np_search[mask] -= self.eps
-
-        simplex_indices = tri.find_simplex(qp_np_search)
-        return simplex_indices
-
-    def reflect(self, x, interval_begin, interval_end):
-        """
-        Reflect each element of tensor x into the interval [interval_begin, interval_end].
-        (For example, if x > interval_end then x is replaced by 2*interval_end - x.)
-        This works even if x is several periods outside the interval.
-        """
-        L = interval_end - interval_begin
-        x_shifted = x - interval_begin
-        mod = 2 * L
-        x_mod = torch.remainder(x_shifted, mod)
-        x_reflected = torch.where(x_mod > L, mod - x_mod, x_mod)
-        return interval_begin + x_reflected
-
-    def _get_interpolation_coeffs(self, query_points, tri):
-        """
-        Given:
-          - query_points: (N,2) array of (phi, theta) at which to evaluate f,
-          - vertices: (M,2) array of grid points (phi, theta),
-          - f_values: (M,) array of function values at those vertices,
-          - tri: Delaunay triangulation of vertices,
-        perform:
-          - Reflection of query_points into the grid domain,
-          - For each query point, find the containing simplex and compute barycentric coordinates,
-          - For query points outside the triangulation (simplex index == -1), perform nearest–neighbor interpolation.
-        Returns:
-          A torch.Tensor of shape (N,) with the interpolated values.
-        """
-        phi_min, phi_max = 0.0, self.phi_limit
-        theta_min, theta_max = 0.0, np.pi / 2
-
-        qp = torch.as_tensor(query_points, dtype=torch.float32)
-
-        qp[:, 0] = self.reflect(qp[:, 0], phi_min, phi_max)
-        qp[:, 1] = self.reflect(qp[:, 1], theta_min, theta_max)
-
-        qp_np = qp.detach().cpu().numpy()
-        simplex_indices = self._get_simplex_indexes(qp_np, tri)
-
-        simplices = tri.simplices[simplex_indices]
-        T = tri.transform[simplex_indices, :2, :]
-        r = qp_np - tri.transform[simplex_indices, 2, :]
-        bary = np.einsum('nij,nj->ni', T, r)  # (n_valid,2)
-        bary_coords = np.hstack((bary, 1 - bary.sum(axis=1, keepdims=True)))  # shape (n, 3)
-
-        return simplices, bary_coords
-
-    def interpolate(self, f_values: torch.Tensor):
-        """
-        :param f_values: the function to interpolate. The shape is [..., M]
-        where M is the mesh at the initial points
-        :return: f_interpolated
-        """
-        f_verts = f_values[..., self.interpolation_indexes]
-        return (f_verts * self.bary_coords).sum(dim=-1)
-
-    def to_delaunay(self, f_interpolated: torch.Tensor):
-        """
-        :param f_interpolated: the function to interpolate. The shape is [..., N]
-        where M is the mesh at the initial points
-        :return: f_delaunay: The shape is [..., K, 3]. Transform data into Delaunay triangulation
-        """
-        return f_interpolated[..., self.initial_simpleces]  # ПОТОМ УДАЛИТЬ!!!!
-
-        #return f_interpolated[..., self.final_simplices]
-
-    def _angle_between(self, u, v):
-        dot = (u * v).sum(dim=1)
-        # Clamp the dot product to avoid numerical errors outside [-1, 1]
-        dot = torch.clamp(dot, -1.0, 1.0)
-        return torch.acos(dot)
-
-    def spherical_triangle_areas(self, vertices, triangles):
-        """
-        vertices: tensor of shape (N,2), each row is [phi, theta]
-        triangles: tensor of shape (M,3) with indices into vertices defining the triangles.
+        Args:
+            x: Input tensor
+            lower: Interval lower bound
+            upper: Interval upper bound
 
         Returns:
-           areas: tensor of shape (M,) with the spherical areas of the triangles (for unit sphere).
-                  For a sphere of radius R, multiply each area by R**2.
+            torch.Tensor: Reflected coordinates
         """
-        phi = vertices[:, 0]
-        theta = vertices[:, 1]
-        x = torch.sin(theta) * torch.cos(phi)
-        y = torch.sin(theta) * torch.sin(phi)
-        z = torch.cos(theta)
-        xyz = torch.stack([x, y, z], dim=1)
+        interval_length = upper - lower
+        x_shifted = x - lower
+        x_mod = torch.remainder(x_shifted, 2 * interval_length)
+        return lower + torch.where(x_mod > interval_length,
+                                   2 * interval_length - x_mod,
+                                   x_mod)
 
-        v0 = xyz[triangles[:, 0]]
-        v1 = xyz[triangles[:, 1]]
-        v2 = xyz[triangles[:, 2]]
+    def get_interpolation_coefficients(self,
+                                       query_points: np.ndarray,
+                                       triangulation: Delaunay) -> tuple:
+        """
+        Compute barycentric interpolation coefficients for query points.
 
-        a = self._angle_between(v1, v2)
-        b = self._angle_between(v2, v0)
-        c = self._angle_between(v0, v1)
+        Args:
+            query_points: Points to interpolate (N, 2)
+            triangulation: Delaunay triangulation of original grid
 
-        #It is so-called Spherical law of cosines
-        alpha = torch.acos(
-            torch.clamp((torch.cos(a) - torch.cos(b) * torch.cos(c)) / (torch.sin(b) * torch.sin(c)), -1.0, 1.0))
-        beta = torch.acos(
-            torch.clamp((torch.cos(b) - torch.cos(c) * torch.cos(a)) / (torch.sin(c) * torch.sin(a)), -1.0, 1.0))
-        gamma = torch.acos(
-            torch.clamp((torch.cos(c) - torch.cos(a) * torch.cos(b)) / (torch.sin(a) * torch.sin(b)), -1.0, 1.0))
-        excess = (alpha + beta + gamma) - torch.pi
-        excess = torch.nan_to_num(excess, 0.00)  # НАДО РАЗОБРАТЬСЯ, ПОЧЕМУ ЕСТЬ БИТЫЕ УЧАСТКИ ПЛОЩАДИ
-        print(excess.sum())
-        return excess
+        Returns:
+            tuple: (simplex indices, barycentric coordinates)
+        """
+        query_tensor = torch.as_tensor(query_points, dtype=torch.float32)
+
+        # Reflect coordinates into valid range
+        query_tensor[:, 0] = self.reflect_coordinate(query_tensor[:, 0],
+                                                     0.0, self.phi_limit)
+        query_tensor[:, 1] = self.reflect_coordinate(query_tensor[:, 1],
+                                                     0.0, np.pi / 2)
+
+        # Find containing simplices
+        simplex_indices = self.find_containing_simplices(
+            query_tensor.numpy(), triangulation)
+
+        # Compute barycentric coordinates
+        transforms = triangulation.transform[simplex_indices, :2, :]
+        offsets = query_tensor.numpy() - triangulation.transform[simplex_indices, 2, :]
+        bary = np.einsum('nij,nj->ni', transforms, offsets)
+        bary_coords = np.hstack([bary, 1 - bary.sum(axis=1, keepdims=True)])
+
+        return triangulation.simplices[simplex_indices], bary_coords
+
+    def find_containing_simplices(self,
+                                  query_points: np.ndarray,
+                                  triangulation: Delaunay) -> np.ndarray:
+        """
+        Find simplices containing query points with boundary handling.
+
+        Args:
+            query_points: Points to locate (N, 2)
+            triangulation: Delaunay triangulation to search
+
+        Returns:
+            np.ndarray: Indices of containing simplices
+        """
+        adjusted_points = query_points.copy()
+
+        # Handle boundary points by small perturbations
+        boundaries = {
+            'phi_low': (adjusted_points[:, 0] == 0, self.eps),
+            'phi_high': (adjusted_points[:, 0] == self.phi_limit, -self.eps),
+            'theta_low': (adjusted_points[:, 1] == 0, self.eps),
+            'theta_high': (adjusted_points[:, 1] == np.pi / 2, -self.eps)
+        }
+
+        for mask, delta in boundaries.values():
+            adjusted_points[mask] += delta
+
+        return triangulation.find_simplex(adjusted_points)
+
+    def interpolate(self, f_values: torch.Tensor) -> torch.Tensor:
+        """
+        Interpolate function values using barycentric coordinates.
+
+        Args:
+            f_values: Function values at initial grid points
+
+        Returns:
+            torch.Tensor: Interpolated values at query points
+        """
+        return (f_values[..., self._interpolation_indices] *
+                self._barycentric_coords).sum(dim=-1)
+
+    def to_delaunay(self,
+                    f_interpolated: torch.Tensor,
+                    simplices: torch.Tensor) -> torch.Tensor:
+        """
+        Format interpolated values for Delaunay representation.
+
+        Args:
+            f_interpolated: Interpolated function values
+            simplices: Simplices to use for final representation
+
+        Returns:
+            torch.Tensor: Values formatted for Delaunay triangulation
+        """
+        return f_interpolated[..., simplices]
+
 
 

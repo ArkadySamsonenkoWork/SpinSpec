@@ -1,6 +1,7 @@
 import functools
 import itertools
 from abc import ABC, abstractmethod
+import copy
 
 import torch
 
@@ -73,7 +74,7 @@ class BaseInteraction(ABC):
 
     @property
     @abstractmethod
-    def batche_shape(self):
+    def config_shape(self):
         pass
 
 
@@ -92,7 +93,6 @@ class Interaction(BaseInteraction):
                              "Please point it as alpha, beta, gamma Euler angles.")
         else:
             self._frame = frame
-
         if (strain is None) or (strain.shape == self.shape):
             self.strain = strain
             if self.strain is not None:
@@ -100,7 +100,6 @@ class Interaction(BaseInteraction):
         else:
             raise ValueError("The strain shape must be equal to shape of the initial components."
                              "Please point it as x, y, z components")
-
         self._rot_matrix = self.euler_to_rotmat(self._frame)
 
     @property
@@ -133,7 +132,6 @@ class Interaction(BaseInteraction):
             torch.stack([sa * cb, sa * sb * sg + ca * cg, sa * sb * cg - ca * sg], dim=-1),
             torch.stack([-sb, cb * sg, cb * cg], dim=-1)
         ], dim=-2)
-
         return R.to(torch.complex64)
 
     def _tensor(self):
@@ -162,15 +160,15 @@ class Interaction(BaseInteraction):
         return self._strained_tensor()
 
     @property
-    def batche_shape(self):
+    def config_shape(self):
         return self.shape[:-1]
 
 
 class MultiOrientedInteraction(BaseInteraction):
-    def __init__(self, base_tensor, base_strained_tensor, base_batche_shape):
-        self._oriented_tensor = base_tensor
-        self._strained_tensor = base_strained_tensor
-        self._batche_shape = base_batche_shape
+    def __init__(self, oriented_tensor, strained_tensor, config_shape):
+        self._oriented_tensor = oriented_tensor
+        self._strained_tensor = strained_tensor
+        self._config_shape = config_shape
 
     @property
     def tensor(self):
@@ -181,28 +179,38 @@ class MultiOrientedInteraction(BaseInteraction):
         return self._strained_tensor
 
     @property
-    def batche_shape(self):
-        return self._batche_shape[:-1]
+    def config_shape(self):
+        return self.tensor.shape[:-2]
 
 
 class SpinSystem:
     """Represents a spin system with electrons, nuclei, and interactions."""
     def __init__(self, electrons: list[particles.Electron], g_tensors: list[BaseInteraction],
-                 hyperfine_interactions: list[tuple[int, int, BaseInteraction]] | None = None,
+                 electron_nuclei: list[tuple[int, int, BaseInteraction]] | None = None,
+                 electron_electron: list[tuple[int, int, BaseInteraction]] | None = None,
+                 nuclei_nuclei: list[tuple[int, int, BaseInteraction]] | None = None,
                  nuclei: list[particles.Nucleus] | None = None,
                  device=torch.device("cpu")):
+
         self.electrons = electrons
         self.g_tensors = g_tensors
         self.nuclei = nuclei if nuclei else []
-        self.hyperfine_interactions = hyperfine_interactions if hyperfine_interactions else []
+
+        self.electron_nuclei = electron_nuclei if electron_nuclei else []
+        self.electron_electron = electron_electron if electron_electron else []
+        self.nuclei_nuclei = nuclei_nuclei if nuclei_nuclei else []
+
         if len(self.g_tensors) != len(self.electrons):
             raise ValueError("the number of g tensors must be equal to the number of electrons")
 
         self._operator_cache = {}  # Format: {particle_idx: tensor}
         self._precompute_all_operators()
-
         self.device = device
-        self.batch_shape = self.g_tensors[0].batche_shape
+
+    @property
+    def config_shape(self) -> int:
+        """shape of the tensor"""
+        return self.g_tensors[0].config_shape
 
     @property
     def dim(self) -> int:
@@ -210,6 +218,10 @@ class SpinSystem:
         return torch.prod(
             torch.tensor([int(2 * p.spin + 1) for p in itertools.chain(self.electrons, self.nuclei)])
         ).item()
+
+    @property
+    def operator_cache(self):
+        return self._operator_cache
 
     #  Нужно передалать функцию, слишком много циклов. Можно улучшить
     def _precompute_all_operators(self):
@@ -220,34 +232,78 @@ class SpinSystem:
             for axis, mat in zip(['x', 'y', 'z'], p.spin_matrices):
                 operator = create_operator(particels, idx, mat)
                 axis_cache.append(operator)
-            self._operator_cache[idx] = torch.stack(axis_cache, dim=-3)  # Сейчас каждый спин даёт матрицу [K, K] и
+            self.operator_cache[idx] = torch.stack(axis_cache, dim=-3)  # Сейчас каждый спин даёт матрицу [K, K] и
                                                                          # расчёт взаимодействией не оптимальный
+
+class BaseSample():
+    def __init__(self, spin_system: SpinSystem, *args, **kwargs):
+        self.spin_system = copy.deepcopy(spin_system)
+
+    @property
+    def config_shape(self):
+        return self.spin_system.config_shape
+
+    def build_electron_electron(self) -> torch.Tensor:
+        """Constructs the zero-field Hamiltonian F."""
+        F = torch.zeros((*self.config_shape, self.spin_system.dim, self.spin_system.dim), dtype=torch.complex64,
+                        device=self.spin_system.device)
+        for e_idx_1, e_idx_2, interaction in self.spin_system.electron_electron:
+            interaction = interaction.tensor
+            F += scalar_tensor_multiplication(
+                self.spin_system.operator_cache[e_idx_1],
+                self.spin_system.operator_cache[e_idx_2],
+                interaction)
+        return F
+
+    def build_electron_nuclei(self) -> torch.Tensor:
+        """Constructs the zero-field Hamiltonian F."""
+        F = torch.zeros((*self.config_shape, self.spin_system.dim, self.spin_system.dim), dtype=torch.complex64,
+                        device=self.spin_system.device)
+        for e_idx, n_idx, interaction in self.spin_system.electron_nuclei:
+            interaction = interaction.tensor
+            F += scalar_tensor_multiplication(
+                self.spin_system.operator_cache[e_idx],
+                self.spin_system.operator_cache[len(self.spin_system.electrons) + n_idx],
+                interaction)
+        return F
+
+    def build_nuclei_nuclei(self) -> torch.Tensor:
+        """Constructs the zero-field Hamiltonian F."""
+        F = torch.zeros((*self.config_shape, self.spin_system.dim, self.spin_system.dim), dtype=torch.complex64,
+                        device=self.spin_system.device)
+        for n_idx_1, n_idx_2, interaction in self.spin_system.electron_nuclei:
+            interaction = interaction.tensor
+            F += scalar_tensor_multiplication(
+                self.spin_system.operator_cache[len(self.spin_system.electrons) + n_idx_1],
+                self.spin_system.operator_cache[len(self.spin_system.electrons) + n_idx_2],
+                interaction)
+        return F
+
+    def build_first_order_interactions(self) -> torch.Tensor:
+        """Constructs the zero-field Hamiltonian F of the first order operators"""
+        return self.build_nuclei_nuclei() + self.build_electron_nuclei() + self.build_electron_electron()
 
     def build_zero_field_term(self) -> torch.Tensor:
         """Constructs the zero-field Hamiltonian F."""
-        F = torch.zeros((*self.batch_shape, self.dim, self.dim), dtype=torch.complex64, device=self.device)
-        for e_idx, n_idx, A in self.hyperfine_interactions:
-            A = A.tensor
-            F += scalar_tensor_multiplication(self._operator_cache[e_idx],
-                                              self._operator_cache[len(self.electrons) + n_idx], A)
-        F = F
-        return F
+        return self.build_first_order_interactions()
 
     def _build_electron_zeeman_terms(self) -> torch.Tensor:
         """Constructs the Zeeman interaction terms Gx, Gy, Gz. for electron spins with give g-tensors"""
-        G = torch.zeros((*self.batch_shape, 3, self.dim, self.dim), dtype=torch.complex64, device=self.device)
-        for idx, g_tensor in enumerate(self.g_tensors):
+        G = torch.zeros((*self.config_shape, 3, self.spin_system.dim, self.spin_system.dim), dtype=torch.complex64,
+                        device=self.spin_system.device)
+        for idx, g_tensor in enumerate(self.spin_system.g_tensors):
             g = g_tensor.tensor
-            G += transform_tensor_components(self._operator_cache[idx], g)
+            G += transform_tensor_components(self.spin_system.operator_cache[idx], g)
         G *= (constants.BOHR / constants.PLANCK)
         return G
 
     def _build_nucleus_zeeman_terms(self) -> torch.Tensor:
         """Constructs the Nucleus interaction terms Gx, Gy, Gz. for nucleus spins"""
-        G = torch.zeros((*self.batch_shape, 3, self.dim, self.dim), dtype=torch.complex64, device=self.device)
-        for idx, nucleus in enumerate(self.nuclei):
+        G = torch.zeros((*self.config_shape, 3, self.spin_system.dim, self.spin_system.dim), dtype=torch.complex64,
+                        device=self.spin_system.device)
+        for idx, nucleus in enumerate(self.spin_system.nuclei):
             g = nucleus.g_factor
-            G += self._operator_cache[len(self.electrons) + idx] * g
+            G += self.spin_system.operator_cache[len(self.spin_system.electrons) + idx] * g
         G *= (constants.NUCLEAR_MAGNETRON / constants.PLANCK)
         return G
 
@@ -263,47 +319,16 @@ class SpinSystem:
         :return: the maximum value of the energy derivatives with respect to magnetic field
         """
         electron_contrib = 0
-        for idx, electron in enumerate(self.electrons):
+        for idx, electron in enumerate(self.spin_system.electrons):
             electron_contrib += electron.spin * torch.sum(
-                self.g_tensors[idx].tensor[..., :, 0], dim=-1, keepdim=True).abs()
+                self.spin_system.g_tensors[idx].tensor[..., :, 0], dim=-1, keepdim=True).abs()
 
         nuclei_contrib = 0
-        for idx, nucleus in enumerate(self.nuclei):
+        for idx, nucleus in enumerate(self.spin_system.nuclei):
             nuclei_contrib += nucleus.spin * nucleus.g_factor.abs()
 
         return (electron_contrib * (constants.BOHR / constants.PLANCK) +
             nuclei_contrib * (constants.NUCLEAR_MAGNETRON / constants.PLANCK)).unsqueeze(-1)
-
-
-    # Потом нужно переделать. Есть небольшой оверхэд
-    def build_field_dep_stained(self):
-        """
-        Calculate electron Zeeman field dependant strained part
-        :return:
-        """
-        for idx, g_tensor in enumerate(self.g_tensors):
-            g = g_tensor.strained_tensor
-            if g is None:
-                pass
-            else:
-                for part in range(3):
-                    # yield transform_tensor_components(self._operator_cache[idx], g[..., part, :, :])[..., 2, :, :] *\
-                    #    (constants.BOHR / constants.PLANCK)
-                    yield torch.einsum("...j, jkl->...kl", g[..., part, 2, :], self._operator_cache[idx]) *\
-                        (constants.BOHR / constants.PLANCK)
-
-    def build_zero_field_stained(self) -> torch.Tensor:
-        """Constructs the zero-field strained part."""
-        for e_idx, n_idx, hyperfine in self.hyperfine_interactions:
-            hyperfine_stained = hyperfine.strained_tensor
-            if hyperfine_stained is None:
-                pass
-            else:
-                for part in range(3):
-                    yield scalar_tensor_multiplication(
-                        self._operator_cache[e_idx],
-                        self._operator_cache[len(self.electrons) + n_idx],
-                        hyperfine_stained[..., part, :, :])
 
     def get_hamiltonian_terms(self) -> tuple:
         """
@@ -315,163 +340,123 @@ class SpinSystem:
         return self.build_zero_field_term(), *self.build_zeeman_terms()
 
 
-
-class MultiOrientedSystem():
-    def __init__(self, spin_system: SpinSystem, humiltonian_strained: torch.Tensor, rotation_matrices: torch.Tensor):
-        self.humiltonian_strained =\
-            (self._expand_hamiltonian(humiltonian_strained,
-                                      self.orientation_vector(rotation_matrices)
-                                      ) ** 2).sum(dim=-1).square()
-        self.spin_system = spin_system
-        self.replace_to_oriented_interactions(rotation_matrices)
-
-
-    def _expand_hamiltonian(self, humiltonian_strained, orientation_vector):
-        return torch.einsum("...i, ri -> ...ri", humiltonian_strained, orientation_vector)
-
-
-    def replace_to_oriented_interactions(self, rotation_matrices):
-        rotation_matrices = rotation_matrices.to(torch.complex64)
-        batche_shape = torch.Size([*self.spin_system.batch_shape, rotation_matrices.shape[0]])
-        self.spin_system.batch_shape = batche_shape
-
-        g_tensors = [g_tensor.tensor for g_tensor in self.spin_system.g_tensors]
-        g_strained = [
-            g_tensor.strained_tensor for g_tensor in self.spin_system.g_tensors if g_tensor.strained_tensor is not None]
-        hyperfine_tensors = [interaction[-1].tensor for interaction in self.spin_system.hyperfine_interactions]
-        hyperfine_strained = [
-            interaction[-1].strained_tensor for interaction in self.spin_system.hyperfine_interactions
-            if interaction[-1].strained_tensor is not None]
-        interactions = torch.stack((*g_tensors, *hyperfine_tensors), dim=0)
-        interactions = utils.apply_expanded_rotations(rotation_matrices, interactions)
-        g_tensors, hyperfine_interactions =\
-            torch.split(interactions, [len(g_tensors), len(hyperfine_tensors)], dim=0)
-
-        to_stain = (*g_strained, *hyperfine_strained)
-        if to_stain:
-            strained = torch.stack(to_stain, dim=0)
-            strained = utils.apply_expanded_rotations(rotation_matrices, strained)
-            strained = strained.transpose(-3, -4)
-            g_strained, hyperfine_strained =\
-                torch.split(strained, [len(g_strained), len(hyperfine_strained)], dim=0)
-        else:
-            g_strained = [None]
-            hyperfine_strained = [None]
-
-        for idx in range(len(self.spin_system.g_tensors)):
-            strained_idx = 0
-            if self.spin_system.g_tensors[idx].strained_tensor is not None:
-                self.spin_system.g_tensors[idx] =\
-                    MultiOrientedInteraction(g_tensors[idx], g_strained[strained_idx], batche_shape)
-                strained_idx += 1
-            else:
-                self.spin_system.g_tensors[idx] =\
-                    MultiOrientedInteraction(g_tensors[idx], None, batche_shape)
-
-
-        for idx in range(len(self.spin_system.hyperfine_interactions)):
-            strained_idx = 0
-            el, nucs, interaction = self.spin_system.hyperfine_interactions[idx]
-            if interaction.strained_tensor is not None:
-                self.spin_system.hyperfine_interactions[idx] = \
-                    (el, nucs, MultiOrientedInteraction(hyperfine_interactions[idx],
-                                                        hyperfine_strained[strained_idx], batche_shape))
-                strained_idx += 1
-            else:
-                self.spin_system.hyperfine_interactions[idx] = \
-                    (el, nucs, MultiOrientedInteraction(hyperfine_interactions[idx], None, batche_shape))
-                strained_idx += 1
-
-    def get_hamiltonian_terms(self) -> tuple:
-        """
-        Returns F, Gx, Gy, Gz.
-        F is magnetic field free term
-        Gx, Gy, Gz are terms multiplied to Bx, By, Bz respectively
-
-        """
-        return self.spin_system.get_hamiltonian_terms()
-
-
-    def calculate_derivative_max(self) -> tuple:
-        """
-        Calculate the maximum value of the energy derivatives with respect to magnetic field.
-        It is assumed that B has direction along z-axis
-        :return: the maximum value of the energy derivatives with respect to magnetic field
-        """
-        return self.spin_system.calculate_derivative_max()
-
-
     def build_field_dep_stained(self):
         """
         Calculate electron Zeeman field dependant strained part
         :return:
         """
-        return self.spin_system.build_field_dep_stained()
-
+        for idx, g_tensor in enumerate(self.spin_system.g_tensors):
+            g = g_tensor.strained_tensor
+            if g is None:
+                pass
+            else:
+                for part in range(3):
+                    yield torch.einsum("...j, jkl->...kl", g[..., part, 2, :], self.spin_system.operator_cache[idx])
 
     def build_zero_field_stained(self) -> torch.Tensor:
         """Constructs the zero-field strained part."""
-        return self.spin_system.build_zero_field_stained()
+        for e_idx, n_idx, electron_nuclei in self.spin_system.electron_nuclei:
+            electron_nuclei = electron_nuclei.strained_tensor
+            if electron_nuclei is None:
+                pass
+            else:
+                for part in range(3):
+                    result = scalar_tensor_multiplication(
+                        self.spin_system.operator_cache[e_idx],
+                        self.spin_system.operator_cache[len(self.spin_system.electrons) + n_idx],
+                        electron_nuclei[..., part, :, :])
+                    yield result
+
+
+
+class SpinSystemOrientator:
+    def __call__(self, spin_system: SpinSystem, rotation_matrices: torch.Tensor) -> SpinSystem:
+        """
+        :param spin_system: spin_system with interactions
+        :param rotation_matrices: rotation_matrices that rotate spin system
+        :return: modified spin system with all rotated interactions
+        """
+        spin_system = self.transform_spin_system_to_oriented(copy.deepcopy(spin_system), rotation_matrices)
+        return spin_system
+
+    def interactions_to_multioriented(self, interactions: list[BaseInteraction], rotation_matrices: torch.Tensor):
+        interactions_tensors = torch.stack([interaction.tensor for interaction in interactions], dim=0)
+        interactions_tensors = utils.apply_expanded_rotations(rotation_matrices, interactions_tensors)
+        not_none_strained = [
+            interaction.strained_tensor for interaction in interactions if interaction.strained_tensor is not None
+        ]
+        none_strained_flag = [
+            True if interaction.strained_tensor is None else False for interaction in interactions
+        ]
+        if not_none_strained:
+            strained_tensors = torch.stack(not_none_strained, dim=0)
+            strained_tensors = utils.apply_expanded_rotations(rotation_matrices, strained_tensors)
+            strained_tensors = strained_tensors.transpose(-3, -4)
+            strained_iterator = iter(strained_tensors)
+            strined_res = [None if x else next(strained_iterator) for x in none_strained_flag]
+        else:
+            strined_res = [None] * len(interactions)
+        return interactions_tensors, strined_res
+
+
+    def _apply_reverse_transform(self, spin_system: SpinSystem, new_interactions: list):
+        # Determine how many interactions belong to each original group.
+        num_g = len(spin_system.g_tensors)
+        num_nuc = len(spin_system.electron_nuclei)
+        num_el = len(spin_system.electron_electron)
+
+        # Split the new interactions list into the three groups.
+        new_g_tensors = new_interactions[:num_g]
+        new_electron_nuclei = new_interactions[num_g:num_g + num_nuc]
+        new_electron_electron = new_interactions[num_g + num_nuc:]
+
+        spin_system.g_tensors = [
+            interaction for interaction in new_g_tensors
+        ]
+        spin_system.electron_nuclei = [
+            (x, y, interaction) for (x, y, _), interaction in zip(spin_system.electron_nuclei, new_electron_nuclei)
+        ]
+        spin_system.electron_electron = [
+            (x, y, interaction) for (x, y, _), interaction in zip(spin_system.electron_electron, new_electron_electron)
+        ]
+        return spin_system
+
+    def transform_spin_system_to_oriented(self, spin_system: SpinSystem, rotation_matrices: torch.Tensor):
+        rotation_matrices = rotation_matrices.to(torch.complex64)
+        config_shape = torch.Size([*spin_system.config_shape, rotation_matrices.shape[0]])
+        interactions = [g_tensor for g_tensor in spin_system.g_tensors] + \
+                       [el_nuc[-1] for el_nuc in spin_system.electron_nuclei] +\
+                       [el_el[-1] for el_el in spin_system.electron_electron]
+        interactions_tensors, strained_tensors = self.interactions_to_multioriented(interactions, rotation_matrices)
+        interactions =\
+            [MultiOrientedInteraction(interactions_tensor, strained_tensor, config_shape) for
+             interactions_tensor, strained_tensor in zip(interactions_tensors, strained_tensors)]
+        spin_system = self._apply_reverse_transform(spin_system, interactions)
+        return spin_system
+
+
+
+
+
+class MultiOrientedSample(BaseSample):
+    def __init__(self, spin_system: SpinSystem, humiltonian_strained: torch.Tensor, rotation_matrices: torch.Tensor):
+        super().__init__(spin_system)
+        self.humiltonian_strained = self._expand_hamiltonian(
+            humiltonian_strained,
+            self.orientation_vector(rotation_matrices)
+        )
+        self.spin_system = SpinSystemOrientator()(spin_system, rotation_matrices)
+
+
+
+    def _expand_hamiltonian(self, humiltonian_strained, orientation_vector):
+        return torch.einsum("...i, ri -> ...r", humiltonian_strained**2, orientation_vector**2).sqrt()
 
     def orientation_vector(self, rotation_matrices):
         return rotation_matrices[..., :, -1]
 
+
     def build_hamiltonian_stained(self) -> torch.Tensor:
         """Constructs the zero-field strained part."""
-
         return self.humiltonian_strained
-
-
-def system_1():
-    electron = particles.Electron(spin=1/2)
-    g_isotropic = torch.diag(torch.tensor([2.0, 2.0, 2.0], dtype=torch.float32))
-
-    system = SpinSystem(
-        particles=[electron],
-        electron_indices=[0],
-        g_tensors=[g_isotropic]
-    )
-    return system
-
-def system_3():
-    electron = particles.Electron(spin=1/2)
-    g_isotropic = torch.diag(torch.tensor([2.0, 2.0, 2.0], dtype=torch.float32))
-    g_tensor = torch.stack((g_isotropic, g_isotropic, g_isotropic))
-
-    system = SpinSystem(
-        particles=[electron],
-        electron_indices=[0],
-        g_tensors=[g_tensor]
-    )
-    return system
-
-
-def system_2():
-    electron = particles.Electron(spin=1 / 2)
-    g_isotropic = torch.diag(torch.tensor([2.0, 2.0, 2.0], dtype=torch.float32)) + torch.linspace(0.01, 3, 1000)[..., None, None]
-    nucleus = particles.Nucleus("15N")
-    A = torch.eye(3, dtype=torch.float32) * 7 * 10**7
-
-    system = SpinSystem(
-        particles=[electron, nucleus],
-        electron_indices=[0],
-        g_tensors=[g_isotropic],
-        hyperfine_interactions=[(0, 1, A)]
-    )
-    return system
-
-if __name__ == "__main__":
-    resonance_frequency = torch.tensor([9.8 * 1e9])
-    B = 0.3  # T
-    B_high = torch.tensor([100.0]).expand(1000)
-    B_low = torch.tensor([0.01]).expand(1000)
-    system = system_2()
-    F, Gx, Gy, Gz = system.get_hamiltonian_terms()
-    deriv_max = system.calculate_derivative_max()[..., None]
-    resonance_interval_finder = res_field.GeneralResonanceIntervalSolver()
-    baselign_sign = res_field.compute_zero_field_resonance(F, resonance_frequency)
-    res_loc = res_field.ResonanceLocator()
-    batches = resonance_interval_finder.get_resonance_intervals(F, Gz, B_low, B_high,
-                                            resonance_frequency, baselign_sign, deriv_max)
-    res_loc.locate_resonance_fields(batches, resonance_frequency)
 

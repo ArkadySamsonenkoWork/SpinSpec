@@ -46,17 +46,16 @@ class Broadening:
         ).square()
 
     def __call__(self, system, vector_down, vector_up, B_trans, indexes):
-        straine_field = sum(
+        strained_field = sum(
             self._compute_field_straine_square(straine, vector_down, vector_up, B_trans, indexes) for straine in system.build_field_dep_stained()
         )
-        straine_free = sum(
+        strained_free = sum(
             self._compute_field_free_straine_square(straine, vector_down, vector_up, indexes) for straine in system.build_zero_field_stained()
         )
-        return straine_field + straine_free
+        return strained_field + strained_free
 
     def add_hamiltonian_stained(self, system, squared_width):
         hamiltonian_width = system.build_hamiltonian_stained().unsqueeze(-1).square()
-
         return (squared_width + hamiltonian_width).sqrt()
 
 
@@ -91,17 +90,40 @@ class IntensitiesCalculator:
 
 # В каждом батче тоже лучше "обрезать" малые интенсивности.
 class SpectraCreator:
-    def __init__(self, spin_system_dim, batch_dims, mesh: Mesh):
+    def __init__(self, spin_system_dim, batch_dims, mesh: Mesh, interpolate: bool = False):
         self.threshold = torch.tensor(1e-3)
         self.spin_system_dim = spin_system_dim  # Как-то поменять
+        self.mesh_size = mesh.size
         self.batch_dims = batch_dims
         self.intensity_calculator = IntensitiesCalculator()
         self.broader = Broadening()
         self.mesh = mesh
         self.spectra_integrator = SpectraIntegrator()
         self.res_field = res_field_algorithm.ResField()
+        self.interpolate = interpolate
 
-    # ТОЖЕ ПЕРЕДЕЛАТЬ ЛОГИКУ
+    def _transform_data_to_delaunay_format(self, res_fields, intensities, width):
+        batched_matrix = torch.stack((res_fields, intensities, width), dim=-3)
+        if self.interpolate:
+            batched_matrix = self.mesh.interpolate(batched_matrix.transpose(-1, -2))
+            grid, simplices = self.mesh.interpolated_mesh
+        else:
+            batched_matrix = batched_matrix.transpose(-1, -2)
+            grid, simplices = self.mesh.initial_mesh
+
+        batched_matrix = self.mesh.to_delaunay(batched_matrix, simplices)
+        expanded_size = batched_matrix.shape[-3]
+        batched_matrix = batched_matrix.flatten(-3, -2)
+        res_fields, intensities, width = torch.unbind(batched_matrix, dim=-3)
+        width = width.mean(dim=-1)
+        intensities = intensities.mean(dim=-1)
+
+        areas = self.mesh.spherical_triangle_areas(grid, simplices)
+        areas = areas.reshape(1, -1)
+        areas = areas.expand(expanded_size, -1)
+        areas = areas.flatten()
+        return res_fields, width, intensities, areas
+
     def __call__(self, system, resonance_frequency: torch.tensor, fields: torch.Tensor):
         """
         :param system:
@@ -109,45 +131,19 @@ class SpectraCreator:
         :param fields: the shape is [batch_shape, n_points]
         :return:
         """
-        mesh_size = self.mesh.size
-        B_low = fields[..., 0].unsqueeze(-1).expand(*mesh_size)
-        B_high = fields[..., -1].unsqueeze(-1).expand(*mesh_size)
+        B_low = fields[..., 0].unsqueeze(-1).expand(*self.mesh_size)
+        B_high = fields[..., -1].unsqueeze(-1).expand(*self.mesh_size)
 
         F, Gx, Gy, Gz = system.get_hamiltonian_terms()
         batches = self.res_field(system, resonance_frequency, B_low, B_high, F, Gz)
         res_fields, intensities, width = self.compute_parameters(system, Gx, Gy, Gz, batches)
-        #return res_fields, intensities, width
-        width = self.broader.add_hamiltonian_stained(system, width)
-        #res_fields = self.mesh.interpolate(res_fields.transpose(-1, -2))
-        #intensities = self.mesh.interpolate(intensities.transpose(-1, -2))
-        #width = self.mesh.interpolate(width.transpose(-1, -2))
-
-        res_fields = res_fields.transpose(-1, -2)
-        intensities = intensities.transpose(-1, -2)
-        width = width.transpose(-1, -2)
-
-        res_fields = self.mesh.to_delaunay(res_fields)
-        intensities = self.mesh.to_delaunay(intensities).mean(dim=-1)
-        width = self.mesh.to_delaunay(width).mean(dim=-1)
-
-        #interpolation_grid = torch.tensor([[val[0], val[1]] for val in self.mesh.interpolation_grid])  #
-        interpolation_grid = torch.tensor([[val[0], val[1]] for val in self.mesh.initial_grid])
-        areas = self.mesh.spherical_triangle_areas(interpolation_grid, self.mesh.initial_simpleces)
-
-        expanded_size = res_fields.shape[-3]
-        res_fields = res_fields.flatten(-3, -2)
-
-        width = width.flatten(-2, -1)
-        intensities = intensities.flatten(-2, -1)
-
-        areas = areas.reshape(1, -1)
-        areas = areas.expand(expanded_size, -1)
-        areas = areas.flatten()
+        res_fields, width, intensities, areas = self._transform_data_to_delaunay_format(
+            res_fields, intensities, width)
         return self.spectra_integrator.integrate(res_fields, width, intensities, areas, fields)
         # return answer
 
 
-    def _iterate_batche(self, system, Gx, Gy, Gz, batch):
+    def _iterate_batch(self, system, Gx, Gy, Gz, batch):
         intensity = self.intensity_calculator(Gx, Gy, Gz, batch)
         (vector_down, vector_up), (_, _),\
             B_trans, mask_trans, mask_triu, indexes, resonance_energies = batch
@@ -157,13 +153,15 @@ class SpectraCreator:
     #ТУТ СОЗДАЁТСЯ СИЛЬНО БОЛЬШАЯ МАТРИЦА. НУЖНО ПОМЕНЯТЬ ЛОГИКУ СОЗДАНИЯ ФИНАЛЬНЫХ МАТРИЦ!!!!!!
     #ПРИ ЭТОМ ФИНАЛЬНЫЙ РАЗМЕР МАЛЕНЬКИЙ!!
     def compute_parameters(self, system, Gx, Gy, Gz, batches):
+        config_dims = (*self.batch_dims, *self.mesh_size)
         num_pairs = (self.spin_system_dim ** 2 - self.spin_system_dim) // 2
-        res_fields = torch.zeros((*self.batch_dims, num_pairs), dtype=torch.float32)
-        intensities = torch.zeros((*self.batch_dims, num_pairs), dtype=torch.float32)
-        width_square = torch.zeros((*self.batch_dims, num_pairs), dtype=torch.float32)
+        res_fields = torch.zeros((*config_dims, num_pairs), dtype=torch.float32)
+        intensities = torch.zeros((*config_dims, num_pairs), dtype=torch.float32)
+        width_square = torch.zeros((*config_dims, num_pairs), dtype=torch.float32)
+
         for batch in batches:
             mask_triu, B_trans_batch, intensity_batch, width_square_batch, mask_indexes \
-                = self._iterate_batche(system, Gx, Gy, Gz, batch)
+                = self._iterate_batch(system, Gx, Gy, Gz, batch)
             row_idx = torch.nonzero(mask_indexes).squeeze(-1)  # Shape [num_selected_rows]
             col_idx = torch.nonzero(mask_triu).squeeze(-1)  # Shape [num_selected_cols]
             # Use advanced indexing to update the relevant elements
@@ -171,29 +169,53 @@ class SpectraCreator:
                 res_fields[row_idx[:, None], col_idx] += B_trans_batch
                 intensities[row_idx[:, None], col_idx] += intensity_batch
                 width_square[row_idx[:, None], col_idx] += width_square_batch
-
-            #intensities[indexes][..., mask_triu] += 1123/
         intensities = intensities.abs()
         intensities = intensities / intensities.max()
         treeshold_mask = (intensities >= self.threshold).flatten(0, -2).any(dim=0)
-        #print(treeshold_mask.shape)
         intensities = intensities[..., treeshold_mask]
         res_fields = res_fields[..., treeshold_mask]
         width_square = width_square[..., treeshold_mask]
-        return res_fields, intensities, width_square
+
+        width = self.broader.add_hamiltonian_stained(system, width_square)
+        return res_fields, intensities, width
 
 class SpectraIntegrator:
-    def __init__(self):
+    def __init__(self, harmonic: int = 0):
+        """
+        :param harmonic: The harmonic of the spectra. 0 is an absorptions, 1 is derivative
+        """
         self.sqrt_pi = torch.tensor(math.sqrt(math.pi))
         self.two_sqrt = torch.tensor(math.sqrt(2.0))
-        self.sqrt_2 = torch.sqrt(torch.tensor(2.0))
         self.eps_val = torch.tensor(1e-10)
+        self.natural_width = 1e-7
         self.threshold = torch.tensor(1e-12)
-        self.const_factor = torch.sqrt(torch.tensor(2.0 / math.pi))
-        self.clamp = torch.tesnor(50)
+        self.clamp = torch.tensor(1)
+        self.sum_method = self._sum_method_fabric(harmonic)
 
 
-    def integrate(self, res_fields, width, A_mean, area, B):
+    def _sum_method_fabric(self, harmonic: int = 0):
+        if harmonic == 0:
+            return self._absorption
+        elif harmonic == 1:
+            return self._derivative
+        else:
+            raise ValueError("Harmonic must be 0 or 1")
+
+    def _absorption(self, x: torch.Tensor, c_val: torch.Tensor, width_val: torch.Tensor):
+        arg = torch.clamp(c_val * x, -self.clamp, self.clamp)
+        erf_val = torch.erf(arg)
+        exp_val = torch.exp(-arg ** 2)
+        return x * erf_val + (width_val / (self.two_sqrt * self.sqrt_pi)) * exp_val
+
+    def _derivative(self, x: torch.Tensor, c_val: torch.Tensor, width_val: torch.Tensor):
+        arg = torch.clamp(c_val * x, -self.clamp, self.clamp)
+        return torch.erf(arg)
+
+     #### НЕ РАБОТАЕТ ДЛЯ ИЗОТРОПНОГО ВЗАИМОДЕЙСТВИЯ!!! КОГДА B1=B2=B3 есть численная нестабильность!!!!!
+     ### ЧИСЛЕННО НЕСТАБИЛЬНО РАБОТАЕТ. НУЖНО ИДЕОЛОГИЧЕСКИ МЕНЯТЬ ПОДХОД!!!!
+    def integrate(self, res_fields: torch.Tensor,
+                  width: torch.Tensor, A_mean:torch.Tensor,
+                  area: torch.Tensor, spectral_field: torch.Tensor):
         r"""
         Computes the integral
             I(B) = sqrt(2/pi) * (1/width) * A_mean * I_triangle(B) * area,
@@ -202,11 +224,12 @@ class SpectraIntegrator:
         :param width: The width of transitions. The shape is [..., M]
         :param A_mean: The intensities of transitions. The shape is [..., M]
         :param area: The area of transitions. The shape is [M]. It is the same for all batch dimensions
-        :param B: The magnetic fields where spectra should be created. The shape is [...., N]
+        :param spectral_field: The magnetic fields where spectra should be created. The shape is [...., N]
         :return: result: Tensor of shape (..., N) with the value of the integral for each B
         """
-        width = width / 1000000
-        width = self.eps_val + width * constants.PLANCK / constants.BOHR
+        width = width
+        width = self.natural_width + width
+        res_fields, _ = torch.sort(res_fields, dim=-1, descending=True)
         B1, B2, B3 = torch.unbind(res_fields, dim=-1)
 
         d13 = (B1 - B3)
@@ -220,69 +243,15 @@ class SpectraIntegrator:
                                        denominator + self.eps_val,
                                        denominator)
 
-        def F(x, c_val, width_val):
-            arg = torch.clamp(c_val * x, -self.clamp, self.clamp)
-            erf_val = torch.erf(arg)
-            exp_val = torch.exp(-arg ** 2)
-            return x * erf_val + (width_val / (self.two_sqrt * self.sqrt_pi)) * exp_val
-
         def integrand(B_val):
-            X1 = F(B1 - B_val, c, width)
-            X2 = F(B2 - B_val, c, width)
-            X3 = F(B3 - B_val, c, width)
+            X1 = self.sum_method(B1 - B_val, c, width)
+            X2 = self.sum_method(B2 - B_val, c, width)
+            X3 = self.sum_method(B3 - B_val, c, width)
             num = X1 * d23 - X2 * d13 + X3 * d12
             term = num / safe_denom
             return (term * (A_mean * area)).sum(dim=-1)
-
-        result = torch.vmap(integrand)(B)
+        result = torch.vmap(integrand)(spectral_field)
         return result
-
-    def ___integrate(self, res_fields, width, A_mean, area, B):
-        r"""
-        Computes the integral
-            I(B) = sqrt(2/pi) * (1/width) * A_mean * I_triangle(B) * area,
-        where
-        :param res_fields: The resonance fields with the shape [..., M, 3]
-        :param width: The width of transitions. The shape is [..., M]
-        :param A_mean: The intensities of transitions. The shape is [..., M]
-        :param area: The area of transitions. The shape is [M]. It is the same for all batch dimensions
-        :param B: The magnetic fields where spectra should be created. The shape is [...., N]
-        :return: result: Tensor of shape (..., N) with the value of the integral for each B
-        """
-        width = width / 1000000
-        width = self.eps_val + width * constants.PLANCK / constants.BOHR
-        #res_fields, _ = torch.sort(res_fields, dim=-1, descending=True)
-        B1, B2, B3 = torch.unbind(res_fields, dim=-1)
-
-        d13 = (B1 - B3).unsqueeze(-1)
-        d23 = (B2 - B3).unsqueeze(-1)
-        d12 = (B1 - B2).unsqueeze(-1)
-
-        c = self.two_sqrt / width
-        c_exp = c.unsqueeze(-1)
-        width_exp = width.unsqueeze(-1),
-        denominator = d12 * d23 * d13
-
-        safe_denominator = torch.where(torch.abs(denominator) < self.threshold,
-                                       denominator + self.eps_val,
-                                       denominator)
-
-        def F(x):
-            # x will be broadcast to shape compatible with c_exp
-            arg = torch.clamp(c_exp * x, -self.clamp, self.clamp)
-            erf_val = torch.erf(arg)
-            exp_val = torch.exp(- arg**2)
-            return x * erf_val + (width_exp / (self.two_sqrt * self.sqrt_pi)) * exp_val
-
-        X1 = F(B1.unsqueeze(-1) - B)
-        X2 = F(B2.unsqueeze(-1) - B)
-        X3 = F(B3.unsqueeze(-1) - B)
-        numerator = (X1 * d23 - X2 * d13 + X3 * d12)
-        term = numerator / safe_denominator
-
-        result = (term * (A_mean * area).unsqueeze(-1)).sum(dim=-2)
-        return result
-
 
 
 
