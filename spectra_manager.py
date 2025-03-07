@@ -30,27 +30,49 @@ class Broadening:
     def __init__(self):
         pass
 
-    def compute_element(self, vector, G):
-        return torch.einsum('...bi,...ij,...bj->...b', torch.conj(vector), G, vector).real
+    def _compute_element_field_free(self, vector: torch.Tensor,
+                          tensor_components_A: torch.Tensor, tensor_components_B: torch.Tensor,
+                          transformation_matrix: torch.Tensor) -> torch.Tensor:
+        return torch.einsum(
+            '...pij,jkl,ikl,...bk,...bl->...b',
+            transformation_matrix, tensor_components_A, tensor_components_B, torch.conj(vector), vector
+        ).real
 
-    def _compute_field_straine_square(self, straine, vector_down, vector_up, B_trans, indexes):
+    def _compute_element_field_dep(self, vector: torch.Tensor,
+                          tensor_components: torch.Tensor,
+                          transformation_matrix: torch.Tensor) -> torch.Tensor:
+        return torch.einsum(
+            '...pi, ikl,...bk,...bl->...b',
+            transformation_matrix, tensor_components, torch.conj(vector), vector
+        ).real
+
+    def _compute_field_straine_square(self, strained_data, vector_down, vector_up, B_trans, indexes):
+        tensor_components, transformation_matrix = strained_data
+
         return (B_trans * (
-                self.compute_element(vector_up, straine[indexes]) -
-                self.compute_element(vector_down, straine[indexes])
+                self._compute_element_field_dep(vector_up, tensor_components, transformation_matrix[indexes]) -
+                self._compute_element_field_dep(vector_down, tensor_components, transformation_matrix[indexes])
         )).square()
 
-    def _compute_field_free_straine_square(self, straine, vector_down, vector_up, indexes):
+    def _compute_field_free_straine_square(self, strained_data, vector_down, vector_up, indexes):
+        tensor_components_A, tensor_components_B, transformation_matrix = strained_data
         return (
-                self.compute_element(vector_up, straine[indexes]) -
-                self.compute_element(vector_down, straine[indexes])
+                self._compute_element_field_free(
+                    vector_up, tensor_components_A, tensor_components_B, transformation_matrix[indexes]
+                ) -
+                self._compute_element_field_free(
+                    vector_down, tensor_components_A, tensor_components_B, transformation_matrix[indexes]
+                )
         ).square()
 
     def __call__(self, system, vector_down, vector_up, B_trans, indexes):
         strained_field = sum(
-            self._compute_field_straine_square(straine, vector_down, vector_up, B_trans, indexes) for straine in system.build_field_dep_stained()
+            self._compute_field_straine_square(strained_data, vector_down, vector_up, B_trans, indexes)
+            for strained_data in system.build_field_dep_staine()
         )
         strained_free = sum(
-            self._compute_field_free_straine_square(straine, vector_down, vector_up, indexes) for straine in system.build_zero_field_stained()
+            self._compute_field_free_straine_square(strained_data, vector_down, vector_up, indexes)
+            for strained_data in system.build_zero_field_staine()
         )
         return strained_field + strained_free
 
@@ -90,7 +112,7 @@ class IntensitiesCalculator:
 
 # В каждом батче тоже лучше "обрезать" малые интенсивности.
 class SpectraCreator:
-    def __init__(self, spin_system_dim, batch_dims, mesh: Mesh, interpolate: bool = False):
+    def __init__(self, spin_system_dim, batch_dims, mesh: Mesh, interpolate: bool = True):
         self.threshold = torch.tensor(1e-3)
         self.spin_system_dim = spin_system_dim  # Как-то поменять
         self.mesh_size = mesh.size
@@ -179,15 +201,18 @@ class SpectraCreator:
         width = self.broader.add_hamiltonian_stained(system, width_square)
         return res_fields, intensities, width
 
+
+
+# ОТСТОЙ!!! НИ ФИГА НЕ РАБОТАЕТ, НУЖНО ПЕРЕДЕЛАТЬ
 class SpectraIntegrator:
     def __init__(self, harmonic: int = 0):
         """
         :param harmonic: The harmonic of the spectra. 0 is an absorptions, 1 is derivative
         """
-        self.sqrt_pi = torch.tensor(math.sqrt(math.pi))
+        self.pi_sqrt = torch.tensor(math.sqrt(math.pi))
         self.two_sqrt = torch.tensor(math.sqrt(2.0))
         self.eps_val = torch.tensor(1e-10)
-        self.natural_width = 1e-7
+        self.natural_width = torch.tensor(1e-4)
         self.threshold = torch.tensor(1e-12)
         self.clamp = torch.tensor(1)
         self.sum_method = self._sum_method_fabric(harmonic)
@@ -201,18 +226,18 @@ class SpectraIntegrator:
         else:
             raise ValueError("Harmonic must be 0 or 1")
 
-    def _absorption(self, x: torch.Tensor, c_val: torch.Tensor, width_val: torch.Tensor):
-        arg = torch.clamp(c_val * x, -self.clamp, self.clamp)
-        erf_val = torch.erf(arg)
-        exp_val = torch.exp(-arg ** 2)
-        return x * erf_val + (width_val / (self.two_sqrt * self.sqrt_pi)) * exp_val
+    def _absorption(self, arg: torch.Tensor, prefactor: torch.Tensor, width: torch.Tensor):
+        log_term = -arg.square()
+        log_prefactor = torch.log(prefactor)
+        log_sum = torch.logsumexp(log_term + log_prefactor, dim=-1)
+        return torch.exp(log_sum)
 
-    def _derivative(self, x: torch.Tensor, c_val: torch.Tensor, width_val: torch.Tensor):
-        arg = torch.clamp(c_val * x, -self.clamp, self.clamp)
-        return torch.erf(arg)
+    def _derivative(self, arg: torch.Tensor, prefactor: torch.Tensor, width: torch.Tensor):
+        term = torch.exp(-arg.square())
+        prefactor = self.two_sqrt * arg * prefactor / width
+        return torch.sum(term * prefactor, dim=-1)
 
-     #### НЕ РАБОТАЕТ ДЛЯ ИЗОТРОПНОГО ВЗАИМОДЕЙСТВИЯ!!! КОГДА B1=B2=B3 есть численная нестабильность!!!!!
-     ### ЧИСЛЕННО НЕСТАБИЛЬНО РАБОТАЕТ. НУЖНО ИДЕОЛОГИЧЕСКИ МЕНЯТЬ ПОДХОД!!!!
+
     def integrate(self, res_fields: torch.Tensor,
                   width: torch.Tensor, A_mean:torch.Tensor,
                   area: torch.Tensor, spectral_field: torch.Tensor):
@@ -227,29 +252,19 @@ class SpectraIntegrator:
         :param spectral_field: The magnetic fields where spectra should be created. The shape is [...., N]
         :return: result: Tensor of shape (..., N) with the value of the integral for each B
         """
-        width = width
-        width = self.natural_width + width
-        res_fields, _ = torch.sort(res_fields, dim=-1, descending=True)
         B1, B2, B3 = torch.unbind(res_fields, dim=-1)
+        B_mean = (B1 + B2 + B3) / 3
 
-        d13 = (B1 - B3)
-        d23 = (B2 - B3)
-        d12 = (B1 - B2)
-
+        additional_square_width = ((B1 - B3).square() + (B2 - B3).square() + (B1 - B2).square()) / 9
+        width = (self.natural_width.square() + width.square() + additional_square_width).sqrt()
         c = self.two_sqrt / width
-        denominator = d12 * d23 * d13
-
-        safe_denom = torch.where(torch.abs(denominator) < self.threshold,
-                                       denominator + self.eps_val,
-                                       denominator)
+        print(additional_square_width.sqrt().mean())
+        prefactor = c * (A_mean * area) / self.pi_sqrt
 
         def integrand(B_val):
-            X1 = self.sum_method(B1 - B_val, c, width)
-            X2 = self.sum_method(B2 - B_val, c, width)
-            X3 = self.sum_method(B3 - B_val, c, width)
-            num = X1 * d23 - X2 * d13 + X3 * d12
-            term = num / safe_denom
-            return (term * (A_mean * area)).sum(dim=-1)
+            arg = (B_mean - B_val) * c
+            return self.sum_method(arg, prefactor, width)
+
         result = torch.vmap(integrand)(spectral_field)
         return result
 
