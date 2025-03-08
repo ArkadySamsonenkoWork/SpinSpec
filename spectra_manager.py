@@ -112,7 +112,7 @@ class IntensitiesCalculator:
 
 # В каждом батче тоже лучше "обрезать" малые интенсивности.
 class SpectraCreator:
-    def __init__(self, spin_system_dim, batch_dims, mesh: Mesh, interpolate: bool = True):
+    def __init__(self, spin_system_dim, batch_dims, mesh: Mesh, interpolate: bool = False):
         self.threshold = torch.tensor(1e-3)
         self.spin_system_dim = spin_system_dim  # Как-то поменять
         self.mesh_size = mesh.size
@@ -203,19 +203,117 @@ class SpectraCreator:
 
 
 
-# ОТСТОЙ!!! НИ ФИГА НЕ РАБОТАЕТ, НУЖНО ПЕРЕДЕЛАТЬ
-class SpectraIntegrator:
+# КАК_ТО Я ЗАСТАВИЛ ЕГО РАБОТАТЬ!!!!!!!
+class SpectraIntegratorQuiteUnbehaviour:
     def __init__(self, harmonic: int = 0):
         """
         :param harmonic: The harmonic of the spectra. 0 is an absorptions, 1 is derivative
         """
         self.pi_sqrt = torch.tensor(math.sqrt(math.pi))
         self.two_sqrt = torch.tensor(math.sqrt(2.0))
+
+        self.natural_width = 2e-5
         self.eps_val = torch.tensor(1e-10)
-        self.natural_width = torch.tensor(1e-4)
         self.threshold = torch.tensor(1e-12)
-        self.clamp = torch.tensor(1)
+        self.clamp = torch.tensor(10)
         self.sum_method = self._sum_method_fabric(harmonic)
+        self.equality_threshold = 1e-2
+
+    def _sum_method_fabric(self, harmonic: int = 0):
+        if harmonic == 0:
+            return self._absorption
+        elif harmonic == 1:
+            return self._derivative
+        else:
+            raise ValueError("Harmonic must be 0 or 1")
+
+    def _absorption(self, x: torch.Tensor, c_val: torch.Tensor, width_val: torch.Tensor):
+        arg = torch.clamp(c_val * x, -self.clamp, self.clamp)  # Prevent large values
+        #arg = c_val * x
+        erf_val = torch.erf(arg)
+        exp_val = torch.exp(torch.clamp(-arg.square(), min=-50))  # Prevent underflow
+        erf_factor = torch.clamp(c_val * x, -100, 100)
+        print((erf_factor * erf_val + (1 / self.pi_sqrt) * exp_val))
+        return (c_val * x * erf_val + (1 / self.pi_sqrt) * exp_val)
+
+    def _derivative(self, x: torch.Tensor, c_val: torch.Tensor, width_val: torch.Tensor):
+        arg = torch.clamp(c_val * x, -self.clamp, self.clamp)
+        return torch.erf(arg)
+
+    def integrate(self, res_fields: torch.Tensor,
+                  width: torch.Tensor, A_mean: torch.Tensor,
+                  area: torch.Tensor, spectral_field: torch.Tensor):
+        r"""
+        Computes the integral
+            I(B) = sqrt(2/pi) * (1/width) * A_mean * I_triangle(B) * area,
+        where
+        :param res_fields: The resonance fields with the shape [..., M, 3]
+        :param width: The width of transitions. The shape is [..., M]
+        :param A_mean: The intensities of transitions. The shape is [..., M]
+        :param area: The area of transitions. The shape is [M]. It is the same for all batch dimensions
+        :param spectral_field: The magnetic fields where spectra should be created. The shape is [...., N]
+        :return: result: Tensor of shape (..., N) with the value of the integral for each B
+        """
+        width = width
+        width = self.natural_width + width
+        res_fields, _ = torch.sort(res_fields, dim=-1, descending=True)
+        B1, B2, B3 = torch.unbind(res_fields, dim=-1)
+        B1 = B1 + width / 100
+        B3 = B3 - width / 100
+
+        d13 = (B1 - B3)
+        d23 = (B2 - B3)
+        d12 = (B1 - B2)
+
+
+        c = self.two_sqrt / width
+
+        denominator_full = d12 * d23 * d13
+
+        selfafe_denom_full = torch.where(torch.abs(denominator_full) < self.threshold,
+                                      denominator_full + self.eps_val,
+                                      denominator_full)
+
+        def integrand_full(B_val):
+            arg_1 = (B1 - B_val) / width
+            arg_2 = (B2 - B_val) / width
+            arg_3 = (B3 - B_val) / width
+
+            X1 = self.sum_method(B1 - B_val, c, width)
+            X2 = self.sum_method(B2 - B_val, c, width)
+            X3 = self.sum_method(B3 - B_val, c, width)
+
+            # num = X1 / (d13 * d12) - X2 / (d12 * d23) + X3 / (d13 * d23)
+            num = (X1 * d23 - X2 * d13 + X3 * d12)
+            num = torch.where((arg_1.square() + arg_2.square() + arg_3.square()).sqrt() < 10, num, 0.0)  # IT HEALS BEHAVIOUR AT INFTY
+
+            eps = self.eps_val / 100
+            log_num = torch.log(torch.abs(num) + eps)
+            log_den = torch.log(torch.abs(selfafe_denom_full) + eps)
+
+            # Recover the ratio while keeping track of the sign
+            ratio = torch.sign(num) * torch.exp(log_num - log_den)
+
+            return (ratio * self.two_sqrt * width * (A_mean * area)).sum(dim=-1)
+
+        result = torch.vmap(integrand_full)(spectral_field)
+        return result
+
+
+class ___SpectraIntegrator:
+    def __init__(self, harmonic: int = 0):
+        """
+        :param harmonic: The harmonic of the spectra. 0 is an absorptions, 1 is derivative
+        """
+        self.pi_sqrt = torch.tensor(math.sqrt(math.pi))
+        self.two_sqrt = torch.tensor(math.sqrt(2.0))
+
+        self.natural_width = 1e-5
+        self.eps_val = torch.tensor(1e-11)
+        self.threshold = torch.tensor(1e-6)
+        self.clamp = torch.tensor(50)
+        self.sum_method = self._sum_method_fabric(harmonic)
+        self.equality_threshold = 1e-2
 
 
     def _sum_method_fabric(self, harmonic: int = 0):
@@ -226,17 +324,149 @@ class SpectraIntegrator:
         else:
             raise ValueError("Harmonic must be 0 or 1")
 
-    def _absorption(self, arg: torch.Tensor, prefactor: torch.Tensor, width: torch.Tensor):
-        log_term = -arg.square()
-        log_prefactor = torch.log(prefactor)
-        log_sum = torch.logsumexp(log_term + log_prefactor, dim=-1)
-        return torch.exp(log_sum)
+    def _absorption(self, x: torch.Tensor, c_val: torch.Tensor, width_val: torch.Tensor):
+        arg = torch.clamp(c_val * x, -self.clamp, self.clamp)  # Prevent large values
+        erf_val = torch.erf(arg)
+        exp_val = torch.exp(torch.clamp(-arg.square(), min=-50))  # Prevent underflow
+        return (c_val * x * erf_val + (1 / self.pi_sqrt) * exp_val)
 
-    def _derivative(self, arg: torch.Tensor, prefactor: torch.Tensor, width: torch.Tensor):
-        term = torch.exp(-arg.square())
-        prefactor = self.two_sqrt * arg * prefactor / width
-        return torch.sum(term * prefactor, dim=-1)
 
+    def _derivative(self, x: torch.Tensor, c_val: torch.Tensor, width_val: torch.Tensor):
+        arg = torch.clamp(c_val * x, -self.clamp, self.clamp)
+        return torch.erf(arg)
+
+    def _get_equality_masks(self, B1, B2, B3, width):
+        diff12 = torch.abs(B1 - B2) / width
+        diff13 = torch.abs(B1 - B3) / width
+        diff23 = torch.abs(B2 - B3) / width
+
+        eq12 = diff12 < self.equality_threshold
+        eq13 = diff13 < self.equality_threshold
+        eq23 = diff23 < self.equality_threshold
+
+        mask_all_diff = ~(eq12 | eq13 | eq23)
+
+        # Case 2: Two are equal, third is different
+        mask_two_eq = (eq12 & ~eq13) | (eq13 & ~eq12) | (eq23 & ~eq12)
+
+        # Case 3: All three are equal
+        mask_all_eq = eq12 & eq13 & eq23
+
+        return mask_all_diff, mask_two_eq, mask_all_eq
+
+    def _two_equality_case(self, B1, B2, B3):
+        diff12 = torch.abs(B1 - B2)
+        diff13 = torch.abs(B1 - B3)
+        diff23 = torch.abs(B2 - B3)
+
+        eq12 = diff12 < self.equality_threshold
+        eq13 = diff13 < self.equality_threshold
+        eq23 = diff23 < self.equality_threshold
+
+        B1, B3 = torch.where(eq12, B3, B1), torch.where(eq12, B1, B3)
+        B1, B2 = torch.where(eq13, B2, B1), torch.where(eq13, B1, B2)
+        return B1, B2, B3
+
+    def _apply_mask(self, B1: torch.Tensor, B2: torch.Tensor, B3: torch.Tensor,
+                  width: torch.Tensor, A_mean:torch.Tensor,
+                  area: torch.Tensor, mask):
+        B1 = B1[mask]
+        B2 = B2[mask]
+        B3 = B3[mask]
+        area = area[mask]
+        A_mean = A_mean[mask]
+        width = width[mask]
+        return B1, B2, B3, width, area, A_mean
+
+
+    def all_different_case(self, B1: torch.Tensor, B2: torch.Tensor, B3: torch.Tensor,
+                  width: torch.Tensor, A_mean:torch.Tensor,
+                  area: torch.Tensor, spectral_field: torch.Tensor, mask_all_diff):
+        B1, B2, B3, width, area, A_mean = self._apply_mask(B1, B2, B3, width, A_mean, area, mask_all_diff)
+
+        d13 = (B1 - B3) / width
+        d23 = (B2 - B3) / width
+        d12 = (B1 - B2) / width
+
+        c = self.two_sqrt / width
+        denominator = d12 * d23 * d13
+        safe_denom = torch.where(torch.abs(denominator) < self.threshold,
+                                       denominator + self.eps_val,
+                                       denominator)
+        def integrand(B_val):
+            arg_1 = (B1 - B_val) / width
+            arg_2 = (B2 - B_val) / width
+            arg_3 = (B3 - B_val) / width
+            X1 = self.sum_method(B1 - B_val, c, width)
+            X2 = self.sum_method(B2 - B_val, c, width)
+            X3 = self.sum_method(B3 - B_val, c, width)
+
+            num = (X1 * d23 - X2 * d13 + X3 * d12)
+            num = torch.where((arg_1.square() + arg_2.square() + arg_3.square()).sqrt() < 20, num, 0.0)  # IT HEALS BEHAVIOUR AT INFTY
+
+            log_num = torch.log(torch.abs(num) + self.eps_val)
+            log_den = torch.log(torch.abs(safe_denom))
+
+            ratio = torch.sign(num) * torch.exp(log_num - log_den)
+            return (ratio * (1 / self.two_sqrt) * (A_mean * area) * (1 / width)).sum(dim=-1)
+
+        result = torch.vmap(integrand)(spectral_field)
+        return result
+
+
+    def two_eq_case(self, B1: torch.Tensor, B2: torch.Tensor, B3: torch.Tensor,
+                           width: torch.Tensor, A_mean: torch.Tensor,
+                           area: torch.Tensor, spectral_field: torch.Tensor, mask_two_equel):
+        B1, B2, B3, width, area, A_mean = self._apply_mask(B1, B2, B3, width, A_mean, area, mask_two_equel)
+        B1, B2, B3 = self._two_equality_case(B1, B2, B3)  # B2 == B3
+
+        d13 = (B1 - B3) / width
+        d12 = (B1 - B2) / width
+
+        c = self.two_sqrt / width
+        denominator = d12 * d13
+        safe_denom = torch.where(torch.abs(denominator) < self.threshold,
+                                 denominator + self.eps_val,
+                                 denominator)
+
+        def F(x1, x2, c_val, width):
+            arg = torch.clamp(c_val * x2, -self.clamp, self.clamp)  # Prevent large values
+            erf_val = torch.erf(arg)
+            exp_val = torch.exp(torch.clamp(-arg.square(), min=-50))  # Prevent underflow
+            return (c_val * x1 * erf_val + (1 / self.pi_sqrt) * exp_val)
+
+        def integrand(B_val):
+            X1 = F(B1 - B_val, B1 - B_val, c, width)
+            X2 = F(B1 - B_val, B2 - B_val, c, width)
+            num = X1 - X2
+            eps = self.eps_val
+            log_num = torch.log(torch.abs(num) + eps)
+            log_den = torch.log(torch.abs(safe_denom) + eps)
+
+            ratio = torch.sign(num) * torch.exp(log_num - log_den)
+
+            return (ratio * (1 / (2 * self.two_sqrt)) * (A_mean * area) * (1 / width)).sum(dim=-1)
+        result = torch.vmap(integrand)(spectral_field)
+        return result
+
+
+    def all_eq_case(self, B1: torch.Tensor, B2: torch.Tensor, B3: torch.Tensor,
+                    width: torch.Tensor, A_mean: torch.Tensor,
+                    area: torch.Tensor, spectral_field: torch.Tensor, mask_all_equel):
+        B1, B2, B3, width, area, A_mean = self._apply_mask(B1, B2, B3, width, A_mean, area, mask_all_equel)
+        B0 = (B1 + B2 + B3) / 3
+        d23 = (B2 - B3)
+        d13 = (B1 - B3)
+        d12 = (B1 - B2)
+        width = (width.square() + (d12.square() + d13.square() + d23.square()) / 9).sqrt()
+        c = self.two_sqrt / width
+        def integrand(B_val):
+            arg = (B0 - B_val) * c
+            term = (self.two_sqrt / self.pi_sqrt) * torch.exp(-arg**2) * (1 / width)
+            return (term * (A_mean * area)).sum(dim=-1)
+
+        result = torch.vmap(integrand)(spectral_field)
+        return result
 
     def integrate(self, res_fields: torch.Tensor,
                   width: torch.Tensor, A_mean:torch.Tensor,
@@ -252,20 +482,26 @@ class SpectraIntegrator:
         :param spectral_field: The magnetic fields where spectra should be created. The shape is [...., N]
         :return: result: Tensor of shape (..., N) with the value of the integral for each B
         """
+        width = width
+        width = self.natural_width + width
+        res_fields, _ = torch.sort(res_fields, dim=-1, descending=True)
         B1, B2, B3 = torch.unbind(res_fields, dim=-1)
-        B_mean = (B1 + B2 + B3) / 3
 
-        additional_square_width = ((B1 - B3).square() + (B2 - B3).square() + (B1 - B2).square()) / 9
-        width = (self.natural_width.square() + width.square() + additional_square_width).sqrt()
-        c = self.two_sqrt / width
-        print(additional_square_width.sqrt().mean())
-        prefactor = c * (A_mean * area) / self.pi_sqrt
+        mask_all_diff, mask_two_eq, mask_all_eq = self._get_equality_masks(B1, B2, B3, width)
+        mask_two_eq = mask_two_eq * 0
+        mask_all_eq = mask_all_eq * 0
+        #mask_all_diff = mask_all_diff * 0
 
-        def integrand(B_val):
-            arg = (B_mean - B_val) * c
-            return self.sum_method(arg, prefactor, width)
 
-        result = torch.vmap(integrand)(spectral_field)
+        print(mask_two_eq.sum())
+        print(mask_all_eq.sum())
+        print(mask_all_diff.sum())
+
+        result =\
+            self.all_different_case(B1, B2, B3, width, A_mean, area, spectral_field, mask_all_diff) + \
+            self.two_eq_case(B1, B2, B3, width, A_mean, area, spectral_field, mask_two_eq) + \
+            self.all_eq_case(B1, B2, B3, width, A_mean, area, spectral_field, mask_all_eq)
+
         return result
 
 
