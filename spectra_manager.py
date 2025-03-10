@@ -204,7 +204,7 @@ class SpectraCreator:
 
 
 # КАК_ТО Я ЗАСТАВИЛ ЕГО РАБОТАТЬ!!!!!!!
-class SpectraIntegratorQuiteUnbehaviour:
+class SpectraIntegratorUnbehabiour:
     def __init__(self, harmonic: int = 0):
         """
         :param harmonic: The harmonic of the spectra. 0 is an absorptions, 1 is derivative
@@ -232,8 +232,6 @@ class SpectraIntegratorQuiteUnbehaviour:
         #arg = c_val * x
         erf_val = torch.erf(arg)
         exp_val = torch.exp(torch.clamp(-arg.square(), min=-50))  # Prevent underflow
-        erf_factor = torch.clamp(c_val * x, -100, 100)
-        print((erf_factor * erf_val + (1 / self.pi_sqrt) * exp_val))
         return (c_val * x * erf_val + (1 / self.pi_sqrt) * exp_val)
 
     def _derivative(self, x: torch.Tensor, c_val: torch.Tensor, width_val: torch.Tensor):
@@ -258,12 +256,12 @@ class SpectraIntegratorQuiteUnbehaviour:
         width = self.natural_width + width
         res_fields, _ = torch.sort(res_fields, dim=-1, descending=True)
         B1, B2, B3 = torch.unbind(res_fields, dim=-1)
-        B1 = B1 + width / 100
-        B3 = B3 - width / 100
+        B1 = B1 + width / 50
+        B3 = B3 - width / 50
 
-        d13 = (B1 - B3)
-        d23 = (B2 - B3)
-        d12 = (B1 - B2)
+        d13 = (B1 - B3) / width
+        d23 = (B2 - B3) / width
+        d12 = (B1 - B2) / width
 
 
         c = self.two_sqrt / width
@@ -285,22 +283,24 @@ class SpectraIntegratorQuiteUnbehaviour:
 
             # num = X1 / (d13 * d12) - X2 / (d12 * d23) + X3 / (d13 * d23)
             num = (X1 * d23 - X2 * d13 + X3 * d12)
-            num = torch.where((arg_1.square() + arg_2.square() + arg_3.square()).sqrt() < 10, num, 0.0)  # IT HEALS BEHAVIOUR AT INFTY
+            num = torch.where((arg_1.square() + arg_2.square() + arg_3.square()).sqrt() < 1000, num, 0.0)  # IT HEALS BEHAVIOUR AT INFTY
 
-            eps = self.eps_val / 100
-            log_num = torch.log(torch.abs(num) + eps)
-            log_den = torch.log(torch.abs(selfafe_denom_full) + eps)
+            log_num = torch.log(torch.abs(num) + self.eps_val)
+            log_den = torch.log(torch.abs(selfafe_denom_full) + + self.eps_val)
+            ratio = num / selfafe_denom_full
+            print(arg_1)
+            print(ratio)
 
             # Recover the ratio while keeping track of the sign
-            ratio = torch.sign(num) * torch.exp(log_num - log_den)
+            #ratio = torch.sign(num) * torch.exp(log_num - log_den)
 
-            return (ratio * self.two_sqrt * width * (A_mean * area)).sum(dim=-1)
+            return (ratio * self.two_sqrt * (A_mean * area) / width).sum(dim=-1)
 
         result = torch.vmap(integrand_full)(spectral_field)
         return result
 
 
-class ___SpectraIntegrator:
+class SpectraIntegrator:
     def __init__(self, harmonic: int = 0):
         """
         :param harmonic: The harmonic of the spectra. 0 is an absorptions, 1 is derivative
@@ -309,7 +309,7 @@ class ___SpectraIntegrator:
         self.two_sqrt = torch.tensor(math.sqrt(2.0))
 
         self.natural_width = 1e-5
-        self.eps_val = torch.tensor(1e-11)
+        self.eps_val = torch.tensor(1e-12)
         self.threshold = torch.tensor(1e-6)
         self.clamp = torch.tensor(50)
         self.sum_method = self._sum_method_fabric(harmonic)
@@ -354,10 +354,10 @@ class ___SpectraIntegrator:
 
         return mask_all_diff, mask_two_eq, mask_all_eq
 
-    def _two_equality_case(self, B1, B2, B3):
-        diff12 = torch.abs(B1 - B2)
-        diff13 = torch.abs(B1 - B3)
-        diff23 = torch.abs(B2 - B3)
+    def _two_equality_case(self, B1, B2, B3, width):
+        diff12 = torch.abs(B1 - B2) / width
+        diff13 = torch.abs(B1 - B3) / width
+        diff23 = torch.abs(B2 - B3) / width
 
         eq12 = diff12 < self.equality_threshold
         eq13 = diff13 < self.equality_threshold
@@ -365,6 +365,7 @@ class ___SpectraIntegrator:
 
         B1, B3 = torch.where(eq12, B3, B1), torch.where(eq12, B1, B3)
         B1, B2 = torch.where(eq13, B2, B1), torch.where(eq13, B1, B2)
+
         return B1, B2, B3
 
     def _apply_mask(self, B1: torch.Tensor, B2: torch.Tensor, B3: torch.Tensor,
@@ -402,12 +403,12 @@ class ___SpectraIntegrator:
             X3 = self.sum_method(B3 - B_val, c, width)
 
             num = (X1 * d23 - X2 * d13 + X3 * d12)
-            num = torch.where((arg_1.square() + arg_2.square() + arg_3.square()).sqrt() < 20, num, 0.0)  # IT HEALS BEHAVIOUR AT INFTY
+            #num = torch.where((arg_1.square() + arg_2.square() + arg_3.square()).sqrt() < 20, num, 0.0)  # IT HEALS BEHAVIOUR AT INFTY
 
-            log_num = torch.log(torch.abs(num) + self.eps_val)
-            log_den = torch.log(torch.abs(safe_denom))
-
-            ratio = torch.sign(num) * torch.exp(log_num - log_den)
+            #log_num = torch.log(torch.abs(num) + self.eps_val)
+            #log_den = torch.log(torch.abs(safe_denom))
+            ratio = num / safe_denom
+            #ratio = torch.sign(num) * torch.exp(log_num - log_den)
             return (ratio * (1 / self.two_sqrt) * (A_mean * area) * (1 / width)).sum(dim=-1)
 
         result = torch.vmap(integrand)(spectral_field)
@@ -418,13 +419,14 @@ class ___SpectraIntegrator:
                            width: torch.Tensor, A_mean: torch.Tensor,
                            area: torch.Tensor, spectral_field: torch.Tensor, mask_two_equel):
         B1, B2, B3, width, area, A_mean = self._apply_mask(B1, B2, B3, width, A_mean, area, mask_two_equel)
-        B1, B2, B3 = self._two_equality_case(B1, B2, B3)  # B2 == B3
+        B1, B2, B3 = self._two_equality_case(B1, B2, B3, width)  # B2 == B3
 
         d13 = (B1 - B3) / width
         d12 = (B1 - B2) / width
 
         c = self.two_sqrt / width
         denominator = d12 * d13
+
         safe_denom = torch.where(torch.abs(denominator) < self.threshold,
                                  denominator + self.eps_val,
                                  denominator)
@@ -439,12 +441,12 @@ class ___SpectraIntegrator:
             X1 = F(B1 - B_val, B1 - B_val, c, width)
             X2 = F(B1 - B_val, B2 - B_val, c, width)
             num = X1 - X2
+
             eps = self.eps_val
             log_num = torch.log(torch.abs(num) + eps)
-            log_den = torch.log(torch.abs(safe_denom) + eps)
+            log_den = torch.log(torch.abs(safe_denom))
 
             ratio = torch.sign(num) * torch.exp(log_num - log_den)
-
             return (ratio * (1 / (2 * self.two_sqrt)) * (A_mean * area) * (1 / width)).sum(dim=-1)
         result = torch.vmap(integrand)(spectral_field)
         return result
@@ -488,8 +490,8 @@ class ___SpectraIntegrator:
         B1, B2, B3 = torch.unbind(res_fields, dim=-1)
 
         mask_all_diff, mask_two_eq, mask_all_eq = self._get_equality_masks(B1, B2, B3, width)
-        mask_two_eq = mask_two_eq * 0
-        mask_all_eq = mask_all_eq * 0
+        #mask_two_eq = mask_two_eq * 0
+        #mask_all_eq = mask_all_eq * 0
         #mask_all_diff = mask_all_diff * 0
 
 
