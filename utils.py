@@ -7,22 +7,72 @@ import constants
 
 def apply_expanded_rotations(R: torch.Tensor, T: torch.Tensor):
     """
+    Rotate tensor T with respect to rotation matrices R using T' = R T R^T.
+
+    Parameters:
+      R (torch.Tensor): Rotation matrices of shape [r, 3, 3].
+      T (torch.Tensor): Tensor to rotate, with shape [..., 3, 3].
+
+    Returns:
+      torch.Tensor: Rotated tensors of shape [..., r, 3, 3].
+    """
+    # Add a new dimension for the rotation dimension.
+    # Now T has shape [..., 1, 3, 3]
+    T = T.unsqueeze(-3)
+
+    # Expand R to allow broadcasting:
+    # R is reshaped from [r, 3, 3] to [1, r, 3, 3]
+    R_exp = R.unsqueeze(0)
+
+    # First multiply: compute R * T.
+    # Broadcasting aligns the new dimension in T with the r dimension in R.
+    # The resulting shape is [..., r, 3, 3]
+    RT = torch.matmul(R_exp, T)
+
+    # Compute the transpose of R on the last two dimensions.
+    R_T = R_exp.transpose(-2, -1)
+
+    # Second multiplication: compute (R * T) * R^T.
+    # The final shape is [..., r, 3, 3]
+    rotated_T = torch.matmul(RT, R_T)
+
+    return rotated_T
+
+
+def apply_single_rotation(R: torch.Tensor, T: torch.Tensor):
+    """
+    Rotate tensor T with respect to rotation matrices R using T' = R T R^T.
+
+    Applies a single rotation matrix (or a batch of rotation matrices) to a tensor
+    using the transformation T' = R T R^T.
+
+    :param R: The rotation matrices with shape [..., 3, 3].
+    :param T: The tensor to be rotated with shape [..., 3, 3].
+    :return: The rotated tensors with shape [..., 3, 3].
+    """
+    RT = torch.matmul(R, T)
+    rotated_T = torch.matmul(RT, R.transpose(-2, -1))
+
+    return rotated_T
+
+
+def __apply_expanded_rotations(R: torch.Tensor, T: torch.Tensor):
+    """
     Rotate tensor T with respect to rotation matrices R according formula T' = RTR'
-    :param R: the rotation matrices. R' = R. The shape is [rotation_dim, 3, 3]
+    :param R: the rotation matrices. The shape is [rotation_dim, 3, 3]
     :param T: tensor that must be rotated. The shape is [... 3, 3]
     :return: The rotated tensors with the shape [..., rotation_dim, 3, 3]
     """
     return torch.einsum('rij, ...jk, rlk -> ...ril', R, T, R)
 
-
-def apply_single_rotation(R: torch.Tensor, T: torch.Tensor):
+def __apply_single_rotation(R: torch.Tensor, T: torch.Tensor):
     """
     Rotate tensor T with respect to rotation matrices R according formula T' = RTR'
 
     Applies a single rotation matrix (or a batch of rotation matrices) to a tensor
     using the transformation T' = R T R^T.
 
-    :param R: the rotation matrices. R' = R. The shape is [..., 3, 3]
+    :param R: the rotation matrices. The shape is [..., 3, 3]
     :param T: tensor that must be rotated. The shape is [... 3, 3]
     :return: The rotated tensors with the shape [..., 3, 3]
     """

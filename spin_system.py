@@ -7,7 +7,6 @@ import torch
 
 import constants
 import particles
-import res_field_algorithm
 import utils
 
 # Подумать над изменением логики.
@@ -39,7 +38,7 @@ def scalar_tensor_multiplication(
         torch.Tensor: Scalar product with shape [..., K, K].
     """
     return torch.einsum(
-        '...ij,...jkl,...ikl->...kl',
+        '...ij, jkl, ikl->...kl',
         transformation_matrix,
         tensor_components_A,
         tensor_components_B
@@ -232,7 +231,7 @@ class SpinSystem:
             for axis, mat in zip(['x', 'y', 'z'], p.spin_matrices):
                 operator = create_operator(particels, idx, mat)
                 axis_cache.append(operator)
-            self.operator_cache[idx] = torch.stack(axis_cache, dim=-3)  # Сейчас каждый спин даёт матрицу [K, K] и
+            self.operator_cache[idx] = torch.stack(axis_cache, dim=-3)   # Сейчас каждый спин даёт матрицу [K, K] и
                                                                          # расчёт взаимодействией не оптимальный
 
 class BaseSample():
@@ -340,7 +339,7 @@ class BaseSample():
         return self.build_zero_field_term(), *self.build_zeeman_terms()
 
 
-    def build_field_dep_stained(self):
+    def build_field_dep_staine(self):
         """
         Calculate electron Zeeman field dependant strained part
         :return:
@@ -350,22 +349,21 @@ class BaseSample():
             if g is None:
                 pass
             else:
-                for part in range(3):
-                    yield torch.einsum("...j, jkl->...kl", g[..., part, 2, :], self.spin_system.operator_cache[idx])
+                yield (
+                    self.spin_system.operator_cache[idx],
+                    g[..., :, 2, :])
 
-    def build_zero_field_stained(self) -> torch.Tensor:
+    def build_zero_field_staine(self) -> torch.Tensor:
         """Constructs the zero-field strained part."""
         for e_idx, n_idx, electron_nuclei in self.spin_system.electron_nuclei:
             electron_nuclei = electron_nuclei.strained_tensor
             if electron_nuclei is None:
                 pass
             else:
-                for part in range(3):
-                    result = scalar_tensor_multiplication(
-                        self.spin_system.operator_cache[e_idx],
-                        self.spin_system.operator_cache[len(self.spin_system.electrons) + n_idx],
-                        electron_nuclei[..., part, :, :])
-                    yield result
+                yield (
+                    self.spin_system.operator_cache[e_idx],
+                    self.spin_system.operator_cache[len(self.spin_system.electrons) + n_idx],
+                    electron_nuclei)
 
 
 

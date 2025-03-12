@@ -96,7 +96,7 @@ class BaseResonanceIntervalSolver(ABC):
     """
     Base class for algorithm of resonance interval search
     """
-    def __init__(self, eigen_finder: tp.Optional[BaseEigenSolver] = EighEigenSolver(), r_tol: float = 1e-6,
+    def __init__(self, eigen_finder: tp.Optional[BaseEigenSolver] = EighEigenSolver(), r_tol: float = 1e-5,
         max_iterations: float=100):
         self.eigen_finder = eigen_finder
         self.r_tol = torch.tensor(r_tol)
@@ -551,7 +551,7 @@ class ZeroFreeResonanceIntervalSolver(BaseResonanceIntervalSolver):
 # один раз для получения энергий.
 # Возможно, стоит избавиться от двух масок.
 class BaseResonanceLocator:
-    def __init__(self, max_iterations=10, tolerance=1e-6, accuracy=0.001):
+    def __init__(self, max_iterations=10, tolerance=1e-12, accuracy=1e-4):
         self.max_iterations = max_iterations
         self.tolerance = tolerance
         self.accuracy = accuracy
@@ -588,7 +588,6 @@ class BaseResonanceLocator:
             Tensor: Estimated magnetic field values where resonance occurs, shape matching input pair dimensions.
         """
         max_iterations = 50
-        tolerance = 1e-12  # small value to avoid division by zero
 
         (coef_3, coef_2, coef_1, coef_0) = self._compute_cubic_polinomial_coeffs(
             diff_eig_low, diff_eig_high, diff_deriv_low, diff_deriv_high)
@@ -597,7 +596,10 @@ class BaseResonanceLocator:
         for _ in range(max_iterations):
             poly_val = coef_3 * t ** 3 + coef_2 * t ** 2 + coef_1 * t + coef_0
             poly_deriv = 3 * coef_3 * t ** 2 + 2 * coef_2 * t + coef_1
-            t -= poly_val / (poly_deriv + tolerance)
+            delta = poly_val / (poly_deriv + self.tolerance)
+            t -= delta
+            if (delta.abs() < self.accuracy).all():
+                break
         return t
 
     def get_resonance_mask(self, diff_eig_low, diff_eig_high, resonance_frequency):

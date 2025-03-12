@@ -110,7 +110,7 @@ class BaseSpectraIntegrator:
         pass
 
 class SpectraIntegratorExtended(BaseSpectraIntegrator):
-    def __init__(self, harmonic: int = 0, natural_width: float = 1e-5):
+    def __init__(self, harmonic: int = 1, natural_width: float = 1e-5):
         """
         :param harmonic: The harmonic of the spectra. 0 is an absorptions, 1 is derivative
         """
@@ -155,6 +155,8 @@ class SpectraIntegratorExtended(BaseSpectraIntegrator):
         :return: result: Tensor of shape (..., N) with the value of the integral for each B
 
         """
+        A_mean = A_mean * area
+
         width = width
         width = self.natural_width + width
         res_fields, _ = torch.sort(res_fields, dim=-1, descending=True)
@@ -185,9 +187,11 @@ class SpectraIntegratorExtended(BaseSpectraIntegrator):
             infty_ratio = self.infty_ratio(B_mean, c_extended, B_val)
             criteria = self._criteria(self.infty_ratio.arg, additional_width)
             ratio = torch.where(criteria, analytical_ratio, infty_ratio)
-            return (ratio * (A_mean * area)).sum(dim=-1)
+            return (ratio * A_mean).sum(dim=-1)
 
-        result = torch.vmap(integrand)(spectral_field) / len(spectral_field)  # To make full integral equel to 1.0
+        spectral_field = spectral_field.unsqueeze(-1)
+        #result = torch.vmap(integrand)(spectral_field)  # To make full integral equel to 1.0
+        result = integrand(spectral_field)
         return result
 
 

@@ -4,7 +4,7 @@ import torch
 from torch import nn
 
 import constants
-from mesher import Mesh
+import mesher
 import res_field_algorithm
 
 
@@ -24,6 +24,7 @@ class StationaryPopulator:
         populations = nn.functional.softmax(-constants.unit_converter(energies) / self.temperature, dim=-1)
         indexes = torch.arange(populations.shape[-2], device=populations.device)
         return populations[..., indexes, lvl_up] - populations[..., indexes, lvl_down]
+
 
 class Broadening:
     def __init__(self):
@@ -111,27 +112,23 @@ class IntensitiesCalculator:
 
 # В каждом батче тоже лучше "обрезать" малые интенсивности.
 class SpectraCreator:
-    def __init__(self, spin_system_dim, batch_dims, mesh: Mesh,
-                 spectra_integrator: BaseSpectraIntegrator = SpectraIntegratorExtended(), interpolate: bool = False):
+    def __init__(self, spin_system_dim, batch_dims, mesh: mesher.BaseMesh,
+                 spectra_integrator: BaseSpectraIntegrator = SpectraIntegratorExtended()):
         self.threshold = torch.tensor(1e-3)
         self.spin_system_dim = spin_system_dim  # Как-то поменять
-        self.mesh_size = mesh.size
+        self.mesh_size = mesh.initial_size
         self.batch_dims = batch_dims
         self.intensity_calculator = IntensitiesCalculator()
         self.broader = Broadening()
         self.mesh = mesh
         self.spectra_integrator = spectra_integrator
         self.res_field = res_field_algorithm.ResField()
-        self.interpolate = interpolate
 
     def _transform_data_to_delaunay_format(self, res_fields, intensities, width):
         batched_matrix = torch.stack((res_fields, intensities, width), dim=-3)
-        if self.interpolate:
-            batched_matrix = self.mesh.interpolate(batched_matrix.transpose(-1, -2))
-            grid, simplices = self.mesh.interpolated_mesh
-        else:
-            batched_matrix = batched_matrix.transpose(-1, -2)
-            grid, simplices = self.mesh.initial_mesh
+
+        batched_matrix = self.mesh.post_process(batched_matrix.transpose(-1, -2))
+        grid, simplices = self.mesh.post_mesh
 
         batched_matrix = self.mesh.to_delaunay(batched_matrix, simplices)
         expanded_size = batched_matrix.shape[-3]

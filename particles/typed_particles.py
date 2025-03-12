@@ -105,7 +105,7 @@ class Nucleus(Particle):
             Nucleus._load_isotope_data(data_path)
         spin, g_factor = self._parse_nucleus_str(nucleus_str)
         super().__init__(spin)
-        self.g_factor = g_factor
+        self.g_factor = torch.tensor(g_factor)
 
     @classmethod
     def _load_isotope_data(cls, data_path: str):
