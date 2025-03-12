@@ -1,4 +1,4 @@
-from spectral_integration import BaseSpectraIntegrator, SpectraIntegratorExtended
+from spectral_integration import BaseSpectraIntegrator, SpectraIntegratorExtended, SpectraIntegratorEasySpinLike
 
 import torch
 from torch import nn
@@ -113,7 +113,7 @@ class IntensitiesCalculator:
 # В каждом батче тоже лучше "обрезать" малые интенсивности.
 class SpectraCreator:
     def __init__(self, spin_system_dim, batch_dims, mesh: mesher.BaseMesh,
-                 spectra_integrator: BaseSpectraIntegrator = SpectraIntegratorExtended()):
+                 spectra_integrator: BaseSpectraIntegrator = SpectraIntegratorEasySpinLike()):
         self.threshold = torch.tensor(1e-3)
         self.spin_system_dim = spin_system_dim  # Как-то поменять
         self.mesh_size = mesh.initial_size
