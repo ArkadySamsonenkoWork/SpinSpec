@@ -681,10 +681,10 @@ class BaseResonanceLocator:
         diff_eig_high = (eig_values_high[..., lvl_up] - eig_values_high[..., lvl_down]).squeeze(-2)
 
         mask = self.get_resonance_mask(diff_eig_low, diff_eig_high, resonance_frequency)
+
         mask_triu = mask.any(dim=0)  # For some u and v there are no transitions
         mask_trans = mask[..., mask_triu]
 
-        #valid_indices = torch.nonzero(mask, as_tuple=True)[0]  # Get valid indices
 
         diff_eig_low = diff_eig_low[mask]
         diff_eig_high = diff_eig_high[mask]
@@ -693,10 +693,6 @@ class BaseResonanceLocator:
         diff_deriv_high = (delta_B * (deriv_high[..., lvl_up] - deriv_high[..., lvl_down])).squeeze(-2)[mask]
         step_B = self._compute_resonance_fields(diff_eig_low, diff_eig_high, diff_deriv_low,
                                     diff_deriv_high, mask_trans, resonance_frequency)
-        # Correctly apply mask to u and v
-        #u_exp = u.unsqueeze(0).expand(mask.size(0), -1)  # shape: [300, 6]
-        #v_exp = v.unsqueeze(0).expand(mask.size(0), -1)  # shape: [300, 6]
-
         resonance_energies = self._compute_resonance_energies(step_B,
                                                               eig_values_low, eig_values_high,
                                                               delta_B * deriv_low, delta_B * deriv_high)
@@ -711,10 +707,11 @@ class BaseResonanceLocator:
         vec_low_down = eig_vectors_low[..., :, valid_lvl_down].transpose(-1, -2)
         vec_high_down = eig_vectors_high[..., :, valid_lvl_down].transpose(-1, -2)
 
-        #vec_low_up = eig_vectors_low[..., valid_lvl_up, :]  # shape: [..., num_transitions, N]
+        #vec_low_up = eig_vectors_low[..., valid_lvl_up, :]  # shape: [..., num_transitions, K]
         #vec_high_up = eig_vectors_high[..., valid_lvl_up, :]  # same shape
 
-        vec_low_up = eig_vectors_low[..., :, valid_lvl_up].transpose(-1, -2)  # shape: [..., num_transitions, N]
+        vec_low_up = eig_vectors_low[..., :, valid_lvl_up].transpose(-1, -2)  # shape: [..., num_transitions, K].
+                                                                              # K is spin system size
         vec_high_up = eig_vectors_high[..., :, valid_lvl_up].transpose(-1, -2)  # same shape
 
         vectors_u = self._interpolate_vectors(vec_low_down, vec_high_down, weights_low, weights_high)
@@ -731,6 +728,90 @@ class BaseResonanceLocator:
         final_batches = [self._iterate_batch(batch, resonance_frequency) for batch in final_batches]
         return final_batches
 
+class GeneralResonanceLocator(BaseResonanceLocator):
+    def _iterate_batch(self,
+                       batch: tuple[
+                                tuple[torch.Tensor, torch.Tensor],
+                                tuple[torch.Tensor, torch.Tensor],
+                                tuple[torch.Tensor, torch.Tensor],
+                                tuple[torch.Tensor, torch.Tensor],
+                                torch.Tensor],
+                       resonance_frequency: torch.Tensor):
+        """
+        :param batch: Tuple with the parameters of the interval:
+             (eig_values_low, eig_values_high) - eigen values of Hamiltonian
+             at the low and high magnetic fields
+             (eig_vectors_low, eig_vectors_high) - eigen vectors of Hamiltonian
+             at the low and high magnetic fields
+             (energy_derivatives_low, energy_derivatives_high) - the derivatives of the energy at
+             low and high magnetic field
+             (energy_derivatives_low, energy_derivatives_high) - the derivatives of the energy
+             at low and high magnetic field
+             (energy_derivatives_low, energy_derivatives_high) - the derivatives of the energy
+             at low and high magnetic field
+             indexes, where mask is valid
+        :param resonance_frequency: the resonance frequency
+        :return:
+        """
+        (eig_values_low, eig_values_high), (eig_vectors_low, eig_vectors_high),\
+            (deriv_low, deriv_high), (B_low, B_high), indexes = batch
+
+        delta_B = B_high - B_low  # [..., 1, 1]
+        shape = eig_values_low.shape  # shape is torch.Size([300, 4])
+        K = shape[-1]
+        lvl_down, lvl_up = torch.triu_indices(K, K, offset=1)
+        eig_values_low = eig_values_low.unsqueeze(-2)  # [..., 1, K]
+        eig_values_high = eig_values_high.unsqueeze(-2)
+        deriv_low = deriv_low.unsqueeze(-2)
+        deriv_high = deriv_high.unsqueeze(-2)
+
+        diff_eig_low = (eig_values_low[..., lvl_up] - eig_values_low[..., lvl_down]).squeeze(-2)
+        diff_eig_high = (eig_values_high[..., lvl_up] - eig_values_high[..., lvl_down]).squeeze(-2)
+
+        mask = self.get_resonance_mask(diff_eig_low, diff_eig_high, resonance_frequency)
+
+        mask_triu = mask.any(dim=0)  # For some u and v there are no transitions
+        mask_trans = mask[..., mask_triu]
+
+
+        diff_eig_low = diff_eig_low[mask]
+        diff_eig_high = diff_eig_high[mask]
+
+        diff_deriv_low = (delta_B * (deriv_low[..., lvl_up] - deriv_low[..., lvl_down])).squeeze(-2)[mask]
+        diff_deriv_high = (delta_B * (deriv_high[..., lvl_up] - deriv_high[..., lvl_down])).squeeze(-2)[mask]
+        step_B = self._compute_resonance_fields(diff_eig_low, diff_eig_high, diff_deriv_low,
+                                    diff_deriv_high, mask_trans, resonance_frequency)
+        resonance_energies = self._compute_resonance_energies(step_B,
+                                                              eig_values_low, eig_values_high,
+                                                              delta_B * deriv_low, delta_B * deriv_high)
+        valid_lvl_down = lvl_down[mask_triu]
+        valid_lvl_up = lvl_up[mask_triu]
+        weights_low, weights_high = self._compute_linear_interpolation_weights(step_B)
+
+        # Get the eigenvector columns corresponding to the levels for interpolation
+        #vec_low_down = eig_vectors_low[..., valid_lvl_down, :]
+        #vec_high_down = eig_vectors_high[..., valid_lvl_down, :]
+
+        vec_low_down = eig_vectors_low[..., :, valid_lvl_down].transpose(-1, -2)
+        vec_high_down = eig_vectors_high[..., :, valid_lvl_down].transpose(-1, -2)
+
+        #vec_low_up = eig_vectors_low[..., valid_lvl_up, :]  # shape: [..., num_transitions, K]
+        #vec_high_up = eig_vectors_high[..., valid_lvl_up, :]  # same shape
+
+        vec_low_up = eig_vectors_low[..., :, valid_lvl_up].transpose(-1, -2)  # shape: [..., num_transitions, K].
+                                                                              # K is spin system size
+        vec_high_up = eig_vectors_high[..., :, valid_lvl_up].transpose(-1, -2)  # same shape
+
+        vectors_u = self._interpolate_vectors(vec_low_down, vec_high_down, weights_low, weights_high)
+        vectors_v = self._interpolate_vectors(vec_low_up, vec_high_up, weights_low, weights_high)
+        return (
+            (vectors_u, vectors_v),
+            (valid_lvl_down, valid_lvl_up),
+            B_low.squeeze(dim=-1) + step_B * delta_B.squeeze(dim=-1),
+            mask_trans, mask_triu,
+            indexes,
+            resonance_energies)
+
 
 class ResField:
     def __init__(self, eigen_finder: BaseEigenSolver = EighEigenSolver()):
@@ -742,7 +823,6 @@ class ResField:
     def _solver_fabric(self, F: torch.Tensor, resonance_frequency: torch.Tensor) \
             -> tuple[BaseResonanceIntervalSolver, BaseResonanceLocator, tuple[tp.Any]]:
         """
-        :param system:
         :param F: The part of Hamiltonian that doesn't depend on the magnetic field
         :param resonance_frequency: The frequency of resonance
         :return:

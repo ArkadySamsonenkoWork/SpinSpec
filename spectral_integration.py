@@ -118,7 +118,7 @@ class SpectraIntegratorExtended(BaseSpectraIntegrator):
         self.two_sqrt = torch.tensor(math.sqrt(2.0))
         self.natural_width = torch.tensor(natural_width)
 
-        self.criteria_coeff = torch.tensor(10)
+        self.criteria_coeff = torch.tensor(4)
         self.three = torch.tensor(3)
         self.shift_coeff = torch.tensor(0.01)
         self.analytical_ratio = AnalyticIntegrand(harmonic)
@@ -192,6 +192,7 @@ class SpectraIntegratorExtended(BaseSpectraIntegrator):
         return result
 
 
+# IT MUST BE CORRECTED TO SPEED UP COMPUTATIONS
 class SpectraIntegratorEasySpinLike(BaseSpectraIntegrator):
     def __init__(self, harmonic: int = 1, natural_width: float = 1e-5):
         """
@@ -451,9 +452,6 @@ class SpectraIntegratorFullyAnalytical(BaseSpectraIntegrator):
         B1, B2, B3 = torch.unbind(res_fields, dim=-1)
 
         mask_all_diff, mask_two_eq, mask_all_eq = self._get_equality_masks(B1, B2, B3, width)
-        # mask_two_eq = mask_two_eq * 0
-        # mask_all_eq = mask_all_eq * 0
-        # mask_all_diff = mask_all_diff * 0
 
 
         result = \
