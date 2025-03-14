@@ -37,8 +37,16 @@ def scalar_tensor_multiplication(
     Returns:
         torch.Tensor: Scalar product with shape [..., K, K].
     """
+
+    #return torch.einsum(
+    #    '...ij, jkl, ikl->...kl',
+    #    transformation_matrix,
+    #    tensor_components_A,
+    #    tensor_components_B
+    #)
+    # IT WAS REBUILD
     return torch.einsum(
-        '...ij, jkl, ikl->...kl',
+        '...ij, jnl, ilm->...nm',
         transformation_matrix,
         tensor_components_A,
         tensor_components_B
@@ -327,7 +335,7 @@ class BaseSample():
             nuclei_contrib += nucleus.spin * nucleus.g_factor.abs()
 
         return (electron_contrib * (constants.BOHR / constants.PLANCK) +
-            nuclei_contrib * (constants.NUCLEAR_MAGNETRON / constants.PLANCK)).unsqueeze(-1)
+            nuclei_contrib * (constants.NUCLEAR_MAGNETRON / constants.PLANCK)).squeeze()
 
     def get_hamiltonian_terms(self) -> tuple:
         """
@@ -339,7 +347,7 @@ class BaseSample():
         return self.build_zero_field_term(), *self.build_zeeman_terms()
 
 
-    def build_field_dep_staine(self):
+    def build_field_dep_straine(self):
         """
         Calculate electron Zeeman field dependant strained part
         :return:
@@ -353,8 +361,13 @@ class BaseSample():
                     self.spin_system.operator_cache[idx],
                     g[..., :, 2, :])
 
-    def build_zero_field_staine(self) -> torch.Tensor:
+    def build_zero_field_straine(self) -> torch.Tensor:
         """Constructs the zero-field strained part."""
+        yield from self.build_electron_nuclei_straine()
+        yield from self.build_electron_electron_straine()
+
+    def build_electron_nuclei_straine(self) -> torch.Tensor:
+        """Constructs the nuclei strained part."""
         for e_idx, n_idx, electron_nuclei in self.spin_system.electron_nuclei:
             electron_nuclei = electron_nuclei.strained_tensor
             if electron_nuclei is None:
@@ -364,6 +377,18 @@ class BaseSample():
                     self.spin_system.operator_cache[e_idx],
                     self.spin_system.operator_cache[len(self.spin_system.electrons) + n_idx],
                     electron_nuclei)
+
+    def build_electron_electron_straine(self) -> torch.Tensor:
+        """Constructs the electron-electron strained part."""
+        for e_idx, e_idx, electron_electron in self.spin_system.electron_electron:
+            electron_electron = electron_electron.strained_tensor
+            if electron_electron is None:
+                pass
+            else:
+                yield (
+                    self.spin_system.operator_cache[e_idx],
+                    self.spin_system.operator_cache[e_idx],
+                    electron_electron)
 
 
 
@@ -397,7 +422,7 @@ class SpinSystemOrientator:
         return interactions_tensors, strined_res
 
 
-    def _apply_reverse_transform(self, spin_system: SpinSystem, new_interactions: list):
+    def _apply_reverse_transform(self, spin_system: SpinSystem, new_interactions: list[MultiOrientedInteraction]):
         # Determine how many interactions belong to each original group.
         num_g = len(spin_system.g_tensors)
         num_nuc = len(spin_system.electron_nuclei)
@@ -429,6 +454,7 @@ class SpinSystemOrientator:
         interactions =\
             [MultiOrientedInteraction(interactions_tensor, strained_tensor, config_shape) for
              interactions_tensor, strained_tensor in zip(interactions_tensors, strained_tensors)]
+
         spin_system = self._apply_reverse_transform(spin_system, interactions)
         return spin_system
 
@@ -454,7 +480,7 @@ class MultiOrientedSample(BaseSample):
         return rotation_matrices[..., :, -1]
 
 
-    def build_hamiltonian_stained(self) -> torch.Tensor:
+    def build_hamiltonian_straineed(self) -> torch.Tensor:
         """Constructs the zero-field strained part."""
         return self.humiltonian_strained
 

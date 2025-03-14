@@ -38,18 +38,18 @@ class EighEigenSolver(BaseEigenSolver):
     def compute_eigenvalues(self, F: torch.Tensor, G: torch.Tensor, B: torch.Tensor):
         return torch.linalg.eigvalsh(F + G * B)
 
-
+# IT WAS BE REBUILDED
 def has_sign_change(res_low: torch.Tensor, res_high: torch.Tensor) -> torch.Tensor:
     """
     calculate the criteria that delta_1N < resonance_frequency
-    :param res_low: resonance function for the lower magnetic field in the interval. The shape is [..., K, K],
+    :param res_low: resonance function for the lower magnetic field in the interval. The shape is [..., num_pairs],
     where K is spin system dimension
-    :param res_high: resonance function for the higher magnetic field in the interval. The shape is [..., K, K],
+    :param res_high: resonance function for the higher magnetic field in the interval. The shape is [..., num_pairs],
     where K is spin system dimension
     :return: mask with the shape [...]. If the value is True, the resonance function changes
     sign and segment can ve bisected further
     """
-    mask = ((res_low * res_high) <= 0).any(dim=(-1, -2))
+    mask = ((res_low * res_high) <= 0).any(dim=(-1))
     return mask
 
 
@@ -57,9 +57,9 @@ def has_rapid_variation(res_low: torch.Tensor, res_high: torch.Tensor,
                             deriv_max: torch.Tensor, B_low: torch.Tensor, B_high: torch.Tensor) -> torch.Tensor:
     """
     calculate the criteria that delta_1N < resonance_frequency
-    :param res_low: resonance function for the lower magnetic field in the interval. The shape is [..., K, K],
+    :param res_low: resonance function for the lower magnetic field in the interval. The shape is [..., num_pairs],
     where K is spin system dimension
-    :param res_high: resonance function for the higher magnetic field in the interval. The shape is [..., K, K],
+    :param res_high: resonance function for the higher magnetic field in the interval. The shape is [..., num_pairs],
     where K is spin system dimension
     :param deriv_max: It is a maxima of energy derevative En'(infinity).
     The calculations can be found in original article. The shape is [...]
@@ -67,7 +67,8 @@ def has_rapid_variation(res_low: torch.Tensor, res_high: torch.Tensor,
     :param B_high: It is maxima magnetic field of the interval. The shape is [..., 1, 1]
     :return: mask with the shape [...]. If the value is True, the segment could be bisected further.
     """
-    mask = (((res_low + res_high) / 2).abs() <= deriv_max * (B_high - B_low)).any(dim=(-1, -2))
+    threshold = (deriv_max * (B_high - B_low).squeeze()).unsqueeze(-1)
+    mask = (((res_low + res_high) / 2).abs() <= threshold).any(dim=(-1))
     return mask
 
 
@@ -96,7 +97,7 @@ class BaseResonanceIntervalSolver(ABC):
     """
     Base class for algorithm of resonance interval search
     """
-    def __init__(self, eigen_finder: tp.Optional[BaseEigenSolver] = EighEigenSolver(), r_tol: float = 1e-5,
+    def __init__(self, eigen_finder: tp.Optional[BaseEigenSolver] = EighEigenSolver(), r_tol: float = 1e-4,
         max_iterations: float=100):
         self.eigen_finder = eigen_finder
         self.r_tol = torch.tensor(r_tol)
@@ -116,7 +117,6 @@ class BaseResonanceIntervalSolver(ABC):
 
         K = eig_values_low.shape[-1]  # Number of states
         u, v = torch.triu_indices(K, K, offset=1, device=eig_values_low.device)
-
         res_low = \
             (eig_values_low.unsqueeze(-2)[..., v] - eig_values_low.unsqueeze(-2)[..., u]).squeeze(
                 -2) - resonance_frequency
@@ -158,7 +158,6 @@ class BaseResonanceIntervalSolver(ABC):
             eig_values_low, eig_values_high, resonance_frequency)  # [...]
         mask_loop_dependant = self.loop_dependant_mask(eig_values_low, eig_values_high, B_low, B_high,
                                                        resonance_frequency, *args, **kwargs)
-
         return torch.logical_and(mask_monotonically, mask_loop_dependant)
 
     @abstractmethod
@@ -226,7 +225,6 @@ class BaseResonanceIntervalSolver(ABC):
 
         mask_and = torch.logical_and(mask_left, mask_right)
         mask_xor = torch.logical_xor(mask_left, mask_right)
-
         # Process and case. It means that both intervals have resonance
 
         if mask_and.any():
@@ -444,12 +442,10 @@ class BaseResonanceIntervalSolver(ABC):
         )]
 
         while current_batches:
-            final_batches = []
             iteration_results = [self._iterate_batch(batch, F, Gz, resonance_frequency, a_tol, *args, **kwargs)
                                  for batch in current_batches]
             current_batches = [current_batch for batches in iteration_results for current_batch in batches[0]]
             final_batches.extend([current_batch for batches in iteration_results for current_batch in batches[1]])
-
             iterations += 1
             if iterations >= self.max_iterations:
                 warnings.warn(f"The max iteration number was overbet {self.max_iterations}")
@@ -602,6 +598,65 @@ class BaseResonanceLocator:
                 break
         return t
 
+    # MUST BE DISAPROVED FUTHER!!!! ЭТО ЗАТЫЧКА, МЕТОД НЬЮТОНА СВАЛИВАЕТСЯ ЗА ГРАНИЦЫ, ЕСЛИ ФУНКЦИЯ МЕНЯЕТ МНОТОННОСТЬ.
+    #  НУЖНО МОДИФИЦИРОВАТЬ _find_resonance_field_newton
+    def _find_resonance_field_bisection(self, diff_eig_low, diff_eig_high, diff_deriv_low, diff_deriv_high,
+                                        resonance_frequency):
+        """
+        Finds the magnetic field value (B_mid) where a resonance occurs by solving a cubic equation
+        using the bisection method. The cubic polynomial is defined by:
+            p3 * t^3 + p2 * t^2 + p1 * t + p0 = 0
+        with coefficients constructed from the input parameters:
+            p3 = 2 * diff_eig_low - 2 * diff_eig_high + diff_deriv_low + diff_deriv_high
+            p2 = -3 * diff_eig_low + 3 * diff_eig_high - 2 * diff_deriv_low - diff_deriv_high
+            p1 = diff_deriv_low
+            p0 = diff_eig_low - target_resonance
+
+        Parameters:
+            diff_eig_low (Tensor): Difference of eigenvalues at B_min for the pair.
+            diff_eig_high (Tensor): Difference of eigenvalues at B_max for the pair.
+            diff_deriv_low (Tensor): Difference of derivatives at B_min for the pair.
+            diff_deriv_high (Tensor): Difference of derivatives at B_max for the pair.
+            resonance_frequency (float): The resonance frequency (or energy) to be reached.
+
+        Returns:
+            Tensor: Estimated magnetic field values where resonance occurs, shape matching input pair dimensions.
+        """
+        max_iterations = 50
+        # Compute the cubic polynomial coefficients.
+        (coef_3, coef_2, coef_1, coef_0) = self._compute_cubic_polinomial_coeffs(
+            diff_eig_low, diff_eig_high, diff_deriv_low, diff_deriv_high)
+        coef_0 -= resonance_frequency
+
+
+        def poly(t):
+            return coef_3 * t ** 3 + coef_2 * t ** 2 + coef_1 * t + coef_0
+        a = torch.tensor(0.0)
+        b = torch.tensor(1.0)
+
+        fa = poly(a)
+        fb = poly(b)
+
+        if (fa * fb > 0).all():
+            raise ValueError("The function does not change sign on the interval (0, 1).")
+
+        for _ in range(max_iterations):
+            t_mid = (a + b) / 2.0
+            f_mid = poly(t_mid)
+
+            # Stop if the function value is close enough to zero or the interval is sufficiently small.
+            if (f_mid.abs() < self.tolerance).all() or (abs(b - a) < self.accuracy).all():
+
+                return t_mid
+
+            sign_change = (fa * f_mid < 0)
+            a = t_mid * (~sign_change).float() + a * sign_change.float()
+            fa = f_mid * (~sign_change).float() + fa * sign_change.float()
+            b = t_mid * sign_change.float() + b * (~sign_change).float()
+            fb = f_mid * sign_change.float() + fb * (~sign_change).float()
+
+        return (a + b) / 2.0
+
     def get_resonance_mask(self, diff_eig_low, diff_eig_high, resonance_frequency):
         sign_change_mask = ((diff_eig_low - resonance_frequency) * (diff_eig_high - resonance_frequency) <= 0)
         return sign_change_mask
@@ -681,7 +736,6 @@ class BaseResonanceLocator:
         diff_eig_high = (eig_values_high[..., lvl_up] - eig_values_high[..., lvl_down]).squeeze(-2)
 
         mask = self.get_resonance_mask(diff_eig_low, diff_eig_high, resonance_frequency)
-
         mask_triu = mask.any(dim=0)  # For some u and v there are no transitions
         mask_trans = mask[..., mask_triu]
 
@@ -693,9 +747,12 @@ class BaseResonanceLocator:
         diff_deriv_high = (delta_B * (deriv_high[..., lvl_up] - deriv_high[..., lvl_down])).squeeze(-2)[mask]
         step_B = self._compute_resonance_fields(diff_eig_low, diff_eig_high, diff_deriv_low,
                                     diff_deriv_high, mask_trans, resonance_frequency)
+
+
         resonance_energies = self._compute_resonance_energies(step_B,
                                                               eig_values_low, eig_values_high,
                                                               delta_B * deriv_low, delta_B * deriv_high)
+
         valid_lvl_down = lvl_down[mask_triu]
         valid_lvl_up = lvl_up[mask_triu]
         weights_low, weights_high = self._compute_linear_interpolation_weights(step_B)
@@ -769,7 +826,6 @@ class GeneralResonanceLocator(BaseResonanceLocator):
         diff_eig_high = (eig_values_high[..., lvl_up] - eig_values_high[..., lvl_down]).squeeze(-2)
 
         mask = self.get_resonance_mask(diff_eig_low, diff_eig_high, resonance_frequency)
-
         mask_triu = mask.any(dim=0)  # For some u and v there are no transitions
         mask_trans = mask[..., mask_triu]
 
@@ -820,7 +876,7 @@ class ResField:
         """
         self.eigen_finder = eigen_finder
 
-    def _solver_fabric(self, F: torch.Tensor, resonance_frequency: torch.Tensor) \
+    def _solver_fabric(self, system, F: torch.Tensor, resonance_frequency: torch.Tensor) \
             -> tuple[BaseResonanceIntervalSolver, BaseResonanceLocator, tuple[tp.Any]]:
         """
         :param F: The part of Hamiltonian that doesn't depend on the magnetic field
@@ -829,9 +885,15 @@ class ResField:
         """
         baselign_sign = self._compute_zero_field_resonance(F, resonance_frequency)
         if baselign_sign.all():
+        #raise NotImplementedError
+            # MUST BE REBUILD FUTHER
             raise NotImplementedError
-        elif baselign_sign.any():
+            locator = BaseResonanceLocator()
             interval_solver = GeneralResonanceIntervalSolver(eigen_finder=self.eigen_finder)
+            args = (baselign_sign, system.calculate_derivative_max())
+            #raise NotImplementedError
+        elif baselign_sign.any():
+            #interval_solver = GeneralResonanceIntervalSolver(eigen_finder=self.eigen_finder)
             raise NotImplementedError
         else:
             locator = BaseResonanceLocator()
@@ -853,7 +915,7 @@ class ResField:
         return res_1N > 0
 
     def __call__(self, system, resonance_frequency, B_low: torch.Tensor, B_high: torch.Tensor, F, Gz):
-        interval_solver, locator, args = self._solver_fabric(F, resonance_frequency)
+        interval_solver, locator, args = self._solver_fabric(system, F, resonance_frequency)
         bathces = interval_solver(F, Gz, B_low, B_high, resonance_frequency, *args)
         bathces = locator(bathces, resonance_frequency)
         return bathces

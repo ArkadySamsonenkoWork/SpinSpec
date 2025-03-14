@@ -181,7 +181,9 @@ class MeshProcessor:
         else:
             return f_extended
 
-
+# It must be changed in the future. Now the mesh is not spherical but plat. Use ConvexHull / matplotlib.tri or
+# other libraries
+# Reimplement approximation processs
 class DelaunayMeshClough(BaseMesh):
     """Delaunay triangulation-based spherical mesh implementation."""
     """It uses CloughTocher2DInterpolator to interpolate Data"""

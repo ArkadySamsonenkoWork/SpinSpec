@@ -254,9 +254,10 @@ class SpectraIntegratorEasySpinLike(BaseSpectraIntegrator):
             ratio = self.infty_ratio(B_mean, c_extended, B_val)
             return (ratio * A_mean).sum(dim=-1)
 
-        spectral_field = spectral_field.unsqueeze(-1)
+        #spectral_field = spectral_field.unsqueeze(-1)
+        #result = integrand(spectral_field)
         #result = torch.vmap(integrand)(spectral_field)  # To make full integral equel to 1.0
-        result = integrand(spectral_field)
+        result = torch.tensor([integrand(b_val) for b_val in spectral_field])
         return result
 
 

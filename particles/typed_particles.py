@@ -60,7 +60,6 @@ def get_spin_operators(s):
     # Sx and Sy from ladder operators
     sx = (splus + sminus) / 2
     sy = (splus - sminus) / (2j)
-
     return {
         'x': sx,
         'y': sy,
