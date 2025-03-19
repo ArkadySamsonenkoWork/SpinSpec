@@ -1,4 +1,7 @@
-from spectral_integration import BaseSpectraIntegrator, SpectraIntegratorExtended, SpectraIntegratorEasySpinLike
+import warnings
+
+from spectral_integration import BaseSpectraIntegrator,\
+    SpectraIntegratorExtended, SpectraIntegratorEasySpinLike,SpectraIntegratorEasySpinLikeTimeResolved
 from populator_time_resolved import PopulatorTimeResolved
 
 import torch
@@ -24,7 +27,7 @@ class StationaryPopulator:
         """
         populations = nn.functional.softmax(-constants.unit_converter(energies) / self.temperature, dim=-1)
         indexes = torch.arange(populations.shape[-2], device=populations.device)
-        return populations[..., indexes, lvl_up] - populations[..., indexes, lvl_down]
+        return populations[..., indexes, lvl_down] - populations[..., indexes, lvl_up]
 
 
 class Broadening:
@@ -190,9 +193,11 @@ class SpectraCreator:
                 res_fields[row_idx[:, None], col_idx] += B_trans_batch
                 intensities[row_idx[:, None], col_idx] += intensity_batch
                 width_square[row_idx[:, None], col_idx] += width_square_batch
-        intensities = intensities.abs()
-        intensities = intensities / intensities.max()
-        treeshold_mask = (intensities >= self.threshold).flatten(0, -2).any(dim=0)
+        #intensities = intensities.abs()
+        if (intensities < 0).any():
+            warnings.warn("Some intensities ate negative. Something probably wrong")
+        intensities = intensities / intensities.abs().max()
+        treeshold_mask = (intensities.abs() >= self.threshold).flatten(0, -2).any(dim=0)
         intensities = intensities[..., treeshold_mask]
         res_fields = res_fields[..., treeshold_mask]
         width_square = width_square[..., treeshold_mask]
@@ -233,13 +238,13 @@ class IntensitiesCalculatorTimeResolved:
         lvl_down, lvl_up = torch.triu_indices(4, 4, offset=1)   # REBUILD FUTHER 4 is spin system dimension
         lvl_down = lvl_down[mask_triu]
         lvl_up = lvl_up[mask_triu]
-        self.populator(res_fields, vector_down, vector_up, resonance_energies, mask_triu, lvl_down, lvl_up)
+        return self.populator(res_fields, vector_down, vector_up, resonance_energies, mask_triu, lvl_down, lvl_up)
 
 
 class SpectraCreatorTimeResolved(SpectraCreator):
     def __init__(self, spin_system_dim, batch_dims, mesh: mesher.BaseMesh,
-                 intensity_calculator: IntensitiesCalculator=IntensitiesCalculatorTimeResolved(),
-                 spectra_integrator: BaseSpectraIntegrator = SpectraIntegratorEasySpinLike(harmonic=1)):
+                 intensity_calculator: IntensitiesCalculatorTimeResolved=IntensitiesCalculatorTimeResolved(),
+                 spectra_integrator: BaseSpectraIntegrator = SpectraIntegratorEasySpinLikeTimeResolved(harmonic=0)):
         super().__init__(spin_system_dim, batch_dims, mesh, intensity_calculator, spectra_integrator)
 
 
@@ -271,11 +276,35 @@ class SpectraCreatorTimeResolved(SpectraCreator):
         population = self.intensity_calculator.calculate_population_evolution(
             res_fields, vector_down, vector_up, resonance_energies, mask_triu)
 
-
+        intensities = intensities.unsqueeze(0)
         intensities = population * intensities  # REBUILD IN THE END
+
         res_fields, width, intensities, areas = self._transform_data_to_delaunay_format(
         res_fields, intensities, width)
         return self.spectra_integrator.integrate(res_fields, width, intensities, areas, fields)
+
+    def _transform_data_to_delaunay_format(self, res_fields, intensities, width):
+        batched_matrix = torch.stack((res_fields, width), dim=-3)
+
+        batched_matrix = self.mesh.post_process(batched_matrix.transpose(-1, -2))
+        intensities = self.mesh.post_process(intensities.transpose(-1, -2))
+        grid, simplices = self.mesh.post_mesh
+
+        batched_matrix = self.mesh.to_delaunay(batched_matrix, simplices)
+        intensities = self.mesh.to_delaunay(intensities, simplices)
+        expanded_size = batched_matrix.shape[-3]
+        batched_matrix = batched_matrix.flatten(-3, -2)
+        intensities = intensities.flatten(-3, -2)
+
+        res_fields, width = torch.unbind(batched_matrix, dim=-3)
+        width = width.mean(dim=-1)
+        intensities = intensities.mean(dim=-1)
+
+        areas = self.mesh.spherical_triangle_areas(grid, simplices)
+        areas = areas.reshape(1, -1)
+        areas = areas.expand(expanded_size, -1)
+        areas = areas.flatten()
+        return res_fields, width, intensities, areas
 
 
     def compute_parameters(self, sample, Gx, Gy, Gz, batches):
