@@ -99,11 +99,6 @@ class BaseMesh(ABC):
 
     @property
     @abstractmethod
-    def initial_mesh(self):
-        pass
-
-    @property
-    @abstractmethod
     def initial_grid(self):
         pass
 
