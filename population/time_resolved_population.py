@@ -14,16 +14,25 @@ import typing as tp
 
 
 class RelaxationSpeedExponential:
-    def __init__(self, time_amplitude=None, zero_temp=3.5, delta_temp=3.5):
-        if time_amplitude is None:
-            self.speed_amplitude = 0.0
-        else:
-            self.speed_amplitude = 1 / (2 * time_amplitude * 10**(-6))
+    def __init__(self, time_amplitude: torch.Tensor, zero_temp=3.5, delta_temp=3.5):
+        """
+        :param time_amplitude: the relaxation time. The shape is [...]
+        :param zero_temp: offset of the exponential dependence
+        :param delta_temp: the scale of the exponential dependence
+        """
+        self.speed_amplitude = 1 / (2 * time_amplitude * 10**(-6))
         self.zero_temp = zero_temp
         self.delta_temp = delta_temp
 
-    def __call__(self, temp):
-        return torch.exp((temp - self.zero_temp) / self.delta_temp) * self.speed_amplitude
+    def __call__(self, temp: torch.Tensor):
+        """
+        :param temp: time-dependant torch tensor. The shape is [time dimension]
+        :return:
+        """
+        out =\
+            torch.exp((temp.view(-1, *[1] * (self.speed_amplitude.dim())) - self.zero_temp) / self.delta_temp) *\
+            self.speed_amplitude
+        return out
 
     def __neg__(self):
         speed = RelaxationSpeedExponential(zero_temp=self.zero_temp, delta_temp=self.delta_temp)
@@ -77,11 +86,14 @@ class RelaxationSpeedMatrix:
     def __init__(self, relaxation_speeds: list[list[RelaxationSpeedExponential]]):
         self.relaxation_speeds = relaxation_speeds
 
-    def __call__(self, temp):
-        #speed_amplitudes = torch.tensor([[m.speed_amplitude for m in row] for row in self.relaxation_speeds])
-        #zero_temps = torch.tensor([[m.zero_temp for m in row] for row in self.relaxation_speeds])
-       # delta_temps = torch.tensor([[m.delta_temp for m in row] for row in self.relaxation_speeds])
-        result = torch.tensor([[m(temp) for m in row] for row in self.relaxation_speeds])
+    def __call__(self, temp: torch.Tensor) -> torch.Tensor:
+        """
+        :param temp: The time-dependant temperature. The shape is [batch_size, time_size]
+        :return: relaxation_spin:
+        relaxation matrix at specific temperature. The output shape is [..., spin dimension, spin dimension]
+        """
+        result = [[m(temp) for m in row] for row in self.relaxation_speeds]
+        result = torch.stack([torch.stack(row, dim=-1) for row in result], dim=-2)
         return result
 
 
@@ -94,21 +106,29 @@ def get_induced_speed_matrix(speed_data: tuple[int, int, torch.Tensor], size: in
     induced_speed[idx_2, idx_2] = -speed
     return induced_speed
 
-class MultiplicationMatrix:
+class EvolutionMatrix:
     def __init__(self, res_energies: torch.Tensor):
+        """
+        :param res_energies: The resonance energies. The shape is [..., spin system dimension, spin system dimension]
+        """
         self.energy_diff = res_energies.unsqueeze(-2) - res_energies.unsqueeze(-1)    # Think about it!!!!
         self.energy_diff = constants.unit_converter(self.energy_diff)
+        self.config_dim = self.energy_diff.shape[:-2]
+
+    def _get_energy_factor(self, temp: torch.Tensor):
+        denom = 1 + torch.exp(-self.energy_diff / temp.view(-1, *[1] * (self.energy_diff.dim())))   # Must be speed up via batching of temperature
+        return torch.reciprocal(denom)
 
     def __call__(self, temp: torch.Tensor, free_speed: RelaxationSpeedMatrix, induced_speed: torch.Tensor):
         """
-        :param temp:
-        :param free_speed:
+        :param temp: The time-dependant temperature. The shape is [time_size]
+        :param free_speed: The free relaxation speed. The shape of the __call__ is
         :param induced_speed:
         :return:
         """
-
-        denom = 1 + torch.exp(-self.energy_diff / temp)  # Must be speed up via batching of temperature
-        part = 2 * free_speed(temp) / denom
+        temp = temp
+        energy_factor = self._get_energy_factor(temp)
+        part = 2 * free_speed(temp) * energy_factor
         K = part.size(-1)
         indices = torch.arange(K, device=part.device)
         part[..., indices, indices] = -part.sum(dim=-2)
@@ -137,12 +157,21 @@ class TempProfile:
         relaxation_part = max_temp - (max_temp - self.start_temp) * (1 - torch.exp(-time / self.thermal_relax_width))
         return relaxation_part * sigmoid_part
 
-def get_relaxation_speeds():
+def get_relaxation_speeds(additional_config=1) -> RelaxationSpeedMatrix:
     #amplitude_relaxation_time_triplet = 100_000  # us
     #amplitude_relaxation_time_exchange = 500  # us
 
-    amplitude_relaxation_time_triplet = 5_700
-    amplitude_relaxation_time_exchange = 500
+    amplitude_relaxation_time_triplet = torch.tensor(5_700)
+    amplitude_relaxation_time_triplet =\
+        amplitude_relaxation_time_triplet.view(-1, *[1] * additional_config)
+
+    amplitude_relaxation_time_exchange = torch.tensor(500)
+    amplitude_relaxation_time_exchange = \
+        amplitude_relaxation_time_exchange.view(-1, *[1] * additional_config)
+
+    zero_speed = torch.tensor(torch.inf)
+    zero_speed = \
+        zero_speed.view(-1, *[1] * additional_config)
 
     #delta_temp = 8.05
     delta_temp = 4.05
@@ -150,7 +179,7 @@ def get_relaxation_speeds():
     zero_temp = 5.0
     triplet_speed = RelaxationSpeedExponential(amplitude_relaxation_time_triplet, zero_temp, 3*delta_temp)
     exchange_speed = RelaxationSpeedExponential(amplitude_relaxation_time_exchange, zero_temp, 3*delta_temp)
-    zero_speed = RelaxationSpeedExponential()
+    zero_speed = RelaxationSpeedExponential(zero_speed)
 
     #free_speeds = [[zero_speed, triplet_speed, zero_speed, zero_speed],
     #               [triplet_speed, zero_speed, exchange_speed, triplet_speed],
@@ -159,9 +188,15 @@ def get_relaxation_speeds():
     #               ]
 
 
-    free_speeds = [[zero_speed, zero_speed, triplet_speed, zero_speed],
-                   [zero_speed, zero_speed, exchange_speed, zero_speed],
-                   [triplet_speed, exchange_speed, zero_speed, triplet_speed],
+    #free_speeds = [[zero_speed, zero_speed, triplet_speed, zero_speed],
+    #               [zero_speed, zero_speed, exchange_speed, zero_speed],
+    #               [triplet_speed, exchange_speed, zero_speed, triplet_speed],
+    #               [zero_speed, zero_speed, triplet_speed, zero_speed],
+    #               ]
+
+    free_speeds = [[zero_speed, zero_speed, exchange_speed, zero_speed],
+                   [zero_speed, zero_speed, triplet_speed, zero_speed],
+                   [exchange_speed, triplet_speed, zero_speed, triplet_speed],
                    [zero_speed, zero_speed, triplet_speed, zero_speed],
                    ]
     return RelaxationSpeedMatrix(free_speeds)
@@ -185,38 +220,37 @@ class TimeResolvedPopulator:
         """
         self.start_temp = start_temp
 
-
-    def __call__(self, res_fields, vector_down, vector_up, energies, lvl_down, lvl_up):
-        """
-        :param energies: energies in Hz
-        :return: population_differences
-        """
+    def _precompute_data(self, res_fields, vector_down, vector_up, energies, lvl_down, lvl_up):
         energies = copy.deepcopy(energies)
-        energies[..., 1] = energies[..., 1] * 7
-        #energies[..., 2] = energies[..., 2] * 12
+        return res_fields, vector_down, vector_up, energies, lvl_down, lvl_up
 
-        initial_populations = nn.functional.softmax(-constants.unit_converter(energies) / self.start_temp, dim=-1)
+    def _get_initial_populations(self, energies):
+        return nn.functional.softmax(-constants.unit_converter(energies) / self.start_temp, dim=-1)
+
+    def _matrix_and_profile(self, energies: torch.Tensor, lvl_down: torch.Tensor, lvl_up: torch.Tensor):
+        free = get_relaxation_speeds()
+        ind = get_induced_speed(lvl_down, lvl_up).unsqueeze(0)
+        evo = EvolutionMatrix(energies)
+        prof = TempProfile(power=50)
+        return free, ind, evo, prof
+
+    def _post_compute_data(self, initial_populations, time_dep_population, lvl_down, lvl_up):
         indexes = torch.arange(initial_populations.shape[-2], device=initial_populations.device)
-        initial_population_intensity =\
-            initial_populations[..., indexes, lvl_down] - initial_populations[..., indexes, lvl_up]
-        free_speed_matrix = get_relaxation_speeds()
-        induced_speed = get_induced_speed(lvl_down, lvl_up).unsqueeze(0)
-        multiplication_matrix = MultiplicationMatrix(energies)
-        temp_profiler = TempProfile(power=50)
-        size = 3000
-        #size = 200
-        time = torch.linspace(-100, 70 * 1e3, size)
-        n0 = initial_populations
+        time_intensities = time_dep_population[..., indexes, lvl_down] - time_dep_population[..., indexes, lvl_up]
+        init_intensity = initial_populations[..., indexes, lvl_down] - initial_populations[..., indexes, lvl_up]
+        return time_intensities - init_intensity.unsqueeze(0)
 
+    def run(self, time: torch.Tensor, initial_populations: torch.Tensor, prof: TempProfile, evo: EvolutionMatrix,
+            free: RelaxationSpeedMatrix, ind: torch.Tensor):
         dt = (time[1] - time[0]) * 1e-6
-        temp = temp_profiler(time)
+        size = time.size()[0]
+        temp = prof(time)
+        n = torch.zeros((size,) + initial_populations.shape, dtype=initial_populations.dtype)
+        n[0] = initial_populations
+        M = evo(temp, free, ind)
+        exp_M = torch.matrix_exp(M * dt)
 
-        n = torch.zeros((size,) + n0.shape, dtype=n0.dtype)
-        n[0] = n0
-        # Iterate over each time step to compute the solution
-        #M = multiplication_matrix(temp, free_speed_matrix, induced_speed)  # Shape [..., K, K]
-        #exp_M = torch.matrix_exp(M * dt)
-
+        """
         self.i = 0
         sol = odeint(
             func=lambda t, y: self.rate_equation(
@@ -227,31 +261,47 @@ class TimeResolvedPopulator:
             atol=1e-0,
             #method=ode_solver
         )
-        
-        print(sol.shape)
+        """
         for i in range(len(time) - 1):
 
             current_n = n[i]  # Shape [..., K]
-            next_n = torch.einsum('...kl,...l->...k', exp_M, current_n)
+            next_n = torch.einsum('...kl,...l->...k', exp_M[i], current_n)
             #delta_n = torch.einsum('...kl,...l->...k', M_i, current_n)
             #print(delta_n[0])
             #next_n = delta_n * dt + current_n
             #next_n = next_n / next_n.sum(dim=-1, keepdim=True)  # To make sure that it is equel to 1
             n[i + 1] = next_n
+        return n
 
-        intensities = n[..., indexes, lvl_down] - n[..., indexes, lvl_up]
-
-        return intensities
-
-    def rate_equation(self, t, n_flat, multiplication_matrix, free_speed, induced_speed, temp_profile):
+    def __call__(self, res_fields, vector_down, vector_up, energies, lvl_down, lvl_up, *args, **kwargs):
         """
+        :param energies: energies in Hz
+        :return: population_differences
+        """
+        eigen_vectors_full = args[0]
+        eigen_vectors_base = 
 
+
+        res_fields, vector_down, vector_up, energies, lvl_down, lvl_up = self._precompute_data(res_fields, vector_down,
+                                                                                               vector_up, energies,
+                                                                                               lvl_down, lvl_up
+                                                                                               )
+        initial_populations = self._get_initial_populations(energies)
+        free, ind, evo, prof = self._matrix_and_profile(energies, lvl_down, lvl_up)
+        size = 3000
+        time = torch.linspace(-100, 70 * 1e3, size)
+        n = self.run(time, initial_populations, prof, evo, free, ind)
+        res = self._post_compute_data(initial_populations, n, lvl_down, lvl_up)
+        return res
+
+"""
+    def rate_equation(self, t, n_flat, multiplication_matrix, free_speed, induced_speed, temp_profile):
 
         RHS for dn/dt = M(t) n, where M depends on t through temperature.
         - t: scalar time
         - n_flat: flattened populations of shape (..., K)
         Returns dn_flat/dt of same shape.
-        """
+
         print(t)
         #K = multiplication_matrix.energies.shape[-1]
         #n = n_flat.view(*multiplication_matrix.energies.shape[:-1], K)
@@ -260,5 +310,5 @@ class TimeResolvedPopulator:
 
         # Compute dn/dt = M_t @ n
         dn = torch.einsum("...kl,...l->...k", M_t, n_flat)
-
         return dn
+"""
