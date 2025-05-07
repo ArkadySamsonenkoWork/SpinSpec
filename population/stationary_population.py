@@ -3,7 +3,7 @@ import torch
 import constants
 
 class StationaryPopulator:
-    def __init__(self, temperature: float = 273.0):
+    def __init__(self, temperature: float = 300.0):
         """
         :param temperature: temperature in K
         """

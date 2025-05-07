@@ -72,9 +72,10 @@ class Broadening:
 
 
 class BaseIntensityCalculator:
-    def __init__(self, populator: tp.Callable, tolerancy=1e-14):
+    def __init__(self, spin_system_dim: int, populator: tp.Callable, tolerancy=1e-14):
         self.tolerancy = torch.tensor(tolerancy)
         self.populator = populator
+        self.spin_system_dim = spin_system_dim
 
     def compute_matrix_element(self, vector_down, vector_up, G):
         return torch.einsum('...bi,...ij,...bj->...b', torch.conj(vector_down), G, vector_up)
@@ -100,8 +101,8 @@ class BaseIntensityCalculator:
 
 
 class StationaryIntensitiesCalculator(BaseIntensityCalculator):
-    def __init__(self, populator: tp.Callable = StationaryPopulator(), tolerancy=1e-14):
-        super().__init__(populator, tolerancy)
+    def __init__(self, spin_system_dim: int, populator: tp.Callable = StationaryPopulator(), tolerancy=1e-14):
+        super().__init__(spin_system_dim, populator, tolerancy)
 
     def compute_intensity(self, Gx, Gy, Gz, batch):
         """Base method to compute intensity (to be overridden)."""
@@ -117,8 +118,7 @@ class StationaryIntensitiesCalculator(BaseIntensityCalculator):
 
 class TimeResolvedIntensitiesCalculator(BaseIntensityCalculator):
     def __init__(self, spin_system_dim: int, populator=TimeResolvedPopulator(), tolerancy=1e-14):
-        super().__init__(populator, tolerancy)
-        self.spin_system_dim = spin_system_dim
+        super().__init__(spin_system_dim, populator, tolerancy)
 
     def compute_intensity(self, Gx, Gy, Gz, batch):
         (vector_down, vector_up), (_, _),\
@@ -151,6 +151,7 @@ class ParamSpec:
 
 class BaseSpectraCreator:
     def __init__(self, spin_system_dim, batch_dims, mesh: mesher.BaseMesh,
+                 intensity_calculator: StationaryIntensitiesCalculator | None = None,
                  spectra_integrator: BaseSpectraIntegrator = SpectraIntegratorEasySpinLike(harmonic=1)):
         self.threshold = torch.tensor(1e-3)
         self.spin_system_dim = spin_system_dim
@@ -160,17 +161,21 @@ class BaseSpectraCreator:
         self.mesh = mesh
         self.spectra_integrator = spectra_integrator
         self.res_field = res_field_algorithm.ResField(output_full_eigenvector=self._get_output_eigenvector())
-        self.intensity_calculator = self._get_intensity_calculator()
+        self.intensity_calculator = self._get_intenisty_calculator(intensity_calculator)
         self._param_specs = self._get_param_specs()
+
+
+    def _get_intenisty_calculator(self, intensity_calculator):
+        if intensity_calculator is None:
+            return StationaryIntensitiesCalculator(self.spin_system_dim)
+        else:
+            return intensity_calculator
 
     def _get_output_eigenvector(self) -> bool:
         return False
 
     def _get_param_specs(self) -> list[ParamSpec]:
         return []
-
-    def _get_intensity_calculator(self):
-        return StationaryIntensitiesCalculator()
 
     def _process_tensor(self, data_tensor: torch.Tensor):
         _, simplices = self.mesh.post_mesh
@@ -358,8 +363,15 @@ class BaseSpectraCreator:
 
 class TruncatedSpectraCreatorTimeResolved(BaseSpectraCreator):
     def __init__(self, spin_system_dim, batch_dims, mesh: mesher.BaseMesh,
+                 intensity_calculator: TimeResolvedIntensitiesCalculator | None = None,
                  spectra_integrator: BaseSpectraIntegrator = SpectraIntegratorEasySpinLikeTimeResolved(harmonic=0)):
-        super().__init__(spin_system_dim, batch_dims, mesh, spectra_integrator)
+        super().__init__(spin_system_dim, batch_dims, mesh, intensity_calculator, spectra_integrator)
+
+    def _get_intenisty_calculator(self, intensity_calculator):
+        if intensity_calculator is None:
+            return TimeResolvedIntensitiesCalculator(self.spin_system_dim)
+        else:
+            return intensity_calculator
 
     def _get_param_specs(self) -> list[ParamSpec]:
         params = [
@@ -424,8 +436,9 @@ class TruncatedSpectraCreatorTimeResolved(BaseSpectraCreator):
 
 class CoupledSpectraCreatorTimeResolved(TruncatedSpectraCreatorTimeResolved):
     def __init__(self, spin_system_dim, batch_dims, mesh: mesher.BaseMesh,
+                 intensity_calculator: TimeResolvedIntensitiesCalculator | None = None,
                  spectra_integrator: BaseSpectraIntegrator = SpectraIntegratorEasySpinLikeTimeResolved(harmonic=0)):
-        super().__init__(spin_system_dim, batch_dims, mesh, spectra_integrator)
+        super().__init__(spin_system_dim, batch_dims, mesh, intensity_calculator, spectra_integrator)
 
     def _get_output_eigenvector(self) -> bool:
         return True
