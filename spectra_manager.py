@@ -4,7 +4,8 @@ from dataclasses import dataclass
 
 from spectral_integration import BaseSpectraIntegrator,\
     SpectraIntegratorExtended, SpectraIntegratorEasySpinLike, SpectraIntegratorEasySpinLikeTimeResolved
-from population import TimeResolvedPopulator, StationaryPopulator
+from population import BaseTimeDependantPopulator, StationaryPopulator
+from population.mechanisms import T1Population
 
 import torch
 from torch import nn
@@ -117,8 +118,10 @@ class StationaryIntensitiesCalculator(BaseIntensityCalculator):
 
 
 class TimeResolvedIntensitiesCalculator(BaseIntensityCalculator):
-    def __init__(self, spin_system_dim: int, populator=TimeResolvedPopulator(), tolerancy=1e-14):
+    def __init__(self, spin_system_dim: int, time: torch.Tensor,
+                 populator: BaseTimeDependantPopulator = T1Population, tolerancy=1e-14):
         super().__init__(spin_system_dim, populator, tolerancy)
+        self.time = time
 
     def compute_intensity(self, Gx, Gy, Gz, batch):
         (vector_down, vector_up), (_, _),\
@@ -136,7 +139,8 @@ class TimeResolvedIntensitiesCalculator(BaseIntensityCalculator):
                                               self.spin_system_dim, offset=1)
         lvl_down = lvl_down[mask_triu]
         lvl_up = lvl_up[mask_triu]
-        return self.populator(res_fields, vector_down, vector_up, resonance_energies, lvl_down, lvl_up, *args, **kwargs)
+        return self.populator(res_fields, vector_down, vector_up, resonance_energies, lvl_down, lvl_up,
+                              self.time, *args, **kwargs)
 
 
 @dataclass
@@ -227,7 +231,6 @@ class BaseSpectraCreator:
 
         F, Gx, Gy, Gz = sample.get_hamiltonian_terms()
         batches = self.res_field(sample, resonance_frequency, B_low, B_high, F, Gz)
-
         compute_out = self.compute_parameters(sample, Gx, Gy, Gz, batches)
         compute_out, fields = self._postcompute_batch_data(compute_out, fields)
         return self._finalize(compute_out, fields)
@@ -240,7 +243,6 @@ class BaseSpectraCreator:
                   fields: torch.Tensor):
 
         _, res_fields, intensities, width, *additional_args = compute_out
-
         res_fields, width, intensities, areas = (
             self._transform_data_to_delaunay_format(
                 res_fields, intensities, width
@@ -256,7 +258,7 @@ class BaseSpectraCreator:
         (vector_down, vector_up), (_, _),\
             B_trans, mask_trans, mask_triu, indexes, resonance_energies, _ = batch
         width_square = self.broader(sample, vector_down, vector_up, B_trans, indexes)
-        return mask_triu, B_trans, intensity, width_square, indexes
+        return mask_trans, mask_triu, B_trans, intensity, width_square, indexes
 
     def _first_pass(self, sample, Gx, Gy, Gz, batches):
         num_pairs = (self.spin_system_dim ** 2 - self.spin_system_dim) // 2
@@ -265,8 +267,9 @@ class BaseSpectraCreator:
         )
         cached_batches = []
         for batch in batches:
-            mask_triu, B_trans_batch, intensity_batch, width_square_batch, mask_indexes, *extras = \
+            mask_trans, mask_triu, B_trans_batch, intensity_batch, width_square_batch, mask_indexes, *extras = \
                 self._precompute_batch_data(sample, Gx, Gy, Gz, batch)
+
             row_idx = torch.nonzero(mask_indexes, as_tuple=False).squeeze(-1)
             col_idx = torch.nonzero(mask_triu, as_tuple=False).squeeze(-1)
 
@@ -276,7 +279,7 @@ class BaseSpectraCreator:
                     max_abs_intensity[col_idx], pair_max
                 )
             cached_batches.append(
-                (mask_triu, B_trans_batch, intensity_batch, width_square_batch, mask_indexes, *extras)
+                (mask_trans, mask_triu, B_trans_batch, intensity_batch, width_square_batch, mask_indexes, *extras)
             )
 
         kept_pairs = torch.nonzero(max_abs_intensity >= self.threshold, as_tuple=False).squeeze(-1)
@@ -330,7 +333,38 @@ class BaseSpectraCreator:
                 extra_tensors[idx][row_idx[:, None], col_base_idx, :, :] = \
                     extras_batch[idx][..., col_batch_idx, :, :]
 
-    def compute_parameters(self, sample, Gx, Gy, Gz, batches):
+    def compute_parameters(self, sample: spin_system.MultiOrientedSample,
+                           Gx: torch.Tensor,
+                           Gy: torch.Tensor,
+                           Gz: torch.Tensor,
+                           batches: list[
+                               tuple[
+                                    tuple[torch.Tensor, torch.Tensor],
+                                    tuple[torch.Tensor, torch.Tensor],
+                                    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+                                    torch.Tensor, torch.Tensor | None,
+                               ]]):
+        """
+        :param sample: The sample which transitions must be found
+        :param Gx: x-part of Hamiltonian Zeeman Term
+        :param Gy: y-part of Hamiltonian Zeeman Term
+        :param Gz: z-part of Hamiltonian Zeeman Term
+
+        :param batches: list of next data:
+        - tuple of eigen vectors for resonance energy levels of low and high levels
+        - tuple of valid indexes of levels between which transition occurs
+        - magnetic field of transitions
+        - mask_trans - Boolean transition mask [batch_size, num valid transitions]. It is True if transition occurs
+        - mask_triu - Boolean triangular mask [total number of all possible transitions].
+        It is True if there is at least one element in batch for which transition between energy levels occurs.
+        num valid transitions = sum(mask_triu)
+        - indexes: Boolean mask of correct elements in batch
+        - resonance energies
+        - vector_full_system | None. The eigen vectors for all energy levels
+
+        :return:
+        """
+
         config_dims = (*self.batch_dims, *self.mesh_size)
         batches, kept_pairs = self._first_pass(sample, Gx, Gy, Gz, batches)
         m = kept_pairs.numel()
@@ -343,35 +377,47 @@ class BaseSpectraCreator:
         num_pairs = (self.spin_system_dim ** 2 - self.spin_system_dim) // 2
         mask_triu_general = torch.ones(num_pairs, dtype=torch.bool)
         for batch in batches:
-            mask_triu, B_trans_batch, intensity_batch, width_square_batch, mask_indexes, *extras_batch = batch
+            mask_trans, mask_triu, B_trans_batch, intensity_batch,\
+                width_square_batch, mask_indexes, *extras_batch = batch
             row_idx = torch.nonzero(mask_indexes).squeeze(-1)  # Shape [num_selected_rows]
             col_idx = torch.nonzero(mask_triu).squeeze(-1)  # Shape [num_selected_cols]
-
             if row_idx.numel() > 0 and col_idx.numel() > 0:
+                print(col_idx)
                 mask_triu_general = mask_triu_general * mask_triu
                 col_base_idx, col_batch_idx = self._match_col_indexes(kept_pairs, col_idx)
-                res_fields[row_idx[:, None], col_base_idx] += B_trans_batch[..., col_batch_idx]
+                res_fields[row_idx[:, None], col_base_idx] = B_trans_batch[..., col_batch_idx]
+
                 intensities[row_idx[:, None], col_base_idx] += intensity_batch[..., col_batch_idx]
                 width_square[row_idx[:, None], col_base_idx] += width_square_batch[..., col_batch_idx]
                 self._update_extras(extra_tensors, extras_batch, row_idx, col_base_idx, col_batch_idx)
-
         intensities = intensities / intensities.abs().max()
         width = self.broader.add_hamiltonian_straine(sample, width_square)
         return mask_triu_general, res_fields, intensities, width, *extra_tensors
 
+
 # The logic with output_full_eigenvector=True must be rebuild
 
 class TruncatedSpectraCreatorTimeResolved(BaseSpectraCreator):
-    def __init__(self, spin_system_dim, batch_dims, mesh: mesher.BaseMesh,
+    def __init__(self, spin_system_dim, batch_dims, mesh: mesher.BaseMesh, time: torch.Tensor,
                  intensity_calculator: TimeResolvedIntensitiesCalculator | None = None,
                  spectra_integrator: BaseSpectraIntegrator = SpectraIntegratorEasySpinLikeTimeResolved(harmonic=0)):
         super().__init__(spin_system_dim, batch_dims, mesh, intensity_calculator, spectra_integrator)
+        self._time = time
 
     def _get_intenisty_calculator(self, intensity_calculator):
         if intensity_calculator is None:
-            return TimeResolvedIntensitiesCalculator(self.spin_system_dim)
+            return TimeResolvedIntensitiesCalculator(self.spin_system_dim, self._time)
         else:
             return intensity_calculator
+
+    @property
+    def time(self):
+        return self._time
+
+    @time.setter
+    def time(self, time: torch.Tensor):
+        self._time = time
+        self.intensity_calculator.time = time
 
     def _get_param_specs(self) -> list[ParamSpec]:
         params = [
@@ -398,7 +444,8 @@ class TruncatedSpectraCreatorTimeResolved(BaseSpectraCreator):
         (vector_down, vector_up), (lvl_down, lvl_up),\
             B_trans, mask_trans, mask_triu, indexes, resonance_energies, _ = batch
         width_square = self.broader(sample, vector_down, vector_up, B_trans, indexes)
-        return mask_triu, B_trans, intensity, width_square, indexes, resonance_energies, vector_down, vector_up
+        return mask_trans, mask_triu, B_trans,\
+            intensity, width_square, indexes, resonance_energies, vector_down, vector_up
 
     def _postcompute_batch_data(self, compute_out: tuple, fields: torch.Tensor):
         mask_triu, res_fields, intensities, width, *extras = compute_out
@@ -435,10 +482,10 @@ class TruncatedSpectraCreatorTimeResolved(BaseSpectraCreator):
 
 
 class CoupledSpectraCreatorTimeResolved(TruncatedSpectraCreatorTimeResolved):
-    def __init__(self, spin_system_dim, batch_dims, mesh: mesher.BaseMesh,
+    def __init__(self, spin_system_dim, batch_dims, mesh: mesher.BaseMesh, time: torch.Tensor,
                  intensity_calculator: TimeResolvedIntensitiesCalculator | None = None,
                  spectra_integrator: BaseSpectraIntegrator = SpectraIntegratorEasySpinLikeTimeResolved(harmonic=0)):
-        super().__init__(spin_system_dim, batch_dims, mesh, intensity_calculator, spectra_integrator)
+        super().__init__(spin_system_dim, batch_dims, mesh, time, intensity_calculator, spectra_integrator)
 
     def _get_output_eigenvector(self) -> bool:
         return True
@@ -465,7 +512,7 @@ class CoupledSpectraCreatorTimeResolved(TruncatedSpectraCreatorTimeResolved):
         (vector_down, vector_up), (lvl_down, lvl_up),\
             B_trans, mask_trans, mask_triu, indexes, resonance_energies, vector_full = batch
         width_square = self.broader(sample, vector_down, vector_up, B_trans, indexes)
-        return mask_triu, B_trans, intensity, width_square, indexes, resonance_energies,\
+        return mask_trans, mask_triu, B_trans, intensity, width_square, indexes, resonance_energies,\
             vector_down, vector_up, vector_full
 
 

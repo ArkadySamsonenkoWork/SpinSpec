@@ -6,6 +6,8 @@ import typing as tp
 import torch
 from torch import nn
 
+import spin_system
+
 class BaseEigenSolver(ABC):
     @abstractmethod
     def __call__(self, F: torch.Tensor, G: torch.Tensor, B: torch.Tensor):
@@ -99,7 +101,7 @@ class BaseResonanceIntervalSolver(ABC):
     Base class for algorithm of resonance interval search
     """
     def __init__(self, eigen_finder: tp.Optional[BaseEigenSolver] = EighEigenSolver(), r_tol: float = 1e-4,
-        max_iterations: float=100):
+        max_iterations: float = 20):
         self.eigen_finder = eigen_finder
         self.r_tol = torch.tensor(r_tol)
         self.max_iterations = torch.tensor(max_iterations)
@@ -206,7 +208,8 @@ class BaseResonanceIntervalSolver(ABC):
         derivatives_low = self._compute_derivative(eig_vectors_low, G[indexes])
         derivatives_high = self._compute_derivative(eig_vectors_high, G[indexes])
         eig_values_estimation = 0.5 * (eig_values_high + eig_values_low) +\
-                                    (B_high - B_low) / 8 * (derivatives_high - derivatives_low)
+                                      (B_high - B_low) / 8 * (derivatives_high - derivatives_low)
+        #eig_values_estimation = 0.5 * (eig_values_high + eig_values_low)
         epsilon = 2 * (eig_values_estimation - eig_values_mid).abs().max(dim=-1)[0]
         return epsilon, (derivatives_low, derivatives_high)
 
@@ -340,14 +343,15 @@ class BaseResonanceIntervalSolver(ABC):
         (eig_values_low, eig_values_high), (eig_vectors_low, eig_vectors_high), (B_low, B_high), indexes = batch
         B_mid = (B_low + B_high) / 2
         eig_values_mid, eig_vectors_mid = torch.linalg.eigh(F[indexes] + Gz[indexes] * B_mid)
+
         # It is only one single
         # point where gradient should be calculated
+
         error, (derivatives_low, derivatives_high) = \
             self.compute_error(eig_values_low, eig_values_mid, eig_values_high,
                                eig_vectors_low, eig_vectors_high,
                                B_low, B_high, Gz, indexes
                                )
-
         converged_mask = (error <= a_tol).any(dim=-1)
         # На этом шаге нужно также разделить инетервал на две части. eig_values_mid, eig_vectors_mid уже посчитаны!!
         # Но нужно тогда пересчитывать derivatives
@@ -641,7 +645,6 @@ class BaseResonanceLocator:
                                   mask_trans: torch.Tensor,
                                   resonance_frequency: torch.Tensor) ->\
             list[tuple[torch.Tensor, torch.Tensor]]:
-
         step_B = torch.zeros_like(mask_trans, dtype=torch.float32)
         step_B[mask_trans] = self._find_resonance_roots(diff_eig_low, diff_eig_high,
                                                   diff_deriv_low, diff_deriv_high,
@@ -670,8 +673,18 @@ class BaseResonanceLocator:
         vectors_u = vec_low * weights_low + vec_high_aligned_down * weights_high
         return vectors_u
 
-    def _split_mask(self, mask_res: torch.Tensor):
-        mask_triu = mask_res.any(dim=0)
+    def _split_mask(self, mask_res: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        :param mask_res: Boolean tensor of shape [batch_size, num_transitions],
+                where each element indicates whether a specific transition occurred in that batch item.
+
+        :return: tuple[torch.Tensor, torch.Tensor]:
+                - mask_triu (torch.Tensor): Boolean vector of length num_transitions.
+                  mask_triu[j] is True if transition j occurred in any batch element.
+                - mask_trans (torch.Tensor): Subset of mask_res selecting only the columns
+                  where mask_triu is True (i.e., transitions that occur at least once in the batch).
+        """
+        mask_triu = mask_res.any(dim=-2)
         mask_trans = mask_res[..., mask_triu]
         return mask_triu, mask_trans
 
@@ -783,6 +796,20 @@ class BaseResonanceLocator:
 
         return (vectors_u, vectors_v), vector_full_system
 
+    def _apply_roots_valid_mask(self, mask_trans: torch.Tensor, mask_trans_i: torch.Tensor,
+                               mask_triu: torch.Tensor, step_B: torch.Tensor) -> tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Apply transition mask filtering and update related tensors efficiently.
+        :param mask_trans: Current transition mask [batch_size, num_transitions]
+        :param mask_trans_i: New mask to apply [batch_size, num_transitions]
+        :param mask_triu: Upper triangular mask to update [num_transitions]
+        :param step_B: Magnetic field steps to filter [batch_size, num_transitions]
+        :return:
+        tuple: (filtered_mask_trans, updated_mask_triu, filtered_step_B)
+        """
+        return mask_trans, mask_triu, step_B
+
     def _iterate_batch(self,
                        batch: tuple[
                                 tuple[torch.Tensor, torch.Tensor],
@@ -790,8 +817,11 @@ class BaseResonanceLocator:
                                 tuple[torch.Tensor, torch.Tensor],
                                 tuple[torch.Tensor, torch.Tensor],
                                 torch.Tensor],
-                       resonance_frequency: torch.Tensor,
-                       *args, **kwargs):
+                       resonance_frequency: torch.Tensor, *args, **kwargs) ->\
+            list[tuple[
+                    tuple[torch.Tensor, torch.Tensor],
+                    tuple[torch.Tensor, torch.Tensor],
+                    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]]:
         """
         :param batch: Tuple with the parameters of the interval:
              (eig_values_low, eig_values_high) - eigen values of Hamiltonian
@@ -802,8 +832,7 @@ class BaseResonanceLocator:
              low and high magnetic field
              (energy_derivatives_low, energy_derivatives_high) - the derivatives of the energy
              at low and high magnetic field
-             (energy_derivatives_low, energy_derivatives_high) - the derivatives of the energy
-             at low and high magnetic field
+             (magnetic field low, magnetic field high) - the low and high magnetic fields
              indexes, where mask is valid
         :param resonance_frequency: the resonance frequency
         args are additional arguments to compute resonance mask
@@ -831,16 +860,20 @@ class BaseResonanceLocator:
 
         outputs = []
         for step_B, mask_trans_i in resonance_field_data:
+            # Check if it is correct
+            mask_trans, mask_triu, step_B =\
+                self._apply_roots_valid_mask(mask_trans, mask_trans_i, mask_triu, step_B)
+
             resonance_energies = self._compute_resonance_energies(step_B,
                                                                   eig_values_low, eig_values_high,
                                                                   delta_B * deriv_low, delta_B * deriv_high
                                                                   )
+
             valid_lvl_down = lvl_down[mask_triu]
             valid_lvl_up = lvl_up[mask_triu]
 
             (vectors_u, vectors_v), vector_full_system = self._compute_eigenvectors(eig_vectors_low, eig_vectors_high,
-                                                              valid_lvl_down, valid_lvl_up, step_B
-                                                              )
+                                                              valid_lvl_down, valid_lvl_up, step_B)
             out_res = (
                 (vectors_u, vectors_v),
                 (valid_lvl_down, valid_lvl_up),
@@ -862,6 +895,9 @@ class BaseResonanceLocator:
 
 class GeneralResonanceLocator(BaseResonanceLocator):
     def _find_three_roots(self, a: torch.Tensor, p: torch.Tensor, q: torch.Tensor):
+        """
+        coefficients of 3-order polynomial
+        """
         p_m3 = torch.sqrt(-p / 3)
 
         acos_argument = (-q / 2) / (p_m3 ** 3)
@@ -875,7 +911,7 @@ class GeneralResonanceLocator(BaseResonanceLocator):
         roots_case1 = torch.stack([t1, t2, t3], dim=-1)  # (..., 3)
         return roots_case1
 
-    def _filter_three_toots(self, three_roots: torch.Tensor) -> torch.Tensor:
+    def _filter_three_roots(self, three_roots: torch.Tensor) -> torch.Tensor:
         """
         Filter three toorch to make number of inf less.
         :param three_roots: The tensor with the shape [N, 3]. The root can be number or inf
@@ -893,6 +929,9 @@ class GeneralResonanceLocator(BaseResonanceLocator):
         results = self._find_resonance_roots(diff_eig_low, diff_eig_high,
                                                   diff_deriv_low, diff_deriv_high,
                                                   resonance_frequency)
+        if not results or all(roots.numel() == 0 for roots, _ in results):
+            return []
+
         outs = []
         for roots, mask_roots in results:
             pair_mask = torch.clone(mask_trans)
@@ -913,20 +952,23 @@ class GeneralResonanceLocator(BaseResonanceLocator):
         :return: the list of the next pairs:
         (roots, mask), where mask has shape [N + M], roots has shape [K], where K is number of True in the mask
         """
-        three_roots = self._filter_three_toots(three_roots)
+        three_roots = self._filter_three_roots(three_roots)
         lines = mask_three_roots.shape[0]
         columns = three_roots.shape[-1]
+
+        out_columns = columns if columns > 0 else 1
         full_roots = torch.full(
-            (lines, columns),
+            (lines, out_columns),
             float('nan'),
             dtype=three_roots.dtype,
             device=three_roots.device
         )
-        full_roots[mask_three_roots] = three_roots
+        if columns > 0:
+            full_roots[mask_three_roots] = three_roots
+
         full_roots[mask_one_root, 0] = one_root.squeeze(-1)
-
-        valid = (full_roots >= 0.0) & (full_roots <= 1.0)
-
+        valid = full_roots.ge(0.0) & full_roots.le(1.0)
+        #valid = (full_roots >= 0.0) & (full_roots <= 1.0)
         result = []
         for i in range(valid.shape[-1]):
             mask = valid[:, i]  # shape [B]
@@ -956,7 +998,10 @@ class GeneralResonanceLocator(BaseResonanceLocator):
         :param diff_deriv_low: Difference of derivatives at B_min for the pair.
         :param diff_deriv_high: Difference of derivatives at B_max for the pair.
         :param resonance_frequency: The resonance frequency (or energy) to be reached.
-        :return: Estimated magnetic field values where resonance occurs, shape matching input pair dimensions.
+        :return: list of tuples (magnetic field, mask)
+        Estimated magnetic field values where resonance occurs, shape matching input pair dimensions.
+        and mask where transition occurs
+
         """
         eps = 1e-11
         tresshold = 1e-10
@@ -981,7 +1026,8 @@ class GeneralResonanceLocator(BaseResonanceLocator):
 
         if mask_three_roots.any():
             roots_case1 = self._find_three_roots(a[mask_three_roots], p[mask_three_roots], q[mask_three_roots])
-            roots_in_interval = (roots_case1 >= 0.0) & (roots_case1 <= 1.0)
+            roots_in_interval = roots_case1.ge(0.0) & roots_case1.le(1.0)
+            #roots_in_interval = (roots_case1 >= 0.0) & (roots_case1 <= 1.0)
             roots_case1 = torch.where(roots_in_interval, roots_case1, torch.full_like(roots_case1, float('inf')))
 
         if mask_one_root.any():
@@ -989,7 +1035,6 @@ class GeneralResonanceLocator(BaseResonanceLocator):
                                                      coef_2[mask_one_root],
                                                      coef_1[mask_one_root],
                                                      coef_0[mask_one_root]).unsqueeze(-1)
-
         result = self._prepare_roots_mask_batch(roots_case1, roots_case2, mask_three_roots, mask_one_root)
         return result
 
@@ -1027,6 +1072,25 @@ class GeneralResonanceLocator(BaseResonanceLocator):
         mask_sign_change = (res_low * res_high <= 0)
         mask_delta = self._has_rapid_variation(res_low, res_high, B_low, B_high, deriv_max[indexes])
         return torch.where(baseline_sign_mask[indexes].unsqueeze(-1), mask_delta, mask_sign_change)
+
+    def _apply_roots_valid_mask(self, mask_trans: torch.Tensor, mask_trans_i: torch.Tensor,
+                               mask_triu: torch.Tensor, step_B: torch.Tensor) ->\
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Apply transition mask filtering and update related tensors efficiently.
+        :param mask_trans: Boolean current transition mask [batch_size, num of old valid transitions]
+        :param mask_trans_i: Boolean New mask to apply [batch_size, num of new valid transitions]
+        :param mask_triu: Boolean upper triangular mask to update [num of all possible transitions]
+        :param step_B: Magnetic field steps to filter [batch_size, num of old valid transitions]
+        :return:
+        tuple: (filtered_mask_trans, updated_mask_triu, filtered_step_B)
+        """
+        combined_mask = mask_trans & mask_trans_i
+        active_transitions = combined_mask.any(dim=-2)
+        filtered_mask_trans = combined_mask[..., active_transitions]
+        filtered_step_B = step_B[..., active_transitions]
+        mask_triu[mask_triu.clone()] = active_transitions
+        return filtered_mask_trans, mask_triu, filtered_step_B
 
 
 class ResField:
@@ -1070,8 +1134,33 @@ class ResField:
         res_1N = eig_values[..., -1] - eig_values[..., 0] - resonance_frequency
         return res_1N > 0
 
-    def __call__(self, system, resonance_frequency, B_low: torch.Tensor, B_high: torch.Tensor, F, Gz):
-        interval_solver, locator, args = self._solver_fabric(system, F, resonance_frequency)
+    def __call__(self, sample: spin_system.BaseSample,
+                 resonance_frequency: torch.Tensor,
+                 B_low: torch.Tensor, B_high: torch.Tensor, F: torch.Tensor, Gz: torch.Tensor) ->\
+        list[tuple[
+            tuple[torch.Tensor, torch.Tensor],
+            tuple[torch.Tensor, torch.Tensor],
+            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]]:
+        """
+        :param sample: The sample for which the resonance parameters need to be found
+        :param resonance_frequency: the resonance frequency. The shape is []
+        :param B_low: low limit of magnetic field intervals. The shape is [batch_dim]
+        :param B_high: high limit of magnetic field intervals. The shape is [batch_dim]
+        :param F: The magnetic free part of Hamiltonian
+        :param Gz: z-part of Zeeman magnetic field term B * Gz
+        :return: list of next data:
+        - tuple of eigen vectors for resonance energy levels of low and high levels
+        - tuple of valid indexes of levels between which transition occurs
+        - magnetic field of transitions
+        - mask_trans - Boolean transition mask [batch_size, num valid transitions]. It is True if transition occurs
+        - mask_triu - Boolean triangular mask [total number of all possible transitions].
+        It is True if there is at least one element in batch for which transition between energy levels occurs.
+        num valid transitions = sum(mask_triu)
+        - indexes: Boolean mask of correct elements in batch
+        - resonance energies
+        - vector_full_system | None. The eigen vectors for all energy levels
+        """
+        interval_solver, locator, args = self._solver_fabric(sample, F, resonance_frequency)
         bathces = interval_solver(F, Gz, B_low, B_high, resonance_frequency, *args)
         bathces = locator(bathces, resonance_frequency, *args)
         return bathces
