@@ -861,7 +861,7 @@ class BaseResonanceLocator:
         outputs = []
         for step_B, mask_trans_i in resonance_field_data:
             # Check if it is correct
-            mask_trans, mask_triu, step_B =\
+            mask_trans_updated, mask_triu_updated, step_B =\
                 self._apply_roots_valid_mask(mask_trans, mask_trans_i, mask_triu, step_B)
 
             resonance_energies = self._compute_resonance_energies(step_B,
@@ -869,8 +869,8 @@ class BaseResonanceLocator:
                                                                   delta_B * deriv_low, delta_B * deriv_high
                                                                   )
 
-            valid_lvl_down = lvl_down[mask_triu]
-            valid_lvl_up = lvl_up[mask_triu]
+            valid_lvl_down = lvl_down[mask_triu_updated]
+            valid_lvl_up = lvl_up[mask_triu_updated]
 
             (vectors_u, vectors_v), vector_full_system = self._compute_eigenvectors(eig_vectors_low, eig_vectors_high,
                                                               valid_lvl_down, valid_lvl_up, step_B)
@@ -878,7 +878,7 @@ class BaseResonanceLocator:
                 (vectors_u, vectors_v),
                 (valid_lvl_down, valid_lvl_up),
                 B_low.squeeze(dim=-1) + step_B * delta_B.squeeze(dim=-1),
-                mask_trans, mask_triu,
+                mask_trans_updated, mask_triu_updated,
                 indexes,
                 resonance_energies,
                 vector_full_system)
@@ -1085,12 +1085,14 @@ class GeneralResonanceLocator(BaseResonanceLocator):
         :return:
         tuple: (filtered_mask_trans, updated_mask_triu, filtered_step_B)
         """
+        mask_triu_updated = mask_triu.clone()
         combined_mask = mask_trans & mask_trans_i
         active_transitions = combined_mask.any(dim=-2)
         filtered_mask_trans = combined_mask[..., active_transitions]
         filtered_step_B = step_B[..., active_transitions]
-        mask_triu[mask_triu.clone()] = active_transitions
-        return filtered_mask_trans, mask_triu, filtered_step_B
+        mask_triu_updated[mask_triu] = active_transitions
+
+        return filtered_mask_trans, mask_triu_updated, filtered_step_B
 
 
 class ResField:

@@ -54,7 +54,7 @@ class BaseMesh(ABC):
         return R
 
     @staticmethod
-    def spherical_triangle_areas(vertices, triangles):
+    def spherical_triangle_areas(vertices: torch.Tensor, triangles: torch.Tensor):
         """
         vertices: tensor of shape (N,2), each row is [phi, theta]
         triangles: tensor of shape (M,3) with indices into vertices defining the triangles.
@@ -63,15 +63,14 @@ class BaseMesh(ABC):
            areas: tensor of shape (M,) with the spherical areas of the triangles (for unit sphere).
                   For a sphere of radius R, multiply each area by R**2.
         """
-
         def _angle_between(u, v):
             dot = (u * v).sum(dim=1)
             # Clamp the dot product to avoid numerical errors outside [-1, 1]
             dot = torch.clamp(dot, -1.0, 1.0)
             return torch.acos(dot)
-
         phi = vertices[:, 0]
         theta = vertices[:, 1]
+
         x = torch.sin(theta) * torch.cos(phi)
         y = torch.sin(theta) * torch.sin(phi)
         z = torch.cos(theta)
@@ -85,16 +84,17 @@ class BaseMesh(ABC):
         b = _angle_between(v2, v0)
         c = _angle_between(v0, v1)
 
+        s = (a + b + c) / 2
 
-        # It is so-called Spherical law of cosines
-        alpha = torch.acos(
-            torch.clamp((torch.cos(a) - torch.cos(b) * torch.cos(c)) / (torch.sin(b) * torch.sin(c)), -1.0, 1.0))
-        beta = torch.acos(
-            torch.clamp((torch.cos(b) - torch.cos(c) * torch.cos(a)) / (torch.sin(c) * torch.sin(a)), -1.0, 1.0))
-        gamma = torch.acos(
-            torch.clamp((torch.cos(c) - torch.cos(a) * torch.cos(b)) / (torch.sin(a) * torch.sin(b)), -1.0, 1.0))
-        excess = (alpha + beta + gamma) - torch.pi
-        excess = torch.nan_to_num(excess, 0.0)  # НАДО РАЗОБРАТЬСЯ, ПОЧЕМУ ЕСТЬ БИТЫЕ УЧАСТКИ ПЛОЩАДИ
+        # L'Huilier's formula for spherical excess
+        tan_E_4 = torch.sqrt(
+            torch.clamp(
+                torch.tan(s / 2) * torch.tan((s - a) / 2) * torch.tan((s - b) / 2) * torch.tan((s - c) / 2),
+                min=0.0
+            )
+        )
+
+        excess = 4 * torch.atan(tan_E_4)
         return excess
 
     @property
@@ -109,6 +109,86 @@ class BaseMesh(ABC):
 
     @abstractmethod
     def to_delaunay(self, f_interpolated: torch.Tensor, simplices: torch.Tensor):
+        pass
+
+    @abstractmethod
+    def post_process(self, f_function: torch.Tensor):
+        pass
+
+
+class BaseMeshAxial(BaseMesh):
+    @abstractmethod
+    def __init__(self, *args, **kwargs):
+        pass
+
+    @property
+    def initial_size(self):
+        return self.initial_grid.size()[:-1]
+
+    def create_rotation_matrices(self):
+        """
+        Given tensors phi and theta (of the same shape), returns a tensor
+        of shape (..., 3, 3) where each 3x3 matrix rotates the z-axis to the direction
+        defined by the spherical angles (theta).
+
+        The rotation is computed as R =  R_y(theta), where:
+          R_y(theta) = [[cos(theta), 0, sin(theta)],
+                        [         0, 1,          0],
+                        [-sin(theta), 0, cos(theta)]]
+        """
+        theta = self.initial_grid[..., 0]
+        cos_theta = torch.cos(theta)
+        sin_theta = torch.sin(theta)
+
+        R = torch.empty(*theta.shape, 3, 3, dtype=theta.dtype, device=theta.device)
+
+        R[..., 0, 0] = cos_theta
+        R[..., 0, 1] = 0.0
+        R[..., 0, 2] = sin_theta
+
+        R[..., 1, 0] = 0.0
+        R[..., 1, 1] = 1.0
+        R[..., 1, 2] = 0
+
+        # Third row
+        R[..., 2, 0] = -sin_theta
+        R[..., 2, 1] = 0.0
+        R[..., 2, 2] = cos_theta
+        return R
+
+    @staticmethod
+    def spherical_triangle_areas(vertices: torch.Tensor, triangles: torch.Tensor):
+        """
+        vertices: tensor of shape (N,1), each row is [theta]
+        triangles: tensor of shape (M,2) with indices into vertices defining the lines.
+
+        Returns:
+           areas: tensor of shape (M,) with the spherical areas of the triangles (for unit sphere).
+                  For a sphere of radius R, multiply each area by R**2.
+        """
+        theta = vertices[:, 0]
+        end_theta = theta[triangles[:, 1]]
+        start_theta = theta[triangles[:, 0]]
+        excess = 2 * torch.pi * (torch.cos(end_theta) - torch.cos(start_theta))
+
+        return excess
+
+    @property
+    @abstractmethod
+    def initial_grid(self):
+        pass
+
+    @property
+    @abstractmethod
+    def post_mesh(self):
+        pass
+
+    @abstractmethod
+    def to_delaunay(self, f_interpolated: torch.Tensor, simplices: torch.Tensor):
+        pass
+
+    @abstractmethod
+    def post_process(self, f_function: torch.Tensor):
         pass
 
 
@@ -294,8 +374,7 @@ class DelaunayMeshLinear(BaseMesh):
             torch.Tensor: Interpolated values at query points
         """
         raise NotImplementedError
-        return (f_values[..., self._interpolation_indices] *
-                self._barycentric_coords).sum(dim=-1)
+
 
     def to_delaunay(self,
                     f_interpolated: torch.Tensor,
@@ -552,14 +631,7 @@ class QuadraticMesh(BaseMesh):
 
         y_grid, x_grid = torch.meshgrid(y_norm, x_norm, indexing='ij')
         grid = torch.stack((x_grid, y_grid), dim=-1).unsqueeze(0)  # [1, new_theta_frequency, new_phi_frequency, 2]
-        print(grid.shape)
-        # Now, interpolate:
-        #f_interp = F.grid_sample(f_2d, grid, mode='bilinear', align_corners=True, padding_mode="border")
-        # f_interp now has shape [1, 1, new_theta_frequency, new_phi_frequency]
 
-        # Remove extra dimensions:
-        #f_interp = f_interp.squeeze(0).squeeze(0)  # Shape: [new_theta_frequency, new_phi_frequency]
         result = torch.nn.functional.interpolate(f_2d, size=(self.interpolation_theta_frequency, self.interpolation_phi_frequency)).flatten(-2, -1)
-        print(result.shape)
         return result
 

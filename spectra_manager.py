@@ -3,18 +3,109 @@ import typing as tp
 from dataclasses import dataclass
 
 from spectral_integration import BaseSpectraIntegrator,\
-    SpectraIntegratorExtended, SpectraIntegratorEasySpinLike, SpectraIntegratorEasySpinLikeTimeResolved
+    SpectraIntegratorEasySpinLike,\
+    SpectraIntegratorEasySpinLikeTimeResolved
 from population import BaseTimeDependantPopulator, StationaryPopulator
 from population.mechanisms import T1Population
 
 import torch
 from torch import nn
+import torch.fft as fft
 
 import constants
 import mesher
 import res_field_algorithm
 import spin_system
 
+from typing import List, Tuple, Set, Dict
+from collections import defaultdict
+
+class PostSpectraProcessing:
+    def __init__(self, gauss: torch.Tensor, lorentz: torch.Tensor):
+        """
+        :param gauss: The gauss parameter. The shape is [batch_size] or []
+        :param lorentz: The gauss parameter. The shape is [batch_size] or []
+        """
+        self.gauss = gauss
+        self.lorentz = lorentz
+        self._broading_method = self._broading_fabric(gauss, lorentz)
+
+    def _skip_broader(self, magnetic_fields: torch.Tensor, spec: torch.Tensor):
+        return spec
+
+    def _broading_fabric(self, gauss, lorentz):
+        if (gauss == 0) and (lorentz == 0):
+            return self._skip_broader
+
+        elif (gauss != 0) and (lorentz == 0):
+            return self._gauss_broader
+
+        elif (gauss == 0) and (lorentz != 0):
+            return self._lorentz_broader
+
+        else:
+            return self._voigt_broader
+
+    def __call__(self, magnetic_field: torch.Tensor, spec: torch.Tensor) -> torch.Tensor:
+        """
+        :param magnetic_field: Tensor of shape [batch, N]
+        :param spec: Spectrum tensor of shape [batch, ..., N]
+        :return: Broadended spectrum, same shape as spec
+        """
+        return self._broading_method(magnetic_field, spec)
+
+    def _build_kernel(self, magnetic_field: torch.Tensor, fwhm_gauss: torch.Tensor, fwhm_lorentz: torch.Tensor):
+        """Construct Voigt kernel on grid for each sample."""
+        dH = magnetic_field[..., 1] - magnetic_field[..., 0]
+        N = magnetic_field.shape[-1]
+        idx = torch.arange(N, device=magnetic_field.device) - N//2
+        x = idx * dH
+
+        sigma = fwhm_gauss / (2 * (2 * torch.log(torch.tensor(2.0)))**0.5)
+
+        gamma = fwhm_lorentz / 2
+        # gaussian kernel
+        G = torch.exp(-0.5 * (x / sigma)**2) / (sigma * (2 * torch.pi)**0.5)
+
+        # lorentzian kernel
+        L = (gamma / torch.pi) / (x**2 + gamma**2)
+
+        Gf = fft.rfft(torch.fft.ifftshift(G, dim=-1), dim=-1)
+        Lf = fft.rfft(torch.fft.ifftshift(L, dim=-1), dim=-1)
+
+        Vf = Gf * Lf
+        V = torch.fft.fftshift(fft.irfft(Vf, n=N, dim=-1), dim=-1)
+
+        V = V / V.sum(dim=-1, keepdim=True)
+        return V
+
+    def _apply_convolution(self, spec: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
+        """Apply convolution via FFT per batch."""
+        S = fft.rfft(spec, dim=-1)
+        K = fft.rfft(torch.fft.ifftshift(kernel, dim=-1), dim=-1)
+        out = fft.irfft(S * K, n=spec.shape[-1], dim=-1)
+        return out
+
+    def _gauss_broader(self, magnetic_field: torch.Tensor, spec: torch.Tensor) -> torch.Tensor:
+        batch = magnetic_field.shape[0]
+        fwhm_gauss = self.gauss.expand(batch)
+        fwhm_lorentz = torch.zeros_like(fwhm_gauss)
+        kernel = self._build_kernel(magnetic_field, fwhm_gauss, fwhm_lorentz)
+        return self._apply_convolution(spec, kernel)
+
+    def _lorentz_broader(self, magnetic_field: torch.Tensor, spec: torch.Tensor) -> torch.Tensor:
+        batch = magnetic_field.shape[0]
+        fwhm_gauss = torch.zeros_like(self.lorentz.expand(batch))
+        fwhm_lorentz = self.lorentz.expand(batch)
+        kernel = self._build_kernel(magnetic_field, fwhm_gauss, fwhm_lorentz)
+        return self._apply_convolution(spec, kernel)
+
+    def _voigt_broader(self, magnetic_field: torch.Tensor, spec: torch.Tensor) -> torch.Tensor:
+        batch = magnetic_field.shape[0]
+        fwhm_gauss = self.gauss.expand(batch)
+        fwhm_lorentz = self.lorentz.expand(batch)
+        kernel = self._build_kernel(magnetic_field, fwhm_gauss, fwhm_lorentz)
+        return self._apply_convolution(spec, kernel)
 
 
 class Broadening:
@@ -156,7 +247,10 @@ class ParamSpec:
 class BaseSpectraCreator:
     def __init__(self, spin_system_dim, batch_dims, mesh: mesher.BaseMesh,
                  intensity_calculator: StationaryIntensitiesCalculator | None = None,
-                 spectra_integrator: BaseSpectraIntegrator = SpectraIntegratorEasySpinLike(harmonic=1)):
+                 spectra_integrator: BaseSpectraIntegrator = SpectraIntegratorEasySpinLike(harmonic=1),
+                 post_spectra_processor: PostSpectraProcessing = PostSpectraProcessing(
+                     torch.tensor(0), torch.tensor(0))
+                 ):
         self.threshold = torch.tensor(1e-3)
         self.spin_system_dim = spin_system_dim
         self.mesh_size = mesh.initial_size
@@ -168,6 +262,7 @@ class BaseSpectraCreator:
         self.intensity_calculator = self._get_intenisty_calculator(intensity_calculator)
         self._param_specs = self._get_param_specs()
 
+        self.post_spectra_processor = post_spectra_processor
 
     def _get_intenisty_calculator(self, intensity_calculator):
         if intensity_calculator is None:
@@ -238,6 +333,19 @@ class BaseSpectraCreator:
     def _postcompute_batch_data(self, compute_out: tuple, fields: torch.Tensor):
         return compute_out, fields
 
+    def _final_mask(self, res_fields: torch.Tensor, width: torch.Tensor,
+                    intensities: torch.Tensor, areas: torch.Tensor):
+        max_intensity = torch.amax(abs(intensities), dim=-1, keepdim=True)
+        mask = ((intensities / max_intensity) > self.threshold).any(dim=tuple(range(intensities.dim() - 1)))
+        #mask = (intensities > self.threshold)
+
+        intensities = intensities[..., mask]
+        width = width[..., mask]
+        res_fields = res_fields[..., mask, :]
+        areas = areas[..., mask]
+        return res_fields, width, intensities, areas
+
+
     def _finalize(self,
                   compute_out: tuple,
                   fields: torch.Tensor):
@@ -249,9 +357,11 @@ class BaseSpectraCreator:
             )
         )
 
-        return self.spectra_integrator.integrate(
+        res_fields, width, intensities, areas = self._final_mask(res_fields, width, intensities, areas)
+        spec = self.spectra_integrator.integrate(
             res_fields, width, intensities, areas, fields
         )
+        return self.post_spectra_processor(fields, spec)
 
     def _precompute_batch_data(self, sample: spin_system.MultiOrientedSample, Gx, Gy, Gz, batch):
         intensity = self.intensity_calculator(Gx, Gy, Gz, batch)
@@ -260,13 +370,103 @@ class BaseSpectraCreator:
         width_square = self.broader(sample, vector_down, vector_up, B_trans, indexes)
         return mask_trans, mask_triu, B_trans, intensity, width_square, indexes
 
+    def _filter_by_max(self, occurrences_max, global_max):
+        updated_occurrences = []
+        for bi, row_idx, col_idx, pair_max in occurrences_max:
+            keep_local = torch.nonzero(pair_max / global_max >= self.threshold, as_tuple=False).squeeze(-1)
+            new_cold_idx = col_idx[keep_local]
+            if new_cold_idx.numel() > 0:
+                updated_occurrences.append((bi, row_idx, col_idx[keep_local], keep_local))
+        return updated_occurrences
+
+    # The logic can be broken. I do not really know for difficult examples!!
+    def _assign_global_indexes(self,
+            occurrences: list[tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]]
+    ) -> tuple[
+        list[tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
+        int
+    ]:
+        """
+        'occurrences' is list of the next data:
+        the batch index
+        The row-batch indexes
+        The column indexes with respect to the triangular matrix of transitions
+        The keep_local. - The pairs that were saved in filter by max
+        The algorithm create global indexes
+
+        Example 1
+        row = [1 ,2, 3], col = [1, 2]
+        row = [1, 2, 3], col = [3, 4]
+        the output
+        row = [1 , 2, 3], col = [1, 2], glob_idx = [0, 1]
+        row = [1 , 2, 3], col = [3,  4], glob_idx = [2, 3]
+
+        Example 2
+        row = [1 ,2, 3], col = [1, 2]
+        row = [4, 5, 6], col = [1, 2]
+        the output
+        row = [1 , 2, 3], col = [1, 2], glob_idx = [0, 1]
+        row = [4 , 5, 6], col = [1,  2], glob_idx = [0, 1]
+
+        Example 3
+        row = [1 ,2], col = [1, 2]
+        row = [2, 3], col = [2, 3]
+        the output
+        row = [1 , 2], col = [1, 2], glob_idx = [0, 1]
+        row = [2 , 3], col = [2,  3], glob_idx = [2, 3]
+
+        Example 4
+        row = [1 ,2 , 3], col = [1, 2]
+        row = [4, 5, 6], col = [2, 3]
+        the output
+        row = [1 , 2, 3], col = [1, 2], glob_idx = [0, 1]
+        row = [4 , 5, 6], col = [2,  3], glob_idx = [1, 2]
+        """
+        row_to_tuples = {}  # row_id -> list of prior tuple-indices
+        assigned_global: list[torch.Tensor] = []
+        out: list[tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        max_global = -1
+
+        for i, (batch_idx, rows, cols, keep_pairs) in enumerate(occurrences):
+            conflicts = set()
+            for r in rows.tolist():
+                conflicts.update(row_to_tuples.get(r, []))
+
+            base_gh = torch.argsort(torch.argsort(cols))
+
+            # 3) collect occupied slots only from those conflicts
+            occupied = set()
+            for j in conflicts:
+                occupied.update(assigned_global[j].tolist())
+
+            # 4) if there’s conflict, shift to avoid _just_ those slots
+            global_idx = base_gh.clone()
+            if occupied:
+                s = 0
+                while True:
+                    shifted = (base_gh + s).tolist()
+                    if not any(x in occupied for x in shifted):
+                        global_idx = base_gh + s
+                        break
+                    s += 1
+
+            # 5) record and update max
+            out.append((batch_idx, rows, cols, global_idx, keep_pairs))
+            assigned_global.append(global_idx)
+            max_global = max(max_global, int(global_idx.max()))
+
+            # 6) register rows
+            for r in rows.tolist():
+                row_to_tuples.setdefault(r, []).append(i)
+
+        return out, max_global + 1
+
     def _first_pass(self, sample, Gx, Gy, Gz, batches):
-        num_pairs = (self.spin_system_dim ** 2 - self.spin_system_dim) // 2
-        max_abs_intensity = torch.zeros(
-            num_pairs, dtype=torch.float32, device=Gx.device
-        )
         cached_batches = []
-        for batch in batches:
+        occurences_max = []
+
+        global_max = torch.tensor(0)
+        for bi, batch in enumerate(batches):
             mask_trans, mask_triu, B_trans_batch, intensity_batch, width_square_batch, mask_indexes, *extras = \
                 self._precompute_batch_data(sample, Gx, Gy, Gz, batch)
 
@@ -274,16 +474,20 @@ class BaseSpectraCreator:
             col_idx = torch.nonzero(mask_triu, as_tuple=False).squeeze(-1)
 
             if row_idx.numel() > 0 and col_idx.numel() > 0:
-                pair_max = torch.amax(intensity_batch, dim=tuple(range(intensity_batch.ndim - 1)))
-                max_abs_intensity[col_idx] = torch.maximum(
-                    max_abs_intensity[col_idx], pair_max
-                )
-            cached_batches.append(
-                (mask_trans, mask_triu, B_trans_batch, intensity_batch, width_square_batch, mask_indexes, *extras)
-            )
 
-        kept_pairs = torch.nonzero(max_abs_intensity >= self.threshold, as_tuple=False).squeeze(-1)
-        return cached_batches, kept_pairs
+                pair_max = torch.amax(torch.abs(intensity_batch), dim=tuple(range(intensity_batch.ndim - 1)))
+                global_max = torch.max(global_max, torch.max(pair_max))
+
+                cached_batches.append(
+                    (mask_trans,
+                     mask_triu, B_trans_batch,
+                     intensity_batch,
+                     width_square_batch,
+                     mask_indexes, *extras)
+                )
+                occurences_max.append((bi, row_idx, col_idx, pair_max))
+
+        return cached_batches, self._filter_by_max(occurences_max, global_max)
 
     def _match_col_indexes(self, kept_pairs: torch.Tensor, col_idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -366,42 +570,44 @@ class BaseSpectraCreator:
         """
 
         config_dims = (*self.batch_dims, *self.mesh_size)
-        batches, kept_pairs = self._first_pass(sample, Gx, Gy, Gz, batches)
-        m = kept_pairs.numel()
+        batches, occurrences = self._first_pass(sample, Gx, Gy, Gz, batches)
+        occurrences, max_columns = self._assign_global_indexes(occurrences)
 
-        res_fields = torch.zeros((*config_dims, m), dtype=torch.float32, device=Gx.device)
-        intensities = torch.zeros((*config_dims, m), dtype=torch.float32, device=Gx.device)
-        width_square = torch.zeros((*config_dims, m), dtype=torch.float32, device=Gx.device)
-        extra_tensors = self._init_extras(config_dims, m, Gx.device)
+        res_fields = torch.zeros((*config_dims, max_columns), dtype=torch.float32, device=Gx.device)
+        intensities = torch.zeros((*config_dims, max_columns), dtype=torch.float32, device=Gx.device)
+        width_square = torch.zeros((*config_dims, max_columns), dtype=torch.float32, device=Gx.device)
+        extra_tensors = self._init_extras(config_dims, max_columns, Gx.device)
 
         num_pairs = (self.spin_system_dim ** 2 - self.spin_system_dim) // 2
-        mask_triu_general = torch.ones(num_pairs, dtype=torch.bool)
-        for batch in batches:
-            mask_trans, mask_triu, B_trans_batch, intensity_batch,\
-                width_square_batch, mask_indexes, *extras_batch = batch
-            row_idx = torch.nonzero(mask_indexes).squeeze(-1)  # Shape [num_selected_rows]
-            col_idx = torch.nonzero(mask_triu).squeeze(-1)  # Shape [num_selected_cols]
-            if row_idx.numel() > 0 and col_idx.numel() > 0:
-                print(col_idx)
-                mask_triu_general = mask_triu_general * mask_triu
-                col_base_idx, col_batch_idx = self._match_col_indexes(kept_pairs, col_idx)
-                res_fields[row_idx[:, None], col_base_idx] = B_trans_batch[..., col_batch_idx]
+        mask_triu_general = torch.zeros(num_pairs, dtype=torch.bool)
 
-                intensities[row_idx[:, None], col_base_idx] += intensity_batch[..., col_batch_idx]
-                width_square[row_idx[:, None], col_base_idx] += width_square_batch[..., col_batch_idx]
-                self._update_extras(extra_tensors, extras_batch, row_idx, col_base_idx, col_batch_idx)
+        for bi, _, col_batch_idx, col_base_idx, keep_local in occurrences:
+            mask_trans, mask_triu, B_trans_batch, intensity_batch,\
+                width_square_batch, mask_indexes, *extras_batch = batches[bi]
+            row_idx = torch.nonzero(mask_indexes).squeeze(-1)
+
+            if row_idx.numel() > 0 and col_base_idx.numel() > 0:
+                mask_triu_general[..., col_batch_idx] = True
+                res_fields[row_idx[:, None], col_base_idx] = B_trans_batch[..., keep_local]
+
+                intensities[row_idx[:, None], col_base_idx] += intensity_batch[..., keep_local]
+                width_square[row_idx[:, None], col_base_idx] += width_square_batch[..., keep_local]
+                self._update_extras(extra_tensors, extras_batch, row_idx, col_base_idx, keep_local)
         intensities = intensities / intensities.abs().max()
         width = self.broader.add_hamiltonian_straine(sample, width_square)
         return mask_triu_general, res_fields, intensities, width, *extra_tensors
 
 
 # The logic with output_full_eigenvector=True must be rebuild
-
 class TruncatedSpectraCreatorTimeResolved(BaseSpectraCreator):
     def __init__(self, spin_system_dim, batch_dims, mesh: mesher.BaseMesh, time: torch.Tensor,
                  intensity_calculator: TimeResolvedIntensitiesCalculator | None = None,
-                 spectra_integrator: BaseSpectraIntegrator = SpectraIntegratorEasySpinLikeTimeResolved(harmonic=0)):
-        super().__init__(spin_system_dim, batch_dims, mesh, intensity_calculator, spectra_integrator)
+                 spectra_integrator: BaseSpectraIntegrator = SpectraIntegratorEasySpinLikeTimeResolved(harmonic=0),
+                 post_spectra_processor: PostSpectraProcessing = PostSpectraProcessing(
+                    torch.tensor(0), torch.tensor(0))):
+        super().__init__(
+            spin_system_dim, batch_dims, mesh, intensity_calculator, spectra_integrator, post_spectra_processor
+        )
         self._time = time
 
     def _get_intenisty_calculator(self, intensity_calculator):
@@ -470,7 +676,6 @@ class TruncatedSpectraCreatorTimeResolved(BaseSpectraCreator):
         batched_matrix = self._compute_batched_tensors(res_fields, width)
         expanded_size = batched_matrix.shape[-3]
         batched_matrix = batched_matrix.flatten(-3, -2)
-
         intensities = self._process_tensor(intensities)
         intensities = intensities.flatten(-3, -2)
 
@@ -484,8 +689,11 @@ class TruncatedSpectraCreatorTimeResolved(BaseSpectraCreator):
 class CoupledSpectraCreatorTimeResolved(TruncatedSpectraCreatorTimeResolved):
     def __init__(self, spin_system_dim, batch_dims, mesh: mesher.BaseMesh, time: torch.Tensor,
                  intensity_calculator: TimeResolvedIntensitiesCalculator | None = None,
-                 spectra_integrator: BaseSpectraIntegrator = SpectraIntegratorEasySpinLikeTimeResolved(harmonic=0)):
-        super().__init__(spin_system_dim, batch_dims, mesh, time, intensity_calculator, spectra_integrator)
+                 spectra_integrator: BaseSpectraIntegrator = SpectraIntegratorEasySpinLikeTimeResolved(harmonic=0),
+                 post_spectra_processor: PostSpectraProcessing = PostSpectraProcessing(
+                     torch.tensor(0), torch.tensor(0))):
+        super().__init__(
+            spin_system_dim, batch_dims, mesh, time, intensity_calculator, spectra_integrator, post_spectra_processor)
 
     def _get_output_eigenvector(self) -> bool:
         return True

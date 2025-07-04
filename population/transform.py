@@ -12,8 +12,38 @@ def basis_transformation(basis_1: torch.Tensor, basis_2: torch.Tensor) -> torch.
 
     :return: A transformation matrix of shape [..., K, K] that transforms
             vectors from the `basis_1` coordinate system to the `basis_2` coordinate system.
+
+    torch.Tensor
+        A tensor of shape [..., K, K] containing the squared absolute values of the
+        transformation coefficients between the two bases.
+
+        For a 2×2 case, the output can be visualized as:
+
+        ```
+        ┌───────────────────────────────────────────┐
+        │                                           │
+        │     basis_1 states →                      │
+        │    ┌─────────────┬─────────────┐          │
+        │    │             │             │          │
+        │    │  ⟨b2₀|b1₀⟩  | <b2₀|b1₁⟩   │          │
+        │ b  │             │             │          │
+        │ a  │             │             │          │
+        │ s  │  ⟨b2₁|b1₀⟩  | <b2₁|b1₁⟩   │          │
+        │ i  │             │             │          │
+        │ s  │             │             │          │
+        │ _  └─────────────┴─────────────┘          │
+        │ 2                                         │
+        │                                           │
+        │ s                                         │
+        │ t                                         │
+        │ a                                         │
+        │ t                                         │
+        │ e                                         │
+        │ s                                         │
+        │ ↓                                         │
+        └───────────────────────────────────────────┘
     """
-    return torch.matmul(basis_2.conj().transpose(-2, -1), basis_1)
+    return torch.matmul(basis_2.conj().transpose(-1, -2), basis_1)
 
 
 def get_transformation_coeffs(basis_old: torch.Tensor, basis_new: torch.Tensor):
@@ -26,11 +56,11 @@ def get_transformation_coeffs(basis_old: torch.Tensor, basis_new: torch.Tensor):
 
     Parameters:
     -----------
-    basis_1: torch.Tensor
+    basis_old (b1): torch.Tensor
         The first basis tensor with shape [..., K, K], where K is the spin dimension size.
         Each column basis_1[:,j] represents an eigenvector in the first basis.
 
-    basis_2: torch.Tensor
+    basis_new (b2): torch.Tensor
         The second basis tensor with shape [..., K, K], where K is the spin dimension size.
         Each column basis_2[:,i] represents an eigenvector in the second basis.
 
@@ -48,10 +78,10 @@ def get_transformation_coeffs(basis_old: torch.Tensor, basis_new: torch.Tensor):
         │     basis_1 states →                      │
         │    ┌─────────────┬─────────────┐          │
         │    │             │             │          │
-        │    │  |⟨b2₀|b1₀⟩|²  |⟨b2₀|b1₁⟩|²  │        │
+        │    │ |⟨b2₀|b1₀⟩|²| ⟨b2₀|b1₁⟩|² │          │
         │ b  │             │             │          │
         │ a  │             │             │          │
-        │ s  │  |⟨b2₁|b1₀⟩|²  |⟨b2₁|b1₁⟩|²  │        │
+        │ s  │ |⟨b2₁|b1₀⟩|²| ⟨b2₁|b1₁⟩|² │          │
         │ i  │             │             │          │
         │ s  │             │             │          │
         │ _  └─────────────┴─────────────┘          │

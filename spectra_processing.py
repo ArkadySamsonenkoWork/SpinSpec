@@ -96,12 +96,12 @@ def correct_baseline_als(y_vals: np.ndarray, mask: np.ndarray, lam=1e6, p=0.01, 
 
 def correct_baseline(x_vals: np.ndarray, y_vals: np.ndarray,
                      baseline_areas: list[tuple[float, float]],
-                     method="poly", poly_order: int = 0):
+                     method="poly", poly_order=0, lam=2e7, p=0.05, niter=10):
     mask = create_baseline_mask(x_vals, baseline_areas)
     if method == "poly":
         y_corrected, baseline = correct_baseline_polynomial(x_vals, y_vals, mask, poly_order=poly_order)
     elif method == "als":
-        y_corrected, baseline = correct_baseline_als(y_vals, mask)
+        y_corrected, baseline = correct_baseline_als(y_vals, mask, lam=lam, p=p, niter=niter)
     else:
         raise ValueError("Wrong method. It must be 'poly' or 'als'")
 

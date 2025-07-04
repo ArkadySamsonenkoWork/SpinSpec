@@ -1,4 +1,4 @@
-from spectral_integration import BaseSpectraIntegrator, SpectraIntegratorExtended, SpectraIntegratorEasySpinLike
+from spectral_integration import BaseSpectraIntegrator, SpectraIntegratorEasySpinLike
 
 import torch
 from torch import nn

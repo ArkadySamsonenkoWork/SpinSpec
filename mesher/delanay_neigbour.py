@@ -223,7 +223,6 @@ class MeshProcessorBase:
         return triangulation.simplices
 
 
-
 class InterpolatingMeshProcessor(MeshProcessorBase):
     def __init__(self, interpolate_grid_frequency, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -327,7 +326,6 @@ def mesh_processor_factory(init_grid_frequency,
             phi_limits,
             boundaries_cond
         )
-
 
 class DelaunayMeshNeighbour(BaseMesh):
     """Delaunay triangulation-based spherical mesh implementation."""

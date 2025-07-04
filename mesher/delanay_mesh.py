@@ -18,6 +18,7 @@ class MeshProcessor:
 
         self.base_tri = self._triangulate(self.base_vertices)
 
+
         self.extended_tri = self._triangulate(self.extended_vertices)
 
 
