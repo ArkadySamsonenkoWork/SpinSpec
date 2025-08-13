@@ -3,15 +3,18 @@ from dataclasses import dataclass
 import typing as tp
 import math
 import time
+import sys
 
 import nevergrad as ng
 import numpy as np
 import torch
 import optuna
-from sklearn.cluster import DBSCAN
+from scipy.spatial.distance import cdist
+from sklearn.preprocessing import StandardScaler
 
 
-from ..spectra_processing import normalize_spectrum
+sys.path.append("..")
+from spectra_processing import normalize_spectrum
 from optimiation import objectives
 
 
@@ -42,6 +45,14 @@ class ParamSpec:
 
 @dataclass
 class FitResult:
+    best_params: tp.Dict[str, float]
+    best_loss: float
+    best_spectrum: tp.Optional[torch.Tensor]
+    optimizer_info: tp.Dict
+
+
+@dataclass
+class ExperementalParameters:
     best_params: tp.Dict[str, float]
     best_loss: float
     best_spectrum: tp.Optional[torch.Tensor]
@@ -165,31 +176,89 @@ class SpectrumFitter:
 
     def __init__(
         self,
-        B: tp.Union[np.ndarray, torch.Tensor],
-        y_exp: tp.Union[np.ndarray, torch.Tensor],
+        B: tp.Union[np.ndarray, torch.Tensor] | list[tp.Union[np.ndarray, torch.Tensor]],
+        y_exp: tp.Union[np.ndarray, torch.Tensor] | list[tp.Union[np.ndarray, torch.Tensor]],
         param_space: ParameterSpace,
-        simulate_spectrum_callable: tp.Optional[tp.Callable[[tp.Dict[str, float]], torch.Tensor]] = None,
+        simulate_spectrum_callable: tp.Callable[
+            [list[torch.Tensor] | torch.Tensor, tp.Dict[str, float], tp.Dict],
+             torch.Tensor | list[torch.Tensor]
+        ],
         norm_mode: str = "integral",
         device: tp.Optional[torch.device] = None,
         objective=objectives.MSEObjective(),
+        weights: list[float] = None
     ):
         self.device = torch.device("cpu") if device is None else device
-        self.B = torch.tensor(B, dtype=torch.float32, device=self.device)
-        self.y_exp = torch.tensor(y_exp, dtype=torch.float32, device=self.device)
         self.norm_mode = norm_mode
-        self.y_exp = normalize_spectrum(self.B, self.y_exp, mode=norm_mode)
-        self.param_space = param_space
-        self._objective = objective
         self._simulate_callable = simulate_spectrum_callable
 
-    def simulate_spectrum(self, params: tp.Dict[str, float]) -> torch.Tensor:
-        return normalize_spectrum(self.B, self._simulate_callable(params), mode=self.norm_mode)
+        self.B, self.y_exp, self.multisample = self._set_experemental(B, y_exp)
 
-    def loss_from_params(self, params: tp.Dict[str, float]) -> torch.Tensor:
+        if self.multisample and (weights is None):
+            self.weights = torch.ones(len(self.B), dtype=torch.float32, device=self.device)
+        else:
+            self.weights = torch.tensor(weights, dtype=torch.float32, device=self.device)
+
+        self.param_space = param_space
+        self._objective = objective
+        self._loss_normalization = self._get_loss_norm()
+
+    def _set_experemental(self, B: tp.Union[np.ndarray, torch.Tensor] | list[tp.Union[np.ndarray, torch.Tensor]],
+                                y_exp: tp.Union[np.ndarray, torch.Tensor] | list[tp.Union[np.ndarray, torch.Tensor]]):
+        if isinstance(B, list):
+            if len(B) != len(y_exp):
+                raise ValueError("The number of fields array and experimental arrays must be the same")
+            else:
+                B = [torch.tensor(b, dtype=torch.float32, device=self.device) for b in B]
+                y_exp = [torch.tensor(y, dtype=torch.float32, device=self.device) for y in y_exp]
+                for idx, b in enumerate(B):
+                    y_exp[idx] = normalize_spectrum(b, y_exp[idx], mode=self.norm_mode)
+                multisample = True
+        else:
+            B = torch.tensor(B, dtype=torch.float32, device=self.device)
+            y_exp = torch.tensor(y_exp, dtype=torch.float32, device=self.device)
+            y_exp = normalize_spectrum(B, y_exp, mode=self.norm_mode)
+            multisample = False
+
+        return B, y_exp, multisample
+
+    def _get_loss_norm(self):
+        if self.multisample:
+            return [self._objective(torch.zeros_like(y), y).reciprocal() for y in self.y_exp]
+        else:
+            return self._objective(torch.zeros_like(self.y_exp), self.y_exp).reciprocal()
+
+    def simulate_single_spectrum(self, params: tp.Dict[str, float], **kwargs) -> torch.Tensor:
+        return normalize_spectrum(self.B, self._simulate_callable(self.B, params, **kwargs), mode=self.norm_mode)
+
+    def simulate_spectral_set(self, params: tp.Dict[str, float], **kwargs) -> list[torch.Tensor]:
+        models = self._simulate_callable(self.B, params, **kwargs)
+        for idx in range(len(models)):
+            models[idx] = normalize_spectrum(self.B[idx], models[idx], mode=self.norm_mode)
+        return models
+
+    def simulate_spectroscopic_data(self, params: tp.Dict[str, float], **kwargs) -> list[torch.Tensor] | torch.Tensor:
+        if self.multisample:
+            model = self.simulate_spectral_set(params, **kwargs)
+        else:
+            model = self.simulate_single_spectrum(params, **kwargs)
+        return model
+
+    def simulate_spectra_from_trial_params(self, trial_params: tp.Dict[str, float], **kwargs) ->\
+            list[torch.Tensor] | torch.Tensor:
+        return self.simulate_spectroscopic_data({**self.param_space.fixed_params, **trial_params}, **kwargs)
+
+    def loss_from_params(self, params: tp.Dict[str, float], **kwargs) -> torch.Tensor:
         """Compute model - experiment residuals as a torch.Tensor."""
         with torch.no_grad():
-            model = self.simulate_spectrum(params)
-        return self._objective(model, self.y_exp)
+            if self.multisample:
+                models = self.simulate_spectral_set(params, **kwargs)
+                loss = sum(self.weights[idx] * self._loss_normalization[idx] * self._objective(
+                    models[idx], self.y_exp[idx]) for idx in range(len(models))) / len(models)
+            else:
+                model = self.simulate_single_spectrum(params, **kwargs)
+                loss = self._loss_normalization * self._objective(model, self.y_exp)
+            return loss
 
     def fit_optuna(
         self,
@@ -201,28 +270,29 @@ class SpectrumFitter:
         show_progress: bool = True,
         seed: tp.Optional[int] = None,
         return_best_spectrum: bool = True,
+            **kwargs,
     ) -> FitResult:
         """Fit using Optuna.
 
         Requires optuna to be installed.
         """
-        def objective(trial):
+        def loss_function(trial):
             p = self.param_space.suggest_optuna(trial)
-            loss = self.loss_from_params(p)
+            loss = self.loss_from_params(p, **kwargs)
             return loss
 
         if sampler is None:
             sampler = optuna.samplers.TPESampler(seed=seed, multivariate=True)
         study = optuna.create_study(direction="minimize", sampler=sampler, study_name=study_name, load_if_exists=True)
         optuna.logging.set_verbosity(optuna.logging.WARNING)
-        study.optimize(objective, n_trials=n_trials, timeout=timeout, n_jobs=n_jobs, show_progress_bar=show_progress)
+        study.optimize(
+            loss_function, n_trials=n_trials, timeout=timeout, n_jobs=n_jobs, show_progress_bar=show_progress)
 
         best_params = {k: float(v) for k, v in study.best_params.items()}
         best_spec = None
         if return_best_spectrum:
-            best_spec = self.simulate_spectrum(best_params)
+            best_spec = self.simulate_spectroscopic_data({**self.param_space.fixed_params, **best_params}, **kwargs)
         return FitResult(best_params, float(study.best_value), best_spec, {"backend": "optuna", "study": study})
-
 
     def fit_nevergrad(
         self,
@@ -230,6 +300,7 @@ class SpectrumFitter:
         optimizer_name: str = "TwoPointsDE",
         seed: tp.Optional[int] = None,
         return_best_spectrum: bool = True,
+        **kwargs,
     ) -> FitResult:
         """Fit using Nevergrad (if installed)."""
         if ng is None:
@@ -251,7 +322,7 @@ class SpectrumFitter:
         best_params = self.param_space.vector_to_dict(x)
         best_spec = None
         if return_best_spectrum:
-            best_spec = self.simulate_spectrum(best_params)
+            best_spec = self.simulate_spectroscopic_data(best_params)
         return FitResult(
             best_params, self.loss_from_params(best_params), best_spec,
             {"backend": "nevergrad", "optimizer": optimizer_name}
@@ -270,29 +341,108 @@ class SpectrumFitter:
         raise ValueError(f"Unknown fit method: {method}")
 
 
-class SpaceSearcher(SpectrumFitter):
-    def search(self, n_trials=200, eps=0.05, min_samples=3, **kwargs) -> tp.List[MinimaCluster]:
-        """Explore space and find multiple local minima."""
-        fit_results = self.fit_optuna(n_trials=n_trials, **kwargs)
-        study = fit_results.optimizer_info["study"]
+class SpaceSearcher:
+    def __init__(
+        self,
+        loss_rel_tol: float = 0.5,
+        top_k: int = 5,
+        distance_fraction: float = 0.2,
+    ):
+        self.loss_rel_tol = float(loss_rel_tol)
+        self.top_k = int(top_k)
+        self.distance_fraction = float(distance_fraction)
 
-        X = np.array([self.param_space.dict_to_vector(t.params) for t in study.trials])
-        losses = np.array([t.value for t in study.trials])
 
-        clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(X)
-        clusters = []
-        for label in set(clustering.labels_):
-            if label == -1:
+    def _extract_trials_from_study(self, study,
+                                   param_names: list[str] | None = None):
+        """
+        Return arrays: (param_matrix, losses, trial_indices)
+        param_matrix shape: (n_trials, n_varying_params)
+        losses: array of length n_trials (float)
+        trial_indices: list of optuna trial numbers corresponding to rows
+        If top_k is given, returns only top_k lowest-loss trials.
+        """
+        trials = [t for t in study.trials if t.state.is_finished()]
+        if len(trials) == 0:
+            return np.zeros((0, 0)), np.array([]), []
+
+        if param_names is None:
+            param_names = list(study.best_params.keys())
+
+        param_rows = []
+        losses = []
+        trial_ids = []
+        for t in trials:
+            if t.value is None:
                 continue
-            indices = np.where(clustering.labels_ == label)[0]
-            cluster_losses = losses[indices]
-            cluster_params = [study.trials[i].params for i in indices]
-            best_idx = indices[np.argmin(cluster_losses)]
-            clusters.append(
-                MinimaCluster(
-                    center_params=study.trials[best_idx].params,
-                    best_loss=float(np.min(cluster_losses)),
-                    members=cluster_params
-                )
+            vals = []
+            for name in param_names:
+                if name not in t.params:
+                    vals = None
+                    break
+                vals.append(float(t.params[name]))
+            if vals is None:
+                continue
+            param_rows.append(vals)
+            losses.append(float(t.value))
+            trial_ids.append(t._trial_id)
+        if len(param_rows) == 0:
+            return np.zeros((0, 0)), np.array([]), []
+        P = np.asarray(param_rows, dtype=float)
+        L = np.asarray(losses, dtype=float)
+        return P, L, np.asarray(trial_ids, dtype=np.int32)
+
+    def __call__(self, study, param_names: list[str] | None = None):
+        P, L, trial_numbers = self._extract_trials_from_study(study, param_names)
+        if P.size == 0 or L.size == 0:
+            return []
+
+        scaler = StandardScaler()
+        P_scaled = scaler.fit_transform(P)
+
+        best_loss = float(L.min())
+        loss_cutoff = best_loss * (1.0 + self.loss_rel_tol)
+        good_mask = L <= loss_cutoff
+        if not np.any(good_mask):
+            return []
+
+        P_good = P_scaled[good_mask]
+        L_good = L[good_mask]
+        trials_good = trial_numbers[good_mask]
+
+        best_idx_in_good = int(np.argmin(L_good))
+        best_vector = P_good[best_idx_in_good].reshape(1, -1)
+
+        distances = cdist(best_vector, P_good, metric="euclidean").flatten()
+
+        sorted_idx = np.argsort(distances)
+        sorted_idx = sorted_idx[sorted_idx != best_idx_in_good][::-1]
+
+        max_dist = max(distances)
+        if self.distance_fraction > 0:
+            thresh = self.distance_fraction * max_dist
+            within_thresh = [i for i in sorted_idx if distances[i] <= thresh]
+            if within_thresh:
+                chosen_idx = within_thresh[: self.top_k]
+            else:
+                chosen_idx = sorted_idx[: self.top_k]
+        else:
+            chosen_idx = sorted_idx[: self.top_k]
+
+        results: tp.List[tp.Dict[str, tp.Any]] = []
+
+        trial_map = {getattr(t, "number", getattr(t, "_trial_id", None)): t for t in study.trials}
+
+        for idx in chosen_idx:
+            tn = int(trials_good[idx])
+            t_obj = trial_map.get(tn)
+            params = getattr(t_obj, "params", {}) if t_obj is not None else {}
+            results.append(
+                {
+                    "trial_number": tn,
+                    "params": params,
+                    "loss": float(L_good[idx]),
+                    "distance": float(distances[idx]),
+                }
             )
-        return clusters
+        return results

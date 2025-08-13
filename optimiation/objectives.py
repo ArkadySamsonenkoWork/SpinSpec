@@ -11,7 +11,7 @@ class BaseObjectiveFunction:
 
 class MSEObjective(BaseObjectiveFunction):
     def __call__(self, pred: torch.Tensor, target: torch.Tensor):
-        return torch.nn.MSELoss(pred, target)
+        return torch.nn.functional.mse_loss(pred, target)
 
 
 class MAEObjective(BaseObjectiveFunction):
