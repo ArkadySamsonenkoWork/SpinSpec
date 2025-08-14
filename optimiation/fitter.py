@@ -66,6 +66,14 @@ class MinimaCluster:
     members: tp.List[tp.Dict[str, float]]
 
 
+@dataclass
+class NevergradTrial:
+    params: tp.Dict[str, float]
+    value: float
+    _trial_id: int
+
+
+
 class ParameterSpace:
     """Helper to manage a set of ParamSpec and conversions.
     Stores parameters in a fixed order. Supports parameters that are
@@ -80,7 +88,6 @@ class ParameterSpace:
         self.names = [s.name for s in self.specs]
 
         self.fixed_params: tp.Dict[str, float] = {} if fixed_params is None else dict(fixed_params)
-
         self._varying_specs = [s for s in self.specs if getattr(s, 'vary', True)]
         self.varying_names = [s.name for s in self._varying_specs]
 
@@ -131,6 +138,17 @@ class ParameterSpace:
             out[s.name] = s.apply(float(v))
         return out
 
+    def varying_vector_to_dict(self, vec: tp.Sequence[float]) -> tp.Dict[str, float]:
+        """Convert an optimizer vector (ordered only over *varying* params)
+        into a full parameter dict that includes fixed parameters.
+        """
+        if len(vec) != len(self._varying_specs):
+            raise ValueError(f"Expected vector of length {len(self._varying_specs)}, got {len(vec)}")
+        out = {}
+        for s, v in zip(self._varying_specs, vec):
+            out[s.name] = s.apply(float(v))
+        return out
+
     def dict_to_vector(self, params: tp.Dict[str, float]) -> np.ndarray:
         return np.array([params[n] for n in self.varying_names], dtype=float)
 
@@ -153,13 +171,50 @@ class ParameterSpace:
         return out
 
     # Nevergrad instrumentation helper - only instrument varying parameters
-    def instrument_nevergrad(self) -> "ng.p.instrumentation.Instrumentation":
-        instr = ng.p.Instrumentation()
+    def instrument_nevergrad(self) -> ng.p.Instrumentation:
+        params = []
         for s in self._varying_specs:
             lo, hi = s.bounds
-            instr *= ng.p.Scalar(lower=lo, upper=hi)
-        return instr
+            params.append(ng.p.Scalar(lower=lo, upper=hi))
+        return ng.p.Instrumentation(*params)
 
+
+class TrialsTracker:
+    def __init__(self):
+        self.trials = []
+        self.losses = []
+        self.step = 0
+
+    def __call__(self, optimizer: ng.optimization.Optimizer,
+                 candidate: ng.p.Instrumentation, loss: float):
+        """Callback function called after each evaluation"""
+        self.trials.append(candidate.value[0])
+        self.losses.append(loss)
+        self.step += 1
+
+        # Optional: print progress
+        if self.step % 10 == 0:
+            print(f"Step {self.step}: Loss = {loss:.6f}")
+
+    def get_best_trial(self):
+        """Get the trial with the lowest loss"""
+        best_idx = np.argmin(self.losses)
+        return {
+            '_trial_id': best_idx + 1,
+            'params': self.trials[best_idx],
+            'value': self.losses[best_idx]
+        }
+
+    def get_all_trials(self):
+        """Get all trials as a list of dictionaries"""
+        return [
+            {
+                '_trial_id': i + 1,
+                'params': trial,
+                'value': loss
+            }
+            for i, (trial, loss) in enumerate(zip(self.trials, self.losses))
+        ]
 
 class SpectrumFitter:
     """
@@ -260,6 +315,17 @@ class SpectrumFitter:
                 loss = self._loss_normalization * self._objective(model, self.y_exp)
             return loss
 
+    def _tracker_to_trials(self, trials_tracker: TrialsTracker) -> list[NevergradTrial]:
+        trials_all_results = trials_tracker.get_all_trials()
+        ng_trials = [
+            NevergradTrial(params=self.param_space.varying_vector_to_dict(trial["params"]),
+                           _trial_id=trial["_trial_id"],
+                           value=trial["value"]
+                           ) for trial in trials_all_results
+        ]
+        return ng_trials
+
+
     def fit_optuna(
         self,
         n_trials: int = 100,
@@ -299,7 +365,9 @@ class SpectrumFitter:
         budget: int = 200,
         optimizer_name: str = "TwoPointsDE",
         seed: tp.Optional[int] = None,
+        show_progress: bool = True,
         return_best_spectrum: bool = True,
+        track_trials = True,
         **kwargs,
     ) -> FitResult:
         """Fit using Nevergrad (if installed)."""
@@ -309,23 +377,33 @@ class SpectrumFitter:
         instr = self.param_space.instrument_nevergrad()
         if seed is not None:
             ng.optimizers.registry.seed(seed)
-        opt = ng.optimizers.registry[optimizer_name](instrumentation=instr, budget=budget)
+        opt = ng.optimizers.registry[optimizer_name](parametrization=instr, budget=budget)
 
         def _loss_from_tuple(*args):
             params = self.param_space.vector_to_dict(args)
-            return self.loss_from_params(params)
+            return self.loss_from_params(params).item()
+
+        if show_progress:
+            opt.register_callback("tell", ng.callbacks.ProgressBar())
+
+        trials_tracker = None
+        if track_trials:
+            trials_tracker = TrialsTracker()
+            opt.register_callback("tell", trials_tracker)
 
         recommendation = opt.minimize(_loss_from_tuple)
         x = recommendation.value
-        if not isinstance(x, (list, tuple, np.ndarray)):
-            x = (x,)
-        best_params = self.param_space.vector_to_dict(x)
+        best_params = self.param_space.varying_vector_to_dict(x[0])
         best_spec = None
         if return_best_spectrum:
-            best_spec = self.simulate_spectroscopic_data(best_params)
+            best_spec = self.simulate_spectroscopic_data({**self.param_space.fixed_params, **best_params})
+
+        if track_trials:
+            trials = self._tracker_to_trials(trials_tracker)
+
         return FitResult(
-            best_params, self.loss_from_params(best_params), best_spec,
-            {"backend": "nevergrad", "optimizer": optimizer_name}
+            best_params, self.loss_from_params({**self.param_space.fixed_params, **best_params}), best_spec,
+            {"backend": "nevergrad", "optimizer": optimizer_name, "trials": trials}
         )
 
     def fit(
@@ -352,23 +430,7 @@ class SpaceSearcher:
         self.top_k = int(top_k)
         self.distance_fraction = float(distance_fraction)
 
-
-    def _extract_trials_from_study(self, study,
-                                   param_names: list[str] | None = None):
-        """
-        Return arrays: (param_matrix, losses, trial_indices)
-        param_matrix shape: (n_trials, n_varying_params)
-        losses: array of length n_trials (float)
-        trial_indices: list of optuna trial numbers corresponding to rows
-        If top_k is given, returns only top_k lowest-loss trials.
-        """
-        trials = [t for t in study.trials if t.state.is_finished()]
-        if len(trials) == 0:
-            return np.zeros((0, 0)), np.array([]), []
-
-        if param_names is None:
-            param_names = list(study.best_params.keys())
-
+    def _parse_trials(self, trials: list[NevergradTrial | optuna.Trial], param_names: list[str]):
         param_rows = []
         losses = []
         trial_ids = []
@@ -392,8 +454,35 @@ class SpaceSearcher:
         L = np.asarray(losses, dtype=float)
         return P, L, np.asarray(trial_ids, dtype=np.int32)
 
-    def __call__(self, study, param_names: list[str] | None = None):
-        P, L, trial_numbers = self._extract_trials_from_study(study, param_names)
+    def _extract_trials_from_fit(self, fit_result: FitResult,
+                                   param_names: list[str] | None = None):
+        """
+        Return arrays: (param_matrix, losses, trial_indices)
+        param_matrix shape: (n_trials, n_varying_params)
+        losses: array of length n_trials (float)
+        trial_indices: list of optuna trial numbers corresponding to rows
+        If top_k is given, returns only top_k lowest-loss trials.
+        """
+        backend = fit_result.optimizer_info["backend"]
+
+        if backend == "nevergrad":
+            trials = fit_result.optimizer_info["trials"]
+        elif backend == "optuna":
+            trials = [t for t in fit_result.optimizer_info["study"].trials if t.state.is_finished()]
+        else:
+            raise KeyError("Unknown fit result")
+
+        if len(trials) == 0:
+            return np.zeros((0, 0)), np.array([]), []
+
+        if param_names is None:
+            param_names = list(fit_result.best_params.keys())
+        return trials, param_names
+
+    def __call__(self, fit_result: FitResult, param_names: list[str] | None = None):
+        trials, param_names = self._extract_trials_from_fit(fit_result, param_names)
+        P, L, trial_numbers = self._parse_trials(trials, param_names)
+
         if P.size == 0 or L.size == 0:
             return []
 
@@ -431,7 +520,7 @@ class SpaceSearcher:
 
         results: tp.List[tp.Dict[str, tp.Any]] = []
 
-        trial_map = {getattr(t, "number", getattr(t, "_trial_id", None)): t for t in study.trials}
+        trial_map = {getattr(t, "number", getattr(t, "_trial_id", None)): t for t in trials}
 
         for idx in chosen_idx:
             tn = int(trials_good[idx])
