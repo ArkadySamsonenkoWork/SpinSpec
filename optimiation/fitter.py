@@ -1,8 +1,5 @@
-import dataclasses
 from dataclasses import dataclass
 import typing as tp
-import math
-import time
 import sys
 
 import nevergrad as ng
@@ -73,7 +70,6 @@ class NevergradTrial:
     _trial_id: int
 
 
-
 class ParameterSpace:
     """Helper to manage a set of ParamSpec and conversions.
     Stores parameters in a fixed order. Supports parameters that are
@@ -91,11 +87,22 @@ class ParameterSpace:
         self._varying_specs = [s for s in self.specs if getattr(s, 'vary', True)]
         self.varying_names = [s.name for s in self._varying_specs]
 
+        self.varying_params = {s.name: s.default for s in self._varying_specs}
+
         for name in list(self.fixed_params.keys()):
             if name in self.varying_names:
                 idx = next(i for i, s in enumerate(self._varying_specs) if s.name == name)
                 del self._varying_specs[idx]
                 self.varying_names.remove(name)
+
+    def __getitem__(self, key: str):
+        try:
+            return self.fixed_params[key]
+        except KeyError:
+            try:
+                return self.varying_params[key]
+            except KeyError:
+                raise KeyError(f"Key '{key}' not found in fixed_params or _varying_specs")
 
     def freeze(self, name: str, value: tp.Optional[float] = None):
         """
@@ -117,6 +124,8 @@ class ParameterSpace:
         self._varying_specs = [s for s in self._varying_specs if s.name != name]
         self.varying_names = [s.name for s in self._varying_specs]
 
+        self.varying_params = {s.name: s.default for s in self._varying_specs}
+
     def unfreeze(self, name: str):
         """Unfreeze a parameter previously frozen with `freeze` or fixed_params."""
         if name in self.fixed_params:
@@ -126,6 +135,7 @@ class ParameterSpace:
             if s.name == name and s not in self._varying_specs and getattr(s, 'vary', True):
                 self._varying_specs.append(s)
                 self.varying_names.append(s.name)
+        self.varying_params = {s.name: s.default for s in self._varying_specs}
 
     def vector_to_dict(self, vec: tp.Sequence[float]) -> tp.Dict[str, float]:
         """Convert an optimizer vector (ordered only over *varying* params)
@@ -161,6 +171,24 @@ class ParameterSpace:
                 lo, hi = s.bounds
                 vals.append(0.5 * (lo + hi))
         return np.array(vals, dtype=float)
+
+    def set(self, params: dict[str, float]):
+        for key, value in params.items():
+            if key not in self.names:
+                raise KeyError(f"Parameter '{key}' not found in parameter space")
+            if key in self.fixed_params:
+                self.fixed_params[key] = value
+            elif key in self.varying_names:
+                for spec in self._varying_specs:
+                    if spec.name == key:
+                        spec.default = value
+                        break
+
+    def __dict__(self) -> dict[str, float]:
+        return {**self.varying_params, **self.fixed_params}
+
+    def __iter__(self):
+        return iter(self.__dict__().items())
 
     def suggest_optuna(self, trial) -> tp.Dict[str, float]:
         out = dict(self.fixed_params)  # start with fixed
@@ -228,6 +256,17 @@ class SpectrumFitter:
       - provide parameter specs
       - call fit(method='optuna'|'nevergrad')
     """
+    __available_optimizer__ = {"nevergrad": sorted(ng.optimizers.registry.keys()),
+                               "optuna": [optuna.integration.BoTorchSampler,
+                                          optuna.samplers.RandomSampler,
+                                          optuna.samplers.TPESampler,
+                                          optuna.samplers.BruteForceSampler,
+                                          optuna.samplers.GridSampler,
+                                          optuna.samplers.CmaEsSampler,
+                                          optuna.samplers.NSGAIISampler,
+                                          optuna.samplers.NSGAIIISampler,
+                                          ]
+                               }
 
     def __init__(
         self,

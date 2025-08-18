@@ -3,7 +3,6 @@ import math
 
 import torch
 
-
 class BaseIntegrand(ABC):
     def _sum_method_fabric(self, harmonic: int = 0):
         if harmonic == 0:
@@ -83,7 +82,6 @@ class SpectraIntegratorEasySpinLike(BaseSpectraIntegrator):
         self.infty_ratio = EasySpinIntegrand(harmonic)
         self.nine = torch.tensor(9.0)
         self.chunk_size = chunk_size
-
 
     def integrate(self, res_fields: torch.Tensor,
                   width: torch.Tensor, A_mean: torch.Tensor,
@@ -174,22 +172,20 @@ class AxialSpectraIntegratorEasySpinLike(SpectraIntegratorEasySpinLike):
         B_mean = (B1 + B2) / self.two
         c_extended = self.two_sqrt / extended_width
 
-
         def integrand(B_val: torch.Tensor):
             """
             :param B_val: the value of  spectral magnetic field
             :return: The total intensity at this magnetic field
             """
             ratio = self.infty_ratio(B_mean, c_extended, B_val)
-
-            return (ratio * A_mean).sum(dim=-1)
+            weighted_ratio = ratio * A_mean
+            return weighted_ratio.sum(dim=1)
 
         out = torch.zeros_like(spectral_field)
         M = spectral_field.shape[-1]
         spectral_field = spectral_field.unsqueeze(-1)
         for i in range(0, M, self.chunk_size):
             out[..., i: i+M] = integrand(spectral_field[..., i: i+M, :])
-
         #result = torch.tensor([integrand(b_val) for b_val in spectral_field])
         return out
 
@@ -243,9 +239,53 @@ class SpectraIntegratorEasySpinLikeTimeResolved(SpectraIntegratorEasySpinLike):
             :param B_val: the value of  spectral magnetic field
             :return: The total intensity at this magnetic field
             """
-            ratio = self.infty_ratio(B_mean, c_extended, B_val)
+            arg = (B_mean - B_val) * c_extended
+            ratio = torch.exp(-arg.square()) * c_extended / self.pi_sqrt
             return (ratio * A_mean).sum(dim=-1)
 
         result = torch.stack([integrand(b_val) for b_val in spectral_field], dim=0)
         return result
 
+
+class MeanIntegrator(BaseSpectraIntegrator):
+    def __init__(self, harmonic: int = 1, natural_width: float = 1e-5):
+        """
+        :param harmonic: The harmonic of the spectra. 0 is an absorptions, 1 is derivative
+        """
+        self.pi_sqrt = torch.tensor(math.sqrt(math.pi))
+        self.two_sqrt = torch.tensor(math.sqrt(2.0))
+        self.natural_width = torch.tensor(natural_width)
+
+        self.three = torch.tensor(3)
+        self.nine = torch.tensor(9.0)
+        self.infty_ratio = EasySpinIntegrand(harmonic)
+
+    def integrate(self, res_fields: torch.Tensor,
+                  width: torch.Tensor, A_mean: torch.Tensor,
+                  area: torch.Tensor, spectral_field: torch.Tensor):
+        r"""
+        Computes the mean intensity
+        :param res_fields: The resonance fields with the shape [..., M]
+        :param width: The width of transitions. The shape is [..., M]
+        :param A_mean: The intensities of transitions. The shape is [..., M]
+        :param area: The area of transitions. The shape is [M]. It is the same for all batch dimensions
+        :param spectral_field: The magnetic fields where spectra should be created. The shape is [...., N]
+        :return: result: Tensor of shape (..., N) with the value of the integral for each B
+
+        """
+        A_mean = A_mean * area
+        width = width
+        width = self.natural_width + width
+
+        c_extended = self.two_sqrt / width
+
+        def integrand(B_val: torch.Tensor):
+            """
+            :param B_val: the value of  spectral magnetic field
+            :return: The total intensity at this magnetic field
+            """
+            ratio = self.infty_ratio(res_fields, c_extended, B_val)
+            return (ratio * A_mean).sum(dim=-1)
+
+        result = torch.tensor([integrand(b_val) for b_val in spectral_field])
+        return result

@@ -7,8 +7,7 @@ import torch
 import torch.nn as nn
 
 from sklearn.neighbors import BallTree
-
-from .general_mesh import BaseMesh
+from .general_mesh import BaseMesh, BaseMeshPowder
 
 
 class BoundaryHandler:
@@ -210,17 +209,44 @@ class MeshProcessorBase:
         indexes = getattr(theta_line, method)()
         return [idx + shift for idx in indexes]
 
-    def _triangulate(self, grid_frequency):
-        delta_phi = self.phi_limits[1] - self.phi_limits[0]
-        vertices = np.array(
-            [[0.0, 0.0]] + [
-                (self.phi_limits[0] + delta_phi * (q / grid_frequency),
-                 (np.pi / 2) * (k / (grid_frequency - 1)))
-                for k in range(1, grid_frequency) for q in range(k + 1)
-            ]
-        )
-        triangulation = Delaunay(vertices)
-        return triangulation.simplices
+    def _create_triangular_dict(self, K: int):
+        """Vectorized version using NumPy operations"""
+        i_vals = np.arange(K)
+        i_grid, j_grid = np.meshgrid(i_vals, i_vals, indexing='ij')
+
+        mask = j_grid <= i_grid
+        i_tri = i_grid[mask]
+        j_tri = j_grid[mask]
+        return {(i, j): idx for idx, (i, j) in enumerate(zip(i_tri, j_tri))}
+
+    def _build_triangles(self, K: int):
+        positions = []
+        indices = []
+        for i in range(K):
+            for j in range(i + 1):
+                positions.append((i, j))
+                indices.append(i * (i + 1) // 2 + j)
+
+        pos_to_idx = {pos: idx for pos, idx in zip(positions, indices)}
+        upward_specs = []
+        downward_specs = []
+        for k in range(K - 1):
+            for q in range(k + 1):
+                upward_specs.append([(k, q), (k + 1, q), (k + 1, q + 1)])
+
+        for k in range(1, K - 1):
+            for q in range(1, k + 1):
+                downward_specs.append([(k, q), (k, q - 1), (k + 1, q)])
+
+        all_specs = upward_specs + downward_specs
+        triangles = np.array([[pos_to_idx[spec[0]], pos_to_idx[spec[1]], pos_to_idx[spec[2]]]
+                              for spec in all_specs], dtype=int)
+
+        return triangles
+
+    def _triangulate(self, grid_frequency: int):
+        triangulation = self._build_triangles(grid_frequency)
+        return triangulation
 
 
 class InterpolatingMeshProcessor(MeshProcessorBase):
@@ -327,16 +353,18 @@ def mesh_processor_factory(init_grid_frequency,
             boundaries_cond
         )
 
-class DelaunayMeshNeighbour(BaseMesh):
+
+class DelaunayMeshNeighbour(BaseMeshPowder):
     """Delaunay triangulation-based spherical mesh implementation."""
-    """It uses CloughTocher2DInterpolator to interpolate Data"""
+    """It uses Close Neighbour method to interpolate"""
     def __init__(self,
                  eps: float = 1e-7,
                  phi_limits: tuple[float, float] = (0, 2 * math.pi),
                  initial_grid_frequency: int = 20,
                  interpolation_grid_frequency: int = 40,
                  boundaries_cond=None,
-                 interpolate=True):
+                 interpolate=False,
+                 dtype=torch.float32):
         """
         Initialize Delaunay mesh parameters.
 
@@ -347,7 +375,9 @@ class DelaunayMeshNeighbour(BaseMesh):
             interpolation_grid_frequency: Resolution of interpolation grid
         """
         super().__init__()
+        self.dtype = dtype
         self.eps = eps
+
         self.phi_limit = phi_limits
         self.initial_grid_frequency = initial_grid_frequency
         self.interpolation_grid_frequency = interpolation_grid_frequency
@@ -359,11 +389,12 @@ class DelaunayMeshNeighbour(BaseMesh):
          self._post_grid,
          self._post_simplices) = self.create_initial_cache_data()
 
+
     def create_initial_cache_data(self) -> tuple:
         """Create and cache initial mesh data structures."""
         return (
-            torch.as_tensor(self.mesh_processor.init_vertices, dtype=torch.float32),
-            torch.as_tensor(self.mesh_processor.final_vertices, dtype=torch.float32),
+            torch.as_tensor(self.mesh_processor.init_vertices, dtype=self.dtype),
+            torch.as_tensor(self.mesh_processor.final_vertices, dtype=self.dtype),
             torch.as_tensor(self.mesh_processor.simplices)
         )
 

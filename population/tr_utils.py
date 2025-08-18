@@ -4,9 +4,42 @@ from torchdiffeq import odeint
 
 
 import constants
-
 import typing as tp
 
+
+class TransitionMatrixGenerator(ABC):
+    def __init__(self, context: tp.Any, *args, **kwargs):
+        self.context = context
+
+    def __call__(self, time: torch.Tensor) ->\
+            tuple[torch.Tensor | None, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """
+        :param time: time, where transition matrix should be found
+        :return: tuple [temperature, base probabilities of transition,
+        induced probabilities, outgoing probabilities]
+        """
+        temp = self._temperature(time)
+        base_probs = self._base_transition_probs(temp)
+        induced = self._induced_transition_probs(temp)
+        outgoing = self._outgoing_transition_probs(temp)
+        return temp, base_probs, induced, outgoing
+
+    def _temperature(self, time: torch.Tensor) -> torch.Tensor | None:
+        """Return temperature(s) at times t"""
+        return None
+
+    @abstractmethod
+    def _base_transition_probs(self, temp: torch.Tensor | None) -> torch.Tensor:
+        """Return the free transition probabilities at given temperature(s)"""
+        pass
+
+    def _induced_transition_probs(self, temp: torch.Tensor | None) -> torch.Tensor | None:
+        """Optional induced transitions; default None"""
+        return None
+
+    def _outgoing_transition_probs(self, temp: torch.Tensor | None) -> torch.Tensor | None:
+        """Optional outgoing transitions; default None"""
+        return None
 
 
 class EvolutionMatrix:
@@ -14,7 +47,7 @@ class EvolutionMatrix:
         """
         :param res_energies: The resonance energies. The shape is [..., spin system dimension, spin system dimension]
         """
-        self.energy_diff = res_energies.unsqueeze(-2) - res_energies.unsqueeze(-1)  # Think about it!!!!
+        self.energy_diff = res_energies.unsqueeze(-2) - res_energies.unsqueeze(-1)
         self.energy_diff = constants.unit_converter(self.energy_diff)
         self.config_dim = self.energy_diff.shape[:-2]
         self._probs_matrix = self._prob_matrix_factory(symmetry_probs)
@@ -64,42 +97,38 @@ class EvolutionMatrix:
         return transition_matrix
 
 
-class TransitionMatrixGenerator(ABC):
-    def __init__(self, context: dict[str, tp.Any] | None = None, *args, **kwargs):
-        self.context = context or {}
-
-    def __call__(self, time: torch.Tensor) ->\
-            tuple[torch.Tensor | None, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+class EvolutionMatrixKinetic(EvolutionMatrix):
+    def __call__(self,
+                 temp: torch.tensor,
+                 free_probs: torch.Tensor,
+                 induced_probs: torch.Tensor | None = None,
+                 out_probs: torch.Tensor | None = None,
+                 kynetic_probs: torch.Tensor | None = None):
         """
-        :param time: time, where transition matrix should be found
-        :return: tuple [temperature, base probabilities of transition,
-        induced probabilities, outgoing probabilities]
+        :temp
+        :param free_probs: The free relaxation speed. The shape of the __call__ is
+        :param induced_probs:
+        :param out_probs:
+        :return:
         """
-        temp = self._temperature(time)
-        base_probs = self._base_transition_probs(temp)
-        induced = self._induced_transition_probs(temp)
-        outgoing = self._outgoing_transition_probs(temp)
-        return temp, base_probs, induced, outgoing
+        probs_matrix = self._probs_matrix(temp, free_probs)
+        K = probs_matrix.shape[-1]
+        indices = torch.arange(K, device=probs_matrix.device)
+        probs_matrix[..., indices, indices] = -probs_matrix.sum(dim=-2)
+        transition_matrix = probs_matrix
 
-    def _temperature(self, time: torch.Tensor) -> torch.Tensor | None:
-        """Return temperature(s) at times t"""
-        return None
+        if induced_probs is not None:
+            induced_probs[..., indices, indices] = -induced_probs.sum(dim=-2)
+            transition_matrix += induced_probs
+        if out_probs is not None:
+            transition_matrix -= torch.diag_embed(out_probs)
 
-    @abstractmethod
-    def _base_transition_probs(self, temp: torch.Tensor | None) -> torch.Tensor:
-        """Return the free transition probabilities at given temperature(s)"""
-        pass
-
-    def _induced_transition_probs(self, temp: torch.Tensor | None) -> torch.Tensor | None:
-        """Optional induced transitions; default None"""
-        return None
-
-    def _outgoing_transition_probs(self, temp: torch.Tensor | None) -> torch.Tensor | None:
-        """Optional outgoing transitions; default None"""
-        return None
+        if kynetic_probs is not None:
+            transition_matrix += kynetic_probs
+        return transition_matrix
 
 
-class EvolutionSolver:
+class EvolutionVectorSolver:
     @staticmethod
     def odeint_solver(time: torch.Tensor, initial_populations: torch.Tensor,
                      evo: EvolutionMatrix, matrix_generator: TransitionMatrixGenerator):
@@ -123,7 +152,7 @@ class EvolutionSolver:
     @staticmethod
     def exponential_solver(time: torch.Tensor,
                           initial_populations: torch.Tensor,
-                              evo: EvolutionMatrix, matrix_generator: TransitionMatrixGenerator):
+                          evo: EvolutionMatrix, matrix_generator: TransitionMatrixGenerator):
         dt = (time[1] - time[0])
         M = evo(*matrix_generator(time))
         exp_M = torch.matrix_exp(M * dt)

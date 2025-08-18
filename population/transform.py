@@ -115,3 +115,10 @@ def transform_rates_vector(initial_rates, coeffs):
     K (b_new_1) = |⟨b_new_1|b_old_1⟩|² * K (b_old_1)
     """
     return torch.matmul(coeffs, initial_rates)
+
+
+def transform_kinetic_rates(kinetic_diag_matrix, coeffs):
+    """
+
+    """
+    return torch.matmul(coeffs, kinetic_diag_matrix)
