@@ -1,7 +1,33 @@
 from scipy.sparse import diags
 from scipy.sparse.linalg import spsolve
-
+import torch
 import numpy as np
+
+
+def normalize_spectrum(B: torch.Tensor,
+                       y: torch.Tensor,
+                       mode: str = "integral") -> torch.Tensor:
+    """Normalize a spectrum tensor y defined on field values B.
+
+    Modes supported:
+      - 'integral': integrate absolute values (Riemann) and divide
+      - 'max': divide by max absolute value
+      - None or 'none': return copy
+    """
+    if mode is None or mode == "none":
+        return y.clone()
+    step = float(B[1] - B[0]) if B.numel() > 1 else 1.0
+    if mode == "max":
+        denom = float(y.abs().max())
+        if denom == 0:
+            return y.clone()
+        return y / denom
+    if mode == "integral":
+        denom = float((y.abs().sum() * step).item())
+        if denom == 0:
+            return y.clone()
+        return y / denom
+    raise ValueError(f"Unknown norm mode: {mode}")
 
 
 def signal_to_amplitude(y_vals):

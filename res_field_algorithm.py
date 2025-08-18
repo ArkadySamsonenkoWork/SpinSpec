@@ -96,15 +96,21 @@ def has_rapid_variation(res_low: torch.Tensor, res_high: torch.Tensor,
 # 14) Изменить способо обработки случая and. Сейчас там формируется два отдельных батча.
 # 15) triu_indices - можно посчитать только один раз и потом не пересчитывать
 # Можно ввести ещё одну размерность.
+
+
 class BaseResonanceIntervalSolver(ABC):
     """
     Base class for algorithm of resonance interval search
     """
-    def __init__(self, eigen_finder: tp.Optional[BaseEigenSolver] = EighEigenSolver(), r_tol: float = 1e-4,
-        max_iterations: float = 20):
+    def __init__(self, spin_dim: int,
+                 eigen_finder: tp.Optional[BaseEigenSolver] = EighEigenSolver(), r_tol: float = 1e-4,
+        max_iterations: float = 20, delta_field: float = 1e-8, device: torch.device = torch.device("cpu")):
         self.eigen_finder = eigen_finder
         self.r_tol = torch.tensor(r_tol)
         self.max_iterations = torch.tensor(max_iterations)
+        self.delta_field = delta_field
+        self.spin_dim = spin_dim
+        self._triu_indices = torch.triu_indices(spin_dim, spin_dim, offset=1, device=device)
 
     def _compute_resonance_functions(self, eig_values_low: torch.Tensor, eig_values_high: torch.Tensor,
                                     resonance_frequency: torch.Tensor) -> (torch.Tensor, torch.Tensor):
@@ -118,13 +124,16 @@ class BaseResonanceIntervalSolver(ABC):
         :return: Resonance functions for left and right fields
         """
 
-        K = eig_values_low.shape[-1]  # Number of states
-        u, v = torch.triu_indices(K, K, offset=1, device=eig_values_low.device)
+        u, v = self._triu_indices
+
+        eig_values_high_expanded = eig_values_high.unsqueeze(-2)
+        eig_values_low_expanded = eig_values_low.unsqueeze(-2)
+
         res_low = \
-            (eig_values_low.unsqueeze(-2)[..., v] - eig_values_low.unsqueeze(-2)[..., u]).squeeze(
+            (eig_values_low_expanded[..., v] - eig_values_low_expanded[..., u]).squeeze(
                 -2) - resonance_frequency
         res_high = \
-            (eig_values_high.unsqueeze(-2)[..., v] - eig_values_high.unsqueeze(-2)[..., u]).squeeze(
+            (eig_values_high_expanded[..., v] - eig_values_high_expanded[..., u]).squeeze(
                 -2) - resonance_frequency
         return res_low, res_high
 
@@ -176,8 +185,9 @@ class BaseResonanceIntervalSolver(ABC):
         :param G: Magnetic dependant part of the Hamiltonian: H = F + B * G
         :return: Derivatives of energies by magnetic field. The calculations are based on Feynman's theorem.
         """
-        return torch.einsum('...ib,...ij,...jb->...b', torch.conj(eigen_vector), G, eigen_vector).real
-        # It has been corrected
+        tmp = torch.matmul(G, eigen_vector)
+        deriv = (torch.conj(eigen_vector) * tmp).sum(dim=-2).real
+        return deriv
 
     def compute_error(self, eig_values_low: torch.Tensor, eig_values_mid: torch.Tensor,
                       eig_values_high: torch.Tensor,
@@ -231,7 +241,6 @@ class BaseResonanceIntervalSolver(ABC):
         mask_and = torch.logical_and(mask_left, mask_right)
         mask_xor = torch.logical_xor(mask_left, mask_right)
         # Process and case. It means that both intervals have resonance
-
         if mask_and.any():
             indexes_and = indexes.clone()
             indexes_and[indexes_and == True] = mask_and
@@ -248,10 +257,8 @@ class BaseResonanceIntervalSolver(ABC):
                  (B_mid[mask_and], B_high[mask_and]),
                  indexes_and)
             )
-
         # Process XOR case. It means that only one interval has resonance.
         # Note, that it is impossible that none interval has resonance
-
         if mask_xor.any():
             new_intervals.append(
                 self._compute_xor_interval(
@@ -298,8 +305,6 @@ class BaseResonanceIntervalSolver(ABC):
         :param indexes: Indexes where Gz must be sliced. The bool tensor with the shape of the INITIAL batch-mesh shape
         :return: tuple of eig_values, eig_vectors, magnetic fields, and new indexes
         """
-        # Get adjusted intervals for XOR case
-
         mask_left = mask_left[mask_xor]
         # Select boundaries based on active mask side
         B_low = torch.where(mask_left.unsqueeze(-1).unsqueeze(-1), B_low[mask_xor], B_mid[mask_xor])
@@ -307,10 +312,11 @@ class BaseResonanceIntervalSolver(ABC):
         # Select corresponding eigenvalues/vectors
         eig_values_low = torch.where(mask_left.unsqueeze(1), eig_values_low[mask_xor], eig_values_mid[mask_xor])
         eig_values_high = torch.where(mask_left.unsqueeze(1), eig_values_mid[mask_xor], eig_values_high[mask_xor])
-        eig_vectors_low = torch.where(mask_left.unsqueeze(-1).unsqueeze(-1), eig_vectors_low[mask_xor], eig_vectors_mid[mask_xor])
-        eig_vectors_high = torch.where(mask_left.unsqueeze(-1).unsqueeze(-1), eig_vectors_mid[mask_xor], eig_vectors_high[mask_xor])
+        eig_vectors_low = torch.where(
+            mask_left.unsqueeze(-1).unsqueeze(-1), eig_vectors_low[mask_xor], eig_vectors_mid[mask_xor])
+        eig_vectors_high = torch.where(
+            mask_left.unsqueeze(-1).unsqueeze(-1), eig_vectors_mid[mask_xor], eig_vectors_high[mask_xor])
 
-        # Update tracking indexes
         indexes = indexes.clone()
         indexes[indexes == True] = mask_xor
 
@@ -320,6 +326,95 @@ class BaseResonanceIntervalSolver(ABC):
             (B_low, B_high),
             indexes
         )
+
+    def _compute_xor_interval_dirivative(self,
+                              mask_xor: torch.Tensor,
+                              mask_left: torch.Tensor,
+                              mask_right: torch.Tensor,
+                              eig_values_low, eig_values_mid, eig_values_high,
+                              eig_vectors_low, eig_vectors_mid, eig_vectors_high,
+                              derivatives_low, derivatives_mid, derivatives_high,
+                              B_low, B_mid, B_high,
+                              indexes: torch.Tensor
+                              ) -> tuple[
+        tuple[torch.Tensor, torch.Tensor],
+        tuple[torch.Tensor, torch.Tensor],
+        tuple[torch.Tensor, torch.Tensor],
+        tuple[torch.Tensor, torch.Tensor], torch.Tensor
+    ]:
+
+        (
+         (eig_values_low, eig_values_high),
+         (eig_vectors_low, eig_vectors_high),
+         (B_low, B_high), indexes
+        ) = self._compute_xor_interval(
+                    mask_xor,
+                    mask_left,
+                    mask_right,
+                    eig_values_low, eig_values_mid, eig_values_high,
+                    eig_vectors_low, eig_vectors_mid, eig_vectors_high,
+                    B_low, B_mid, B_high,
+                    indexes,
+                )
+        mask_left = mask_left[mask_xor]
+        derivatives_low = torch.where(mask_left.unsqueeze(1), derivatives_low[mask_xor], derivatives_mid[mask_xor])
+        derivatives_high = torch.where(mask_left.unsqueeze(1), derivatives_mid[mask_xor], derivatives_high[mask_xor])
+
+        return (
+            (eig_values_low, eig_values_high),
+            (eig_vectors_low, eig_vectors_high),
+            (derivatives_low, derivatives_high),
+            (B_low, B_high),
+            indexes
+        )
+
+    def _finilize_batch(self,
+                        eig_values_low: torch.Tensor, eig_values_mid: torch.Tensor, eig_values_high: torch.Tensor,
+                        eig_vectors_low: torch.Tensor, eig_vectors_mid: torch.Tensor, eig_vectors_high: torch.Tensor,
+                        derivatives_low: torch.Tensor, derivatives_mid: torch.Tensor, derivatives_high: torch.Tensor,
+                        B_low: torch.Tensor, B_mid: torch.Tensor, B_high: torch.Tensor, indexes: torch.Tensor,
+                        resonance_frequency: torch.Tensor, *args, **kwargs):
+
+        mask_left, mask_right = self.determine_split_masks(eig_values_low, eig_values_mid, eig_values_high,
+                                                    B_low, B_mid, B_high,
+                                                    indexes, resonance_frequency, *args, **kwargs)
+
+        mask_and = torch.logical_and(mask_left, mask_right)
+        mask_xor = torch.logical_xor(mask_left, mask_right)
+        new_intervals = []
+        if mask_and.any():
+            indexes_and = indexes.clone()
+            indexes_and[indexes_and == True] = mask_and
+            new_intervals.append(
+                ((eig_values_low[mask_and], eig_values_mid[mask_and]),
+                 (eig_vectors_low[mask_and], eig_vectors_mid[mask_and]),
+                 (derivatives_low[mask_and], derivatives_mid[mask_and]),
+                 (B_low[mask_and], B_mid[mask_and]),
+                 indexes_and)
+            )
+            new_intervals.append(
+                ((eig_values_mid[mask_and], eig_values_high[mask_and]),
+                 (eig_vectors_mid[mask_and], eig_vectors_high[mask_and]),
+                 (derivatives_mid[mask_and], derivatives_high[mask_and]),
+                 (B_mid[mask_and], B_high[mask_and]),
+                 indexes_and)
+            )
+        # Process XOR case. It means that only one interval has resonance.
+        # Note, that it is impossible that none interval has resonance
+        if mask_xor.any():
+            new_intervals.append(
+                self._compute_xor_interval_dirivative(
+                    mask_xor,
+                    mask_left,
+                    mask_right,
+                    eig_values_low, eig_values_mid, eig_values_high,
+                    eig_vectors_low, eig_vectors_mid, eig_vectors_high,
+                    derivatives_low, derivatives_mid, derivatives_high,
+                    B_low, B_mid, B_high,
+                    indexes,
+                )
+            )
+        return new_intervals
 
     def _iterate_batch(self, batch: tuple[
                                  tuple[torch.Tensor, torch.Tensor],
@@ -342,9 +437,11 @@ class BaseResonanceIntervalSolver(ABC):
         final_batches = []
         (eig_values_low, eig_values_high), (eig_vectors_low, eig_vectors_high), (B_low, B_high), indexes = batch
         B_mid = (B_low + B_high) / 2
+
+
         eig_values_mid, eig_vectors_mid = torch.linalg.eigh(F[indexes] + Gz[indexes] * B_mid)
 
-        # It is only one single
+        # It is only one    single
         # point where gradient should be calculated
 
         error, (derivatives_low, derivatives_high) = \
@@ -358,6 +455,18 @@ class BaseResonanceIntervalSolver(ABC):
         if converged_mask.any():
             indexes_conv = indexes.clone()
             indexes_conv[indexes_conv == True] = converged_mask
+
+            eig_vectors_mid_converg = eig_vectors_mid[converged_mask]
+            derivatives_mid = self._compute_derivative(eig_vectors_mid_converg, Gz[indexes_conv])
+            final_batches.extend(
+                self._finilize_batch(
+                    eig_values_low[converged_mask], eig_values_mid[converged_mask], eig_values_high[converged_mask],
+                    eig_vectors_low[converged_mask], eig_vectors_mid_converg, eig_vectors_high[converged_mask],
+                    derivatives_low[converged_mask], derivatives_mid, derivatives_high[converged_mask],
+                    B_low[converged_mask], B_mid[converged_mask], B_high[converged_mask],
+                    indexes_conv, resonance_frequency, *args, **kwargs)
+            )
+            """
             final_batches.append((
                 (eig_values_low[converged_mask], eig_values_high[converged_mask]),
                 (eig_vectors_low[converged_mask], eig_vectors_high[converged_mask]),
@@ -365,7 +474,7 @@ class BaseResonanceIntervalSolver(ABC):
                 (B_low[converged_mask], B_high[converged_mask]),
                 indexes_conv,
             ))
-
+            """
         active_mask = ~converged_mask
         if not active_mask.any():
             return [], final_batches
@@ -463,7 +572,7 @@ class BaseResonanceIntervalSolver(ABC):
 class GeneralResonanceIntervalSolver(BaseResonanceIntervalSolver):
     """
     Find resonance interval for the general Hamiltonian case.
-    The general case determines form the condition:
+    The general case determines form the conditcion:
         delta_1N. If it is greater nu_0, than looping resonance are possible. If not, the resonance interval
         can be determined by change sign of resonance function at the ends of the interval.
     It is used if for part of the data among the beach-mesh dimension, the conditions are True, and for part are False
@@ -503,7 +612,6 @@ class GeneralResonanceIntervalSolver(BaseResonanceIntervalSolver):
                                          resonance_frequency, baseline_sign[indexes], deriv_max[indexes])
 
         return mask_left, mask_right
-
 
 
 class ZeroFreeResonanceIntervalSolver(BaseResonanceIntervalSolver):
@@ -565,8 +673,12 @@ class BaseResonanceLocator:
                                          diff_eig_high: torch.Tensor,
                                          diff_deriv_low: torch.Tensor,
                                          diff_deriv_high: torch.Tensor):
-        coef_3 = 2 * diff_eig_low - 2 * diff_eig_high + diff_deriv_low + diff_deriv_high
-        coef_2 = -3 * diff_eig_low + 3 * diff_eig_high - 2 * diff_deriv_low - diff_deriv_high
+
+
+        deriv_sum = diff_deriv_low + diff_deriv_high
+
+        coef_3 = 2 * (diff_eig_low - diff_eig_high) + deriv_sum
+        coef_2 = -3 * (diff_eig_low - diff_eig_high) - 2 * diff_deriv_low - diff_deriv_high
         coef_1 = diff_deriv_low
         coef_0 = diff_eig_low
         return (coef_3, coef_2, coef_1, coef_0)
@@ -645,7 +757,7 @@ class BaseResonanceLocator:
                                   mask_trans: torch.Tensor,
                                   resonance_frequency: torch.Tensor) ->\
             list[tuple[torch.Tensor, torch.Tensor]]:
-        step_B = torch.zeros_like(mask_trans, dtype=torch.float32)
+        step_B = torch.zeros_like(mask_trans, dtype=resonance_frequency.dtype)
         step_B[mask_trans] = self._find_resonance_roots(diff_eig_low, diff_eig_high,
                                                   diff_deriv_low, diff_deriv_high,
                                                   resonance_frequency)
@@ -664,14 +776,47 @@ class BaseResonanceLocator:
         energy = coef_3 * step_B ** 3 + coef_2 * step_B ** 2 + coef_1 * step_B + coef_0
         return energy
 
-    def _interpolate_vectors(self, vec_low, vec_high, weights_low, weights_high):
-        # Compute inner products along the eigenvector component axis
-        inner_product = torch.sum(torch.conj(vec_low) * vec_high, dim=-1, keepdim=True)
-        inner_product_abs = torch.clamp(torch.abs(inner_product), min=1e-12)
-        phase_factor = inner_product / inner_product_abs
-        vec_high_aligned_down = vec_high * torch.conj(phase_factor)
-        vectors_u = vec_low * weights_low + vec_high_aligned_down * weights_high
-        return vectors_u
+    def _interpolate_vectors(self, vec_low, vec_high, weights_low, weights_high, eps=1e-12):
+        """
+        Faster version of _interpolate_vectors.
+
+        Differences / improvements:
+        - Avoids computing a division for entries where the inner product is (near) zero by using a boolean mask
+          and doing the division only for true entries (reduces work and avoids creating large temporaries).
+        - Uses vec.abs().square().sum(...).sqrt() for norm which is usually cheaper than conj()*sum or linalg.norm.
+        - Minimizes number of intermediate tensors.
+        - Keeps the same numerical handling for tiny magnitudes (controlled by eps).
+        """
+        # inner product along last (vector) axis; keepdim for broadcasting
+        inner = torch.sum(vec_low.conj() * vec_high, dim=-1, keepdim=True)  # complex
+        abs_inner = inner.abs()  # real, >= 0
+
+        # compute phase only where abs_inner > eps; otherwise leave phase = 1
+        phase = torch.ones_like(inner)
+        mask = abs_inner > eps
+        if mask.any():
+            # do the division only for the masked entries
+            phase[mask] = inner[mask] / abs_inner[mask]
+
+        # align vec_high by the conjugate of the phase
+        vec_high_aligned = vec_high * phase.conj()
+
+        # weighted linear combination
+        vec = vec_low * weights_low + vec_high_aligned * weights_high
+
+        # normalize: compute norm via abs()->square()->sum->sqrt (works for complex and avoids conj())
+        norm = torch.sqrt(torch.sum(vec.abs().square(), dim=-1, keepdim=True))
+
+        # avoid dividing by very small norms: set those norms to 1 (so vector remains as-is)
+        small_norm_mask = norm <= eps
+        if small_norm_mask.any():
+            norm_safe = norm.clone()
+            norm_safe[small_norm_mask] = 1.0
+            vec = vec / norm_safe
+        else:
+            vec = vec / norm
+
+        return vec
 
     def _split_mask(self, mask_res: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -935,7 +1080,7 @@ class GeneralResonanceLocator(BaseResonanceLocator):
         outs = []
         for roots, mask_roots in results:
             pair_mask = torch.clone(mask_trans)
-            step_B = torch.zeros_like(mask_trans, dtype=torch.float32)
+            step_B = torch.zeros_like(mask_trans, dtype=resonance_frequency.dtype)
             pair_mask[mask_trans] = mask_roots
             step_B[pair_mask] = roots
             outs.append((step_B, pair_mask))
@@ -1024,6 +1169,7 @@ class GeneralResonanceLocator(BaseResonanceLocator):
         roots_case1 = torch.empty((mask_three_roots.sum(), 3), dtype=a.dtype, device=a.device).fill_(float('inf'))
         roots_case2 = torch.empty((mask_one_root.sum(), 1), dtype=a.dtype, device=a.device).fill_(float('inf'))
 
+
         if mask_three_roots.any():
             roots_case1 = self._find_three_roots(a[mask_three_roots], p[mask_three_roots], q[mask_three_roots])
             roots_in_interval = roots_case1.ge(0.0) & roots_case1.le(1.0)
@@ -1035,6 +1181,7 @@ class GeneralResonanceLocator(BaseResonanceLocator):
                                                      coef_2[mask_one_root],
                                                      coef_1[mask_one_root],
                                                      coef_0[mask_one_root]).unsqueeze(-1)
+
         result = self._prepare_roots_mask_batch(roots_case1, roots_case2, mask_three_roots, mask_one_root)
         return result
 
@@ -1096,10 +1243,11 @@ class GeneralResonanceLocator(BaseResonanceLocator):
 
 
 class ResField:
-    def __init__(self, eigen_finder: BaseEigenSolver = EighEigenSolver(), output_full_eigenvector: bool = False):
+    def __init__(self, spin_dim: int, eigen_finder: BaseEigenSolver = EighEigenSolver(), output_full_eigenvector: bool = False):
         """
         :param eigen_finder: The eigen solver that should find eigen values and eigen vectors
         """
+        self.spin_dim = spin_dim
         self.eigen_finder = eigen_finder
         self.output_full_eigenvector = output_full_eigenvector
 
@@ -1113,14 +1261,14 @@ class ResField:
         baselign_sign = self._compute_zero_field_resonance(F, resonance_frequency)
         if baselign_sign.all():
             locator = GeneralResonanceLocator(output_full_eigenvector=self.output_full_eigenvector)
-            interval_solver = GeneralResonanceIntervalSolver(eigen_finder=self.eigen_finder)
+            interval_solver = GeneralResonanceIntervalSolver(self.spin_dim, eigen_finder=self.eigen_finder)
             args = (baselign_sign, system.calculate_derivative_max())
         elif baselign_sign.any():
             #interval_solver = GeneralResonanceIntervalSolver(eigen_finder=self.eigen_finder)
             raise NotImplementedError
         else:
             locator = BaseResonanceLocator(output_full_eigenvector=self.output_full_eigenvector)
-            interval_solver = ZeroFreeResonanceIntervalSolver(eigen_finder=self.eigen_finder)
+            interval_solver = ZeroFreeResonanceIntervalSolver(self.spin_dim, eigen_finder=self.eigen_finder)
             args = ()
         return interval_solver, locator, args
 
@@ -1163,7 +1311,8 @@ class ResField:
         - vector_full_system | None. The eigen vectors for all energy levels
         """
         interval_solver, locator, args = self._solver_fabric(sample, F, resonance_frequency)
-        bathces = interval_solver(F, Gz, B_low, B_high, resonance_frequency, *args)
+        bathces = interval_solver(
+            F, Gz, B_low, B_high, resonance_frequency, *args)
         bathces = locator(bathces, resonance_frequency, *args)
         return bathces
 

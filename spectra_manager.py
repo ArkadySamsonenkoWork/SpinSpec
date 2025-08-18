@@ -23,8 +23,9 @@ from collections import defaultdict
 
 
 def compute_matrix_element(vector_down, vector_up, G):
-    return torch.einsum('...bi,...ij,...bj->...b', torch.conj(vector_down), G, vector_up)
-
+    tmp = torch.matmul(G, vector_up.transpose(-2, -1))  # (..., i, b)
+    tmp = tmp.transpose(-2, -1)  # (..., b, i)
+    return (vector_down.conj() * tmp).sum(dim=-1)
 
 class PostSpectraProcessing:
     def __init__(self, *args, **kwargs):
@@ -511,7 +512,8 @@ class BaseSpectraCreator(ABC):
         self.mesh_size = self.mesh.initial_size
         self.broader = Broadener()
 
-        self.res_field = res_field_algorithm.ResField(output_full_eigenvector=self._get_output_eigenvector())
+        self.res_field = res_field_algorithm.ResField(spin_dim = self.spin_system_dim,
+                                                      output_full_eigenvector=self._get_output_eigenvector())
 
         self.intensity_calculator = self._get_intenisty_calculator(intensity_calculator, temperature, populator)
         self._param_specs = self._get_param_specs()
@@ -841,10 +843,7 @@ class BaseSpectraCreator(ABC):
 
         intensities *= freq_to_field_global
         intensities = intensities / intensities.abs().max()
-        print("intensities", intensities)
         width = self.broader.add_hamiltonian_straine(sample, width_square) * freq_to_field_global
-        print("width", width)
-        print("res_fields", res_fields)
         return mask_triu_general, res_fields, intensities, width, *extra_tensors
 
 
