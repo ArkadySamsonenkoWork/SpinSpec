@@ -959,11 +959,14 @@ class BaseResonanceLocator:
 
             [True, False, True],
             [True, False, True],
-            ])
-            and mask_triu = torch.Tensor([False, False, True, True, True, False])
-            and batch.shape = [6, 3, ...]
 
-        Then in the output the data must be splitted into 3 parts with repect to:
+            [False, False, True],
+            ])
+
+            and mask_triu = torch.Tensor([False, False, True, True, True, False])
+            and batch.shape = [7, 3, ...]
+
+        Then in the output the data must be splitted into 4 parts with repect to:
             [True, False, False],
             [True, False, False], with corresponding mask_triu_updated = torch.Tensor([False, False, True, False, False, False])
                                   and batch_updated.shape = [2, 1, ...]
@@ -976,35 +979,49 @@ class BaseResonanceLocator:
             [True, False, True], with corresponding mask_triu_updated = torch.Tensor([False, False, True, False, True, False])
                                  and batch_updated.shape = [2, 2, ...]
 
+
+            [Flase, False, True], with corresponding mask_triu_updated = torch.Tensor([False, False, False, False, True, False])
+                                 and batch_updated.shape = [1, 1, ...]
+
         """
         original_shape = mask_trans.shape
         flattened_mask = mask_trans.view(-1, original_shape[-1])
+        n = original_shape[-1]
 
-        # Find unique patterns efficiently using torch operations
-        # Convert to int for unique operation (more efficient than boolean)
-        mask_patterns = flattened_mask.int()
-        unique_patterns, inverse_indices, counts = torch.unique(mask_patterns, dim=0, return_inverse=True,
-                                                                return_counts=True)
+        if n <= 63:
+            ar = torch.arange(n, dtype=torch.long, device=flattened_mask.device)
+            pattern_int = (flattened_mask.long() << ar).sum(dim=-1)
+            unique_ints, inverse_indices, counts = torch.unique(pattern_int, return_inverse=True, return_counts=True)
+            use_bitpack = True
+        else:
+            mask_patterns = flattened_mask.int()
+            unique_patterns, inverse_indices, counts = torch.unique(mask_patterns, dim=0, return_inverse=True,
+                                                                    return_counts=True)
+            use_bitpack = False
 
         # Pre-compute mask_triu true positions for efficiency
         triu_true_positions = torch.where(mask_triu)[0]
         indexes_true_positions = torch.where(indexes)[0]
 
-        # Sort the inverse indices to group them
-        sorted_local_idx = torch.argsort(inverse_indices)
+        num_unique = len(counts)
 
-        # Compute cumulative starts for groups
-        cumsums = torch.cumsum(counts, dim=0)
-        group_starts = torch.cat([torch.zeros(1, dtype=cumsums.dtype, device=cumsums.device), cumsums[:-1]])
+        for pattern_idx in range(num_unique):
+            if use_bitpack:
+                unique_int = unique_ints[pattern_idx]
+                if unique_int == 0:
+                    continue
+                bit_mask = ((unique_int >> ar) & 1).bool()
+                pattern_true_indices = torch.where(bit_mask)[0]
+            else:
+                current_pattern = unique_patterns[pattern_idx].bool()
+                if not current_pattern.any():
+                    continue
+                pattern_true_indices = torch.where(current_pattern)[0]
 
-        for pattern_idx in range(len(unique_patterns)):
-            current_pattern = unique_patterns[pattern_idx].bool()
-            if not current_pattern.any():
+            # Get local indices without sorting
+            pattern_local_indices = torch.where(inverse_indices == pattern_idx)[0]
+            if len(pattern_local_indices) == 0:
                 continue
-
-            start = group_starts[pattern_idx]
-            end = start + counts[pattern_idx]
-            pattern_local_indices = sorted_local_idx[start:end]
 
             # Map to global indices
             global_pattern_indices = indexes_true_positions[pattern_local_indices]
@@ -1015,23 +1032,14 @@ class BaseResonanceLocator:
 
             # Create updated mask_triu efficiently
             mask_triu_updated = torch.zeros_like(mask_triu)
-            pattern_true_indices = torch.where(current_pattern)[0]
             if len(pattern_true_indices) > 0:
                 pos_to_set = triu_true_positions[pattern_true_indices]
                 mask_triu_updated[pos_to_set] = True
 
-            # Row selection mask for the current batch
-            row_select = indexes_updated[indexes]
-
-            batches_selected = []
-            for batch in batches_triu:
-                batch_selected = batch[row_select]
-                batch_selected = batch_selected.index_select(dim=len(original_shape) - 1, index=pattern_true_indices)
-                batches_selected.append(batch_selected)
-
-            for batch in batches_general:
-                batch_selected = batch[row_select]
-                batches_selected.append(batch_selected)
+            # Select batches using integer indices to avoid bool masking
+            batches_selected = \
+                [batch[pattern_local_indices].index_select(dim=len(original_shape) - 1, index=pattern_true_indices) for batch in batches_triu] + \
+                [batch[pattern_local_indices] for batch in batches_general]
 
             yield mask_triu_updated, indexes_updated, batches_selected
 
@@ -1084,7 +1092,8 @@ class BaseResonanceLocator:
         resonance_field_data = self._compute_resonance_fields(diff_eig_low, diff_eig_high, diff_deriv_low,
                                     diff_deriv_high, mask_trans, resonance_frequency)
 
-        outputs = []
+        # resonance_data = self._get_resonance_data(resonance_field_data, mask_triu, indexes)
+
         for step_B, mask_trans_i in resonance_field_data:
             # Check if it is correct
             mask_trans_updated, mask_triu_updated, step_B =\
@@ -1095,18 +1104,12 @@ class BaseResonanceLocator:
                                                                   delta_B * deriv_low, delta_B * deriv_high
                                                                   )
             Bres = B_low.squeeze(dim=-1) + step_B * delta_B.squeeze(dim=-1)
-            # print("mask_triu_updated  ", mask_triu_updated)
-            # print("mask_trans_updated  ", mask_trans_updated)
-
-
-            # IT WAS ADDED. CHECK THE CORRECTNESS
 
             for mask_triu_new, indexes_new, resonance_data in self._split_batch(
                 mask_trans_updated, mask_triu_updated, indexes,
                 (resonance_energies, step_B, Bres), (eig_vectors_low, eig_vectors_high)
                 ):
                 resonance_energies, step_B, Bres, eig_vectors_low_new, eig_vectors_high_new = resonance_data
-
 
                 valid_lvl_down = lvl_down[mask_triu_new]
                 valid_lvl_up = lvl_up[mask_triu_new]
@@ -1121,12 +1124,7 @@ class BaseResonanceLocator:
                     indexes_new,
                     resonance_energies,
                     vector_full_system)
-
-                # print(mask_triu_new)
-                # print("\n")
-
                 outputs.append(out_res)
-            # print("\n\n\n")
         return outputs
 
     def __call__(self, final_batches, resonance_frequency, *args, **kwargs):
@@ -1341,11 +1339,16 @@ class GeneralResonanceLocator(BaseResonanceLocator):
 
 
 class ResField:
-    def __init__(self, spin_dim: int, eigen_finder: BaseEigenSolver = EighEigenSolver(), output_full_eigenvector: bool = False):
+    def __init__(self, spin_system_dim: int,
+                 mesh_size: torch.Size,
+                 batch_dims: torch.Size | tuple,
+                 eigen_finder: BaseEigenSolver = EighEigenSolver(), output_full_eigenvector: bool = False):
         """
         :param eigen_finder: The eigen solver that should find eigen values and eigen vectors
         """
-        self.spin_dim = spin_dim
+        self.spin_system_dim = spin_system_dim
+        self.mesh_size = mesh_size
+        self.batch_dims = batch_dims
         self.eigen_finder = eigen_finder
         self.output_full_eigenvector = output_full_eigenvector
 
@@ -1359,14 +1362,14 @@ class ResField:
         baselign_sign = self._compute_zero_field_resonance(F, resonance_frequency)
         if baselign_sign.all():
             locator = GeneralResonanceLocator(output_full_eigenvector=self.output_full_eigenvector)
-            interval_solver = GeneralResonanceIntervalSolver(self.spin_dim, eigen_finder=self.eigen_finder)
+            interval_solver = GeneralResonanceIntervalSolver(self.spin_system_dim, eigen_finder=self.eigen_finder)
             args = (baselign_sign, system.calculate_derivative_max())
         elif baselign_sign.any():
             #interval_solver = GeneralResonanceIntervalSolver(eigen_finder=self.eigen_finder)
             raise NotImplementedError
         else:
             locator = BaseResonanceLocator(output_full_eigenvector=self.output_full_eigenvector)
-            interval_solver = ZeroFreeResonanceIntervalSolver(self.spin_dim, eigen_finder=self.eigen_finder)
+            interval_solver = ZeroFreeResonanceIntervalSolver(self.spin_system_dim, eigen_finder=self.eigen_finder)
             args = ()
         return interval_solver, locator, args
 
@@ -1382,13 +1385,166 @@ class ResField:
         res_1N = eig_values[..., -1] - eig_values[..., 0] - resonance_frequency
         return res_1N > 0
 
+    def _assign_global_indexes(self,
+                               occurrences: list[tuple[int, torch.Tensor, torch.Tensor]]
+                               ) -> tuple[list[tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]], int]:
+        """
+        'occurrences' is list of the next data:
+        the batch index
+        The row-batch indexes
+        The column indexes with respect to the triangular matrix of transitions
+        The keep_local. - The pairs that were saved in filter by max
+        The algorithm create global indexes
+
+        Example 1
+        row = [1 ,2, 3], col = [1, 2]
+        row = [1, 2, 3], col = [3, 4]
+        the output
+        row = [1 , 2, 3], col = [1, 2], glob_idx = [0, 1]
+        row = [1 , 2, 3], col = [3,  4], glob_idx = [2, 3]
+
+        Example 2
+        row = [1 ,2, 3], col = [1, 2]
+        row = [4, 5, 6], col = [1, 2]
+        the output
+        row = [1 , 2, 3], col = [1, 2], glob_idx = [0, 1]
+        row = [4 , 5, 6], col = [1,  2], glob_idx = [0, 1]
+
+        Example 3
+        row = [1 ,2], col = [1, 2]
+        row = [2, 3], col = [2, 3]
+        the output
+        row = [1 , 2], col = [1, 2], glob_idx = [0, 1]
+        row = [2 , 3], col = [2,  3], glob_idx = [2, 3]
+
+        Example 4
+        row = [1 ,2 , 3], col = [1, 2]
+        row = [4, 5, 6], col = [2, 3]
+        the output
+        row = [1 , 2, 3], col = [1, 2], glob_idx = [0, 1]
+        row = [4 , 5, 6], col = [2,  3], glob_idx = [1, 2]
+        """
+        col_to_slots = {}
+
+        out: list[tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        max_global = -1
+
+        for (batch_idx, rows, cols) in occurrences:
+            rows_set = set(rows.tolist())
+            assigned_indices: list[int] = []
+            for c in cols.tolist():
+                slots = col_to_slots.get(int(c), [])
+                reused = False
+                for slot_idx, (gidx, used_rows) in enumerate(slots):
+                    if used_rows.isdisjoint(rows_set):
+                        assigned_indices.append(gidx)
+                        slots[slot_idx] = (gidx, used_rows.union(rows_set))
+                        reused = True
+                        break
+
+                if not reused:
+                    max_global += 1
+                    gidx = max_global
+                    assigned_indices.append(gidx)
+                    slots.append((gidx, set(rows_set)))
+                    col_to_slots[int(c)] = slots
+
+            global_idx_tensor = torch.tensor(assigned_indices, dtype=torch.long)
+            out.append((batch_idx, rows, cols, global_idx_tensor))
+        return out, max_global + 1
+
+    def _first_pass(self, batches):
+        cached_batches = []
+        occurences = []
+        for bi, batch in enumerate(batches):
+            (vectors_u, vectors_v), (valid_lvl_down, valid_lvl_up), \
+                Bres, mask_triu, mask_indexes, resonance_energies, vector_full_system = batch
+
+            row_idx = torch.nonzero(mask_indexes, as_tuple=False).squeeze(-1)
+            col_idx = torch.nonzero(mask_triu, as_tuple=False).squeeze(-1)
+
+            if row_idx.numel() > 0 and col_idx.numel() > 0:
+                cached_batches.append((
+                    (vectors_u, vectors_v),
+                    (valid_lvl_down, valid_lvl_up),
+                    Bres, mask_triu, mask_indexes, resonance_energies, vector_full_system
+                ))
+                occurences.append((bi, row_idx, col_idx))
+        return cached_batches, occurences
+
+    def _combine_resonance_data(self, device: torch.device,
+                                batches: list[
+                               tuple[
+                                    tuple[torch.Tensor, torch.Tensor],
+                                    tuple[torch.Tensor, torch.Tensor],
+                                    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None,
+                               ]]) -> tuple[
+        tuple[torch.Tensor, torch.Tensor],
+        tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor | None
+    ]:
+        """
+        :param batches: list of next data:
+        - tuple of eigen vectors for resonance energy levels of low and high levels
+        - tuple of valid indexes of levels between which transition occurs
+        - magnetic field of transitions
+        - mask_trans - Boolean transition mask [batch_size, num valid transitions]. It is True if transition occurs
+        - mask_triu - Boolean triangular mask [total number of all possible transitions].
+        It is True if there is at least one element in batch for which transition between energy levels occurs.
+        num valid transitions = sum(mask_triu)
+        - indexes: Boolean mask of correct elements in batch
+        - resonance energies
+        - vector_full_system | None. The eigen vectors for all energy levels
+        :return:
+        torch.Tensor, torch.Tensor
+        """
+
+        config_dims = (*self.batch_dims, *self.mesh_size)
+        batches, occurrences = self._first_pass(batches)
+        occurrences, max_columns = self._assign_global_indexes(occurrences)
+
+        vectors_u = torch.zeros((*config_dims, max_columns, self.spin_system_dim), dtype=torch.complex64, device=device)
+        vectors_v = torch.zeros((*config_dims, max_columns, self.spin_system_dim), dtype=torch.complex64, device=device)
+        resonance_energies = torch.zeros((*config_dims, max_columns, self.spin_system_dim), dtype=torch.float32, device=device)
+
+        valid_lvl_down = torch.zeros(max_columns, dtype=torch.long, device=device)
+        valid_lvl_up = torch.zeros(max_columns, dtype=torch.long, device=device)
+        res_fields = torch.zeros((*config_dims, max_columns), dtype=torch.float32, device=device)
+
+        if self.output_full_eigenvector:
+            full_eigen_vectors = torch.zeros((*config_dims, max_columns,
+                                              self.spin_system_dim, self.spin_system_dim),
+                                             dtype=torch.complex64, device=device)
+        else:
+            full_eigen_vectors = None
+
+        for bi, rows_batch_idx, col_batch_idx, col_base_idx in occurrences:
+            (vectors_u_batch, vectors_v_batch), (valid_lvl_down_batch, valid_lvl_up_batch),\
+                resonance_field_batch, _, mask_indexes, resonance_energies_batch, eigen_vectors_batched = batches[bi]
+
+            row_idx = torch.nonzero(mask_indexes).squeeze(-1)
+            if row_idx.numel() > 0 and col_base_idx.numel() > 0:
+                vectors_u[row_idx[:, None], col_base_idx, :] = vectors_u_batch
+                vectors_v[row_idx[:, None], col_base_idx, :] = vectors_v_batch
+
+                valid_lvl_down[col_base_idx] = valid_lvl_down_batch
+                valid_lvl_up[col_base_idx] = valid_lvl_up_batch
+
+                resonance_energies[row_idx[:, None], col_base_idx, :] = resonance_energies_batch
+
+                res_fields[row_idx[:, None], col_base_idx] = resonance_field_batch
+                if self.output_full_eigenvector:
+                    full_eigen_vectors[row_idx[:, None], col_base_idx, :, :] = eigen_vectors_batched
+
+        return (vectors_u, vectors_v), (valid_lvl_down, valid_lvl_up),\
+            res_fields, resonance_energies, full_eigen_vectors
+
     def __call__(self, sample: spin_system.BaseSample,
                  resonance_frequency: torch.Tensor,
                  B_low: torch.Tensor, B_high: torch.Tensor, F: torch.Tensor, Gz: torch.Tensor) ->\
-        list[tuple[
+            tuple[
             tuple[torch.Tensor, torch.Tensor],
             tuple[torch.Tensor, torch.Tensor],
-            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]]:
+            torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
         :param sample: The sample for which the resonance parameters need to be found
         :param resonance_frequency: the resonance frequency. The shape is []
@@ -1409,9 +1565,9 @@ class ResField:
         - vector_full_system | None. The eigen vectors for all energy levels
         """
         interval_solver, locator, args = self._solver_fabric(sample, F, resonance_frequency)
-        bathces = interval_solver(
+        batches = interval_solver(
             F, Gz, B_low, B_high, resonance_frequency, *args)
-        bathces = locator(bathces, resonance_frequency, *args)
-        return bathces
+        batches = locator(batches, resonance_frequency, *args)
+        return self._combine_resonance_data(device=Gz.device, batches=batches)
 
 
