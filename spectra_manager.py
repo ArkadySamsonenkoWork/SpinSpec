@@ -435,8 +435,8 @@ class StationaryIntensitiesCalculator(BaseIntensityCalculator):
     def compute_intensity(self, Gx, Gy, Gz, batch):
         """Base method to compute intensity (to be overridden)."""
         (vector_down, vector_up), (lvl_down, lvl_up), \
-            B_trans, mask_trans, mask_triu, indexes, resonance_energies, _ = batch
-        intensity = mask_trans * self.populator(resonance_energies, lvl_down, lvl_up) * (
+            B_trans, mask_triu, indexes, resonance_energies, _ = batch
+        intensity = self.populator(resonance_energies, lvl_down, lvl_up) * (
                 self._compute_magnitization(Gx, Gy, vector_down, vector_up, indexes)
         )
         return intensity
@@ -606,12 +606,12 @@ class BaseSpectraCreator(ABC):
     def _precompute_batch_data(self, sample: spin_system.MultiOrientedSample, F, Gx, Gy, Gz, batch):
         intensity = self.intensity_calculator(Gx, Gy, Gz, batch)
         (vector_down, vector_up), (_, _),\
-            B_trans, mask_trans, mask_triu, indexes, resonance_energies, _ = batch
+            B_trans, mask_triu, indexes, resonance_energies, _ = batch
 
         freq_to_field_val = self._freq_to_field(vector_down, vector_up, Gz, indexes)
 
         width_square = self.broader(sample, vector_down, vector_up, B_trans, indexes)
-        return mask_trans, mask_triu, B_trans, intensity, width_square, indexes, freq_to_field_val
+        return mask_triu, B_trans, intensity, width_square, indexes, freq_to_field_val
 
     def _filter_by_max(self, occurrences_max, global_max):
         updated_occurrences = []
@@ -671,7 +671,6 @@ class BaseSpectraCreator(ABC):
 
         for (batch_idx, rows, cols, keep_pairs) in occurrences:
             rows_set = set(rows.tolist())
-
             assigned_indices: list[int] = []
             for c in cols.tolist():
                 slots = col_to_slots.get(int(c), [])
@@ -701,9 +700,10 @@ class BaseSpectraCreator(ABC):
 
         global_max = torch.tensor(0)
         for bi, batch in enumerate(batches):
-            mask_trans, mask_triu, B_trans_batch, intensity_batch, width_square_batch, mask_indexes,\
+            mask_triu, B_trans_batch, intensity_batch, width_square_batch, mask_indexes,\
                 freq_to_field_val, *extras = \
                 self._precompute_batch_data(sample, F, Gx, Gy, Gz, batch)
+
             row_idx = torch.nonzero(mask_indexes, as_tuple=False).squeeze(-1)
             col_idx = torch.nonzero(mask_triu, as_tuple=False).squeeze(-1)
 
@@ -713,8 +713,7 @@ class BaseSpectraCreator(ABC):
                 pair_max = torch.amax(torch.abs(intensity_batch), dim=tuple(range(intensity_batch.ndim - 1)))
                 global_max = torch.max(global_max, torch.max(pair_max))
                 cached_batches.append(
-                    (mask_trans,
-                     mask_triu, B_trans_batch,
+                    (mask_triu, B_trans_batch,
                      intensity_batch,
                      width_square_batch,
                      mask_indexes, freq_to_field_val, *extras)
@@ -818,11 +817,11 @@ class BaseSpectraCreator(ABC):
         mask_triu_general = torch.zeros(num_pairs, dtype=torch.bool)
 
         for bi, rows_batch_idx, col_batch_idx, col_base_idx, keep_local in occurrences:
-            mask_trans, mask_triu, B_trans_batch, intensity_batch,\
+            mask_triu, B_trans_batch, intensity_batch,\
                 width_square_batch, mask_indexes, freq_to_field_val, *extras_batch = batches[bi]
             row_idx = torch.nonzero(mask_indexes).squeeze(-1)
             if row_idx.numel() > 0 and col_base_idx.numel() > 0:
-                mask_triu_general[..., col_batch_idx] = True
+                # mask_triu_general[..., col_batch_idx] = True
                 res_fields[row_idx[:, None], col_base_idx] = B_trans_batch[..., keep_local]
 
                 intensities[row_idx[:, None], col_base_idx] += intensity_batch[..., keep_local]
@@ -835,8 +834,7 @@ class BaseSpectraCreator(ABC):
         intensities *= freq_to_field_global
         intensities = intensities / intensities.abs().max()
         width = self.broader.add_hamiltonian_straine(sample, width_square) * freq_to_field_global
-        print(intensities)
-        print(res_fields)
+
         return mask_triu_general, res_fields, intensities, width, *extra_tensors
 
 

@@ -103,7 +103,7 @@ class BaseResonanceIntervalSolver(ABC):
     Base class for algorithm of resonance interval search
     """
     def __init__(self, spin_dim: int,
-                 eigen_finder: tp.Optional[BaseEigenSolver] = EighEigenSolver(), r_tol: float = 1e-5,
+                 eigen_finder: tp.Optional[BaseEigenSolver] = EighEigenSolver(), r_tol: float = 1e-4,
         max_iterations: float = 20, delta_field: float = 1e-8, device: torch.device = torch.device("cpu")):
         self.eigen_finder = eigen_finder
         self.r_tol = torch.tensor(r_tol)
@@ -935,6 +935,106 @@ class BaseResonanceLocator:
         """
         return mask_trans, mask_triu, step_B
 
+    def _split_batch(self, mask_trans: torch.Tensor,
+                     mask_triu: torch.Tensor,
+                     indexes: torch.Tensor,
+                     batches_triu: tp.Sequence[torch.Tensor], batches_general: tp.Sequence[torch.Tensor]):
+        """
+        :param mask_trans: The mask of True and False of real transitions. The shape is [..., n], where n is valid columns number
+        :param mask_triu: The mask of True and False. The shape is [N], where N is number of all transitions. The number of True == n
+        :param indexes: The indexes are mask of True and False. The shape is [global_batch_indexes].
+        It shows what transitions among global transitions are considered. indexes[indexes==True].shape = [...]
+        :param batches_triu: The Sequence of tensors with shape [..., n, ...].
+        :param  batches_general: tp.Sequence[torch.Tensor] of thensors with shape [..., ....]
+        :return: tuple[mask_triu_updated, indexes_updated, *batches_updated]
+
+        This musk split the data into sub-batches that for each sub-batch all transitions occurse.
+        For example:
+            mask_trans = torch.tensor([
+            [True, False, False],
+            [True, False, False],
+
+            [True, True, True],
+            [True, True, True],
+
+            [True, False, True],
+            [True, False, True],
+            ])
+            and mask_triu = torch.Tensor([False, False, True, True, True, False])
+            and batch.shape = [6, 3, ...]
+
+        Then in the output the data must be splitted into 3 parts with repect to:
+            [True, False, False],
+            [True, False, False], with corresponding mask_triu_updated = torch.Tensor([False, False, True, False, False, False])
+                                  and batch_updated.shape = [2, 1, ...]
+
+            [True, True, True],
+            [True, True, True], with corresponding mask_triu_updated = torch.Tensor([False, False, True, True, True, False])
+                                and batch_updated.shape = [2, 3, ...]
+
+            [True, False, True],
+            [True, False, True], with corresponding mask_triu_updated = torch.Tensor([False, False, True, False, True, False])
+                                 and batch_updated.shape = [2, 2, ...]
+
+        """
+        original_shape = mask_trans.shape
+        flattened_mask = mask_trans.view(-1, original_shape[-1])
+
+        # Find unique patterns efficiently using torch operations
+        # Convert to int for unique operation (more efficient than boolean)
+        mask_patterns = flattened_mask.int()
+        unique_patterns, inverse_indices, counts = torch.unique(mask_patterns, dim=0, return_inverse=True,
+                                                                return_counts=True)
+
+        # Pre-compute mask_triu true positions for efficiency
+        triu_true_positions = torch.where(mask_triu)[0]
+        indexes_true_positions = torch.where(indexes)[0]
+
+        # Sort the inverse indices to group them
+        sorted_local_idx = torch.argsort(inverse_indices)
+
+        # Compute cumulative starts for groups
+        cumsums = torch.cumsum(counts, dim=0)
+        group_starts = torch.cat([torch.zeros(1, dtype=cumsums.dtype, device=cumsums.device), cumsums[:-1]])
+
+        for pattern_idx in range(len(unique_patterns)):
+            current_pattern = unique_patterns[pattern_idx].bool()
+            if not current_pattern.any():
+                continue
+
+            start = group_starts[pattern_idx]
+            end = start + counts[pattern_idx]
+            pattern_local_indices = sorted_local_idx[start:end]
+
+            # Map to global indices
+            global_pattern_indices = indexes_true_positions[pattern_local_indices]
+
+            # Create updated indexes efficiently
+            indexes_updated = torch.zeros_like(indexes)
+            indexes_updated[global_pattern_indices] = True
+
+            # Create updated mask_triu efficiently
+            mask_triu_updated = torch.zeros_like(mask_triu)
+            pattern_true_indices = torch.where(current_pattern)[0]
+            if len(pattern_true_indices) > 0:
+                pos_to_set = triu_true_positions[pattern_true_indices]
+                mask_triu_updated[pos_to_set] = True
+
+            # Row selection mask for the current batch
+            row_select = indexes_updated[indexes]
+
+            batches_selected = []
+            for batch in batches_triu:
+                batch_selected = batch[row_select]
+                batch_selected = batch_selected.index_select(dim=len(original_shape) - 1, index=pattern_true_indices)
+                batches_selected.append(batch_selected)
+
+            for batch in batches_general:
+                batch_selected = batch[row_select]
+                batches_selected.append(batch_selected)
+
+            yield mask_triu_updated, indexes_updated, batches_selected
+
     def _iterate_batch(self,
                        batch: tuple[
                                 tuple[torch.Tensor, torch.Tensor],
@@ -946,7 +1046,7 @@ class BaseResonanceLocator:
             list[tuple[
                     tuple[torch.Tensor, torch.Tensor],
                     tuple[torch.Tensor, torch.Tensor],
-                    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]]:
+                    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]]:
         """
         :param batch: Tuple with the parameters of the interval:
              (eig_values_low, eig_values_high) - eigen values of Hamiltonian
@@ -994,22 +1094,39 @@ class BaseResonanceLocator:
                                                                   eig_values_low, eig_values_high,
                                                                   delta_B * deriv_low, delta_B * deriv_high
                                                                   )
+            Bres = B_low.squeeze(dim=-1) + step_B * delta_B.squeeze(dim=-1)
+            # print("mask_triu_updated  ", mask_triu_updated)
+            # print("mask_trans_updated  ", mask_trans_updated)
 
-            valid_lvl_down = lvl_down[mask_triu_updated]
-            valid_lvl_up = lvl_up[mask_triu_updated]
 
-            (vectors_u, vectors_v), vector_full_system = self._compute_eigenvectors(eig_vectors_low, eig_vectors_high,
-                                                              valid_lvl_down, valid_lvl_up, step_B)
-            out_res = (
-                (vectors_u, vectors_v),
-                (valid_lvl_down, valid_lvl_up),
-                B_low.squeeze(dim=-1) + step_B * delta_B.squeeze(dim=-1),
-                mask_trans_updated, mask_triu_updated,
-                indexes,
-                resonance_energies,
-                vector_full_system)
+            # IT WAS ADDED. CHECK THE CORRECTNESS
 
-            outputs.append(out_res)
+            for mask_triu_new, indexes_new, resonance_data in self._split_batch(
+                mask_trans_updated, mask_triu_updated, indexes,
+                (resonance_energies, step_B, Bres), (eig_vectors_low, eig_vectors_high)
+                ):
+                resonance_energies, step_B, Bres, eig_vectors_low_new, eig_vectors_high_new = resonance_data
+
+
+                valid_lvl_down = lvl_down[mask_triu_new]
+                valid_lvl_up = lvl_up[mask_triu_new]
+
+                (vectors_u, vectors_v), vector_full_system = self._compute_eigenvectors(
+                    eig_vectors_low_new, eig_vectors_high_new, valid_lvl_down, valid_lvl_up, step_B)
+
+                out_res = (
+                    (vectors_u, vectors_v),
+                    (valid_lvl_down, valid_lvl_up),
+                    Bres, mask_triu_new,
+                    indexes_new,
+                    resonance_energies,
+                    vector_full_system)
+
+                # print(mask_triu_new)
+                # print("\n")
+
+                outputs.append(out_res)
+            # print("\n\n\n")
         return outputs
 
     def __call__(self, final_batches, resonance_frequency, *args, **kwargs):
