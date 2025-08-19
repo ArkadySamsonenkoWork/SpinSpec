@@ -27,6 +27,7 @@ def compute_matrix_element(vector_down, vector_up, G):
     tmp = tmp.transpose(-2, -1)  # (..., b, i)
     return (vector_down.conj() * tmp).sum(dim=-1)
 
+
 class PostSpectraProcessing:
     def __init__(self, *args, **kwargs):
         """
@@ -618,7 +619,7 @@ class BaseSpectraCreator(ABC):
             keep_local = torch.nonzero(pair_max / global_max >= self.threshold, as_tuple=False).squeeze(-1)
             new_cold_idx = col_idx[keep_local]
             if new_cold_idx.numel() > 0:
-                updated_occurrences.append((bi, row_idx, col_idx[keep_local], keep_local))
+                updated_occurrences.append((bi, row_idx, new_cold_idx, keep_local))
         return updated_occurrences
 
     def _assign_global_indexes(self,
@@ -663,42 +664,34 @@ class BaseSpectraCreator(ABC):
         row = [1 , 2, 3], col = [1, 2], glob_idx = [0, 1]
         row = [4 , 5, 6], col = [2,  3], glob_idx = [1, 2]
         """
-        row_to_tuples = {}  # row_id -> list of prior tuple-indices
-        assigned_global: list[torch.Tensor] = []
+        col_to_slots = {}
+
         out: list[tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
         max_global = -1
 
-        for i, (batch_idx, rows, cols, keep_pairs) in enumerate(occurrences):
-            conflicts = set()
-            for r in rows.tolist():
-                conflicts.update(row_to_tuples.get(r, []))
+        for (batch_idx, rows, cols, keep_pairs) in occurrences:
+            rows_set = set(rows.tolist())
 
-            base_gh = torch.argsort(torch.argsort(cols))
-
-            # 3) collect occupied slots only from those conflicts
-            occupied = set()
-            for j in conflicts:
-                occupied.update(assigned_global[j].tolist())
-
-            # 4) if there’s conflict, shift to avoid _just_ those slots
-            global_idx = base_gh.clone()
-            if occupied:
-                s = 0
-                while True:
-                    shifted = (base_gh + s).tolist()
-                    if not any(x in occupied for x in shifted):
-                        global_idx = base_gh + s
+            assigned_indices: list[int] = []
+            for c in cols.tolist():
+                slots = col_to_slots.get(int(c), [])
+                reused = False
+                for slot_idx, (gidx, used_rows) in enumerate(slots):
+                    if used_rows.isdisjoint(rows_set):
+                        assigned_indices.append(gidx)
+                        slots[slot_idx] = (gidx, used_rows.union(rows_set))
+                        reused = True
                         break
-                    s += 1
 
-            # 5) record and update max
-            out.append((batch_idx, rows, cols, global_idx, keep_pairs))
-            assigned_global.append(global_idx)
-            max_global = max(max_global, int(global_idx.max()))
+                if not reused:
+                    max_global += 1
+                    gidx = max_global
+                    assigned_indices.append(gidx)
+                    slots.append((gidx, set(rows_set)))
+                    col_to_slots[int(c)] = slots
 
-            # 6) register rows
-            for r in rows.tolist():
-                row_to_tuples.setdefault(r, []).append(i)
+            global_idx_tensor = torch.tensor(assigned_indices, dtype=torch.long)
+            out.append((batch_idx, rows, cols, global_idx_tensor, keep_pairs))
 
         return out, max_global + 1
 
@@ -711,15 +704,14 @@ class BaseSpectraCreator(ABC):
             mask_trans, mask_triu, B_trans_batch, intensity_batch, width_square_batch, mask_indexes,\
                 freq_to_field_val, *extras = \
                 self._precompute_batch_data(sample, F, Gx, Gy, Gz, batch)
-
             row_idx = torch.nonzero(mask_indexes, as_tuple=False).squeeze(-1)
             col_idx = torch.nonzero(mask_triu, as_tuple=False).squeeze(-1)
+
 
             if row_idx.numel() > 0 and col_idx.numel() > 0:
 
                 pair_max = torch.amax(torch.abs(intensity_batch), dim=tuple(range(intensity_batch.ndim - 1)))
                 global_max = torch.max(global_max, torch.max(pair_max))
-
                 cached_batches.append(
                     (mask_trans,
                      mask_triu, B_trans_batch,
@@ -825,11 +817,10 @@ class BaseSpectraCreator(ABC):
         num_pairs = (self.spin_system_dim ** 2 - self.spin_system_dim) // 2
         mask_triu_general = torch.zeros(num_pairs, dtype=torch.bool)
 
-        for bi, _, col_batch_idx, col_base_idx, keep_local in occurrences:
+        for bi, rows_batch_idx, col_batch_idx, col_base_idx, keep_local in occurrences:
             mask_trans, mask_triu, B_trans_batch, intensity_batch,\
                 width_square_batch, mask_indexes, freq_to_field_val, *extras_batch = batches[bi]
             row_idx = torch.nonzero(mask_indexes).squeeze(-1)
-
             if row_idx.numel() > 0 and col_base_idx.numel() > 0:
                 mask_triu_general[..., col_batch_idx] = True
                 res_fields[row_idx[:, None], col_base_idx] = B_trans_batch[..., keep_local]
@@ -844,6 +835,8 @@ class BaseSpectraCreator(ABC):
         intensities *= freq_to_field_global
         intensities = intensities / intensities.abs().max()
         width = self.broader.add_hamiltonian_straine(sample, width_square) * freq_to_field_global
+        print(intensities)
+        print(res_fields)
         return mask_triu_general, res_fields, intensities, width, *extra_tensors
 
 

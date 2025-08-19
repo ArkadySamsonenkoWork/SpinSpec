@@ -103,7 +103,7 @@ class BaseResonanceIntervalSolver(ABC):
     Base class for algorithm of resonance interval search
     """
     def __init__(self, spin_dim: int,
-                 eigen_finder: tp.Optional[BaseEigenSolver] = EighEigenSolver(), r_tol: float = 1e-4,
+                 eigen_finder: tp.Optional[BaseEigenSolver] = EighEigenSolver(), r_tol: float = 1e-5,
         max_iterations: float = 20, delta_field: float = 1e-8, device: torch.device = torch.device("cpu")):
         self.eigen_finder = eigen_finder
         self.r_tol = torch.tensor(r_tol)
@@ -306,10 +306,8 @@ class BaseResonanceIntervalSolver(ABC):
         :return: tuple of eig_values, eig_vectors, magnetic fields, and new indexes
         """
         mask_left = mask_left[mask_xor]
-        # Select boundaries based on active mask side
         B_low = torch.where(mask_left.unsqueeze(-1).unsqueeze(-1), B_low[mask_xor], B_mid[mask_xor])
         B_high = torch.where(mask_left.unsqueeze(-1).unsqueeze(-1), B_mid[mask_xor], B_high[mask_xor])
-        # Select corresponding eigenvalues/vectors
         eig_values_low = torch.where(mask_left.unsqueeze(1), eig_values_low[mask_xor], eig_values_mid[mask_xor])
         eig_values_high = torch.where(mask_left.unsqueeze(1), eig_values_mid[mask_xor], eig_values_high[mask_xor])
         eig_vectors_low = torch.where(
@@ -696,7 +694,8 @@ class BaseResonanceLocator:
         :param coef_0: coefficient at t^0
         :return: The root od the polynomial
         """
-        t = - coef_0 / (coef_0 + coef_1 + coef_2)
+        t = - coef_0 / (coef_1 + coef_2 + coef_3)
+
         for _ in range(self.max_iterations_newton):
             poly_val = coef_3 * t ** 3 + coef_2 * t ** 2 + coef_1 * t + coef_0
             poly_deriv = 3 * coef_3 * t ** 2 + 2 * coef_2 * t + coef_1
@@ -733,6 +732,7 @@ class BaseResonanceLocator:
         (coef_3, coef_2, coef_1, coef_0) = self._compute_cubic_polinomial_coeffs(
             diff_eig_low, diff_eig_high, diff_deriv_low, diff_deriv_high)
         coef_0 -= resonance_frequency
+
         return self._find_one_root_newton(coef_3, coef_2, coef_1, coef_0)
 
     def get_resonance_mask(self, diff_eig_low: torch.Tensor, diff_eig_high: torch.Tensor,
@@ -778,8 +778,6 @@ class BaseResonanceLocator:
 
     def _interpolate_vectors(self, vec_low, vec_high, weights_low, weights_high, eps=1e-12):
         """
-        Faster version of _interpolate_vectors.
-
         Differences / improvements:
         - Avoids computing a division for entries where the inner product is (near) zero by using a boolean mask
           and doing the division only for true entries (reduces work and avoids creating large temporaries).
@@ -787,34 +785,16 @@ class BaseResonanceLocator:
         - Minimizes number of intermediate tensors.
         - Keeps the same numerical handling for tiny magnitudes (controlled by eps).
         """
-        # inner product along last (vector) axis; keepdim for broadcasting
-        inner = torch.sum(vec_low.conj() * vec_high, dim=-1, keepdim=True)  # complex
-        abs_inner = inner.abs()  # real, >= 0
+        inner = torch.sum(vec_low.conj() * vec_high, dim=-1, keepdim=True)
+        abs_inner = inner.abs()
 
-        # compute phase only where abs_inner > eps; otherwise leave phase = 1
         phase = torch.ones_like(inner)
         mask = abs_inner > eps
         if mask.any():
-            # do the division only for the masked entries
             phase[mask] = inner[mask] / abs_inner[mask]
 
-        # align vec_high by the conjugate of the phase
         vec_high_aligned = vec_high * phase.conj()
-
-        # weighted linear combination
         vec = vec_low * weights_low + vec_high_aligned * weights_high
-
-        # normalize: compute norm via abs()->square()->sum->sqrt (works for complex and avoids conj())
-        norm = torch.sqrt(torch.sum(vec.abs().square(), dim=-1, keepdim=True))
-
-        # avoid dividing by very small norms: set those norms to 1 (so vector remains as-is)
-        small_norm_mask = norm <= eps
-        if small_norm_mask.any():
-            norm_safe = norm.clone()
-            norm_safe[small_norm_mask] = 1.0
-            vec = vec / norm_safe
-        else:
-            vec = vec / norm
 
         return vec
 
@@ -985,6 +965,7 @@ class BaseResonanceLocator:
         """
         eig_values_low, eig_values_high, eig_vectors_low, eig_vectors_high, deriv_low, deriv_high, \
             B_low, B_high, indexes, delta_B, lvl_down, lvl_up = self._prepare_inputs(batch)
+
 
         diff_eig_low, diff_eig_high, diff_deriv_low, diff_deriv_high =\
             self._compute_raw_differences(eig_values_low, eig_values_high, deriv_low, deriv_high, lvl_down, lvl_up)
