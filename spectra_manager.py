@@ -176,11 +176,13 @@ class IntegrationProcessorBase(ABC):
         return res_fields, width, intensities, areas
 
     def finalize(self,
-                  compute_out: tuple,
-                  gauss: torch.Tensor,
-                  lorentz: torch.Tensor,
-                  fields: torch.Tensor):
-        _, res_fields, intensities, width, *additional_args = compute_out
+                 res_fields: torch.Tensor,
+                 intensities: torch.Tensor,
+                 width: torch.Tensor,
+                 gauss: torch.Tensor,
+                 lorentz: torch.Tensor,
+                 fields: torch.Tensor):
+
         res_fields, width, intensities, areas = (
             self._transform_data_to_mesh_format(
                 res_fields, intensities, width
@@ -356,26 +358,26 @@ class Broadener:
             transformation_matrix, tensor_components, torch.conj(vector), vector
         ).real
 
-    def _compute_field_straine_square(self, strained_data, vector_down, vector_up, B_trans, indexes):
+    def _compute_field_straine_square(self, strained_data, vector_down, vector_up, B_trans):
         tensor_components, transformation_matrix = strained_data
 
         return (B_trans * (
-                self._compute_element_field_dep(vector_up, tensor_components, transformation_matrix[indexes]) -
-                self._compute_element_field_dep(vector_down, tensor_components, transformation_matrix[indexes])
+                self._compute_element_field_dep(vector_up, tensor_components, transformation_matrix) -
+                self._compute_element_field_dep(vector_down, tensor_components, transformation_matrix)
                 )).square()
 
-    def _compute_field_free_straine_square(self, strained_data, vector_down, vector_up, indexes):
+    def _compute_field_free_straine_square(self, strained_data, vector_down, vector_up):
         tensor_components_A, tensor_components_B, transformation_matrix = strained_data
         return (
                 self._compute_element_field_free(
-                    vector_up, tensor_components_A, tensor_components_B, transformation_matrix[indexes]
+                    vector_up, tensor_components_A, tensor_components_B, transformation_matrix
                 ) -
                 self._compute_element_field_free(
-                    vector_down, tensor_components_A, tensor_components_B, transformation_matrix[indexes]
+                    vector_down, tensor_components_A, tensor_components_B, transformation_matrix
                 )
         ).square()
 
-    def __call__(self, sample, vector_down, vector_up, B_trans, indexes):
+    def __call__(self, sample, vector_down, vector_up, B_trans):
         target_shape = vector_down.shape[:-1]
         device = B_trans.device
         dtype = B_trans.dtype
@@ -383,12 +385,12 @@ class Broadener:
         result = torch.zeros(target_shape, dtype=dtype, device=device)
 
         for strained_data in sample.build_field_dep_straine():
-            result += self._compute_field_straine_square(strained_data, vector_down, vector_up, B_trans, indexes)
+            result += self._compute_field_straine_square(strained_data, vector_down, vector_up, B_trans)
 
         for strained_data in sample.build_zero_field_straine():
-            result += self._compute_field_free_straine_square(strained_data, vector_down, vector_up, indexes)
+            result += self._compute_field_free_straine_square(strained_data, vector_down, vector_up)
 
-        return result
+        return self.add_hamiltonian_straine(sample, result)
 
     def add_hamiltonian_straine(self, sample: spin_system.MultiOrientedSample, squared_width):
         hamiltonian_width = sample.build_hamiltonian_straineed().unsqueeze(-1).square()
@@ -408,16 +410,16 @@ class BaseIntensityCalculator:
     def _init_populator(self, populator: tp.Optional[tp.Callable], temperature: tp.Optional[float]):
         return populator
 
-    def _compute_magnitization(self, Gx, Gy, vector_down, vector_up, indexes):
-        magnitization = compute_matrix_element(vector_down, vector_up, Gx[indexes]).square().abs() + \
-                        compute_matrix_element(vector_down, vector_up, Gy[indexes]).square().abs()
+    def _compute_magnitization(self, Gx, Gy, vector_down, vector_up):
+        magnitization = compute_matrix_element(vector_down, vector_up, Gx).square().abs() + \
+                        compute_matrix_element(vector_down, vector_up, Gy).square().abs()
         return magnitization
 
-    def compute_intensity(self, Gx, Gy, Gz, batch):
+    def compute_intensity(self, Gx, Gy, Gz, vector_down, vector_up, lvl_down, lvl_up, resonance_energies):
         raise NotImplementedError
 
-    def __call__(self, Gx, Gy, Gz, batch, *args, **kwargs):
-        return self.compute_intensity(Gx, Gy, Gz, batch)
+    def __call__(self, Gx, Gy, Gz, vector_down, vector_up, lvl_down, lvl_up, resonance_energies, *args, **kwargs):
+        return self.compute_intensity(Gx, Gy, Gz, vector_down, vector_up, lvl_down, lvl_up, resonance_energies)
 
 
 class StationaryIntensitiesCalculator(BaseIntensityCalculator):
@@ -431,13 +433,10 @@ class StationaryIntensitiesCalculator(BaseIntensityCalculator):
         else:
             return populator
 
-
-    def compute_intensity(self, Gx, Gy, Gz, batch):
+    def compute_intensity(self, Gx, Gy, Gz, vector_down, vector_up, lvl_down, lvl_up, resonance_energies):
         """Base method to compute intensity (to be overridden)."""
-        (vector_down, vector_up), (lvl_down, lvl_up), \
-            B_trans, mask_triu, indexes, resonance_energies, _ = batch
         intensity = self.populator(resonance_energies, lvl_down, lvl_up) * (
-                self._compute_magnitization(Gx, Gy, vector_down, vector_up, indexes)
+                self._compute_magnitization(Gx, Gy, vector_down, vector_up)
         )
         return intensity
 
@@ -448,23 +447,17 @@ class TimeResolvedIntensitiesCalculator(BaseIntensityCalculator):
                  tolerancy=1e-14):
         super().__init__(spin_system_dim, temperature, populator, tolerancy)
 
-    def compute_intensity(self, Gx, Gy, Gz, batch):
-        (vector_down, vector_up), (_, _),\
-            B_trans, mask_trans, mask_triu, indexes, resonance_energies, _ = batch
-
-        intensity = mask_trans * (
-                self._compute_magnitization(Gx, Gy, vector_down, vector_up, indexes)
+    def compute_intensity(self,Gx, Gy, Gz, vector_down, vector_up, lvl_down, lvl_up, resonance_energies):
+        intensity = (
+                self._compute_magnitization(Gx, Gy, vector_down, vector_up)
         )
         return intensity
 
     def calculate_population_evolution(self, time: torch.Tensor,
-                                       res_fields, mask_triu,
+                                       res_fields, lvl_down, lvl_up,
                                        resonance_energies, vector_down, vector_up,
                                        *args, **kwargs):
-        lvl_down, lvl_up = torch.triu_indices(self.spin_system_dim,
-                                              self.spin_system_dim, offset=1)
-        lvl_down = lvl_down[mask_triu]
-        lvl_up = lvl_up[mask_triu]
+
         return self.populator(time, res_fields, lvl_down,
                               lvl_up, resonance_energies, vector_down, vector_up, *args, **kwargs)
 
@@ -495,6 +488,7 @@ class ParamSpec:
 
 class BaseSpectraCreator(ABC):
     def __init__(self,
+                 freq: tp.Union[float, torch.Tensor],
                  sample: tp.Optional[spin_system.MultiOrientedSample] = None,
                  spin_system_dim: tp.Optional[int] = None,
                  batch_dims: tp.Optional[float] = None,
@@ -507,13 +501,16 @@ class BaseSpectraCreator(ABC):
                  temperature: tp.Optional[float] = 293,
                  ):
 
+        self.resonance_freq = torch.tensor(freq)
         self.threshold = torch.tensor(1e-5)
         self.spin_system_dim, self.batch_dims, self.mesh =\
             self._init_sample_parameters(sample, spin_system_dim, batch_dims, mesh)
         self.mesh_size = self.mesh.initial_size
         self.broader = Broadener()
 
-        self.res_field = res_field_algorithm.ResField(spin_dim = self.spin_system_dim,
+        self.res_field = res_field_algorithm.ResField(spin_system_dim=self.spin_system_dim,
+                                                      mesh_size=self.mesh_size,
+                                                      batch_dims=self.batch_dims,
                                                       output_full_eigenvector=self._get_output_eigenvector())
 
         self.intensity_calculator = self._get_intenisty_calculator(intensity_calculator, temperature, populator)
@@ -558,10 +555,10 @@ class BaseSpectraCreator(ABC):
         else:
             return intensity_calculator
 
-    def _freq_to_field(self, vector_down, vector_up, Gz, indexes):
+    def _freq_to_field(self, vector_down, vector_up, Gz):
         """Compute frequency-to-field contribution"""
-        factor_1 = compute_matrix_element(vector_up, vector_up, Gz[indexes])
-        factor_2 = compute_matrix_element(vector_down, vector_down, Gz[indexes])
+        factor_1 = compute_matrix_element(vector_up, vector_up, Gz)
+        factor_2 = compute_matrix_element(vector_down, vector_down, Gz)
 
         diff = (factor_1 - factor_2).abs()
         safe_diff = torch.where(diff < self.tolerancy, self.tolerancy, diff)
@@ -575,273 +572,131 @@ class BaseSpectraCreator(ABC):
 
     def __call__(self,
                  sample: spin_system.MultiOrientedSample,
-                 resonance_frequency: torch.Tensor,
                  fields: torch.Tensor, **kwargs):
         B_low  = fields[..., 0].unsqueeze(-1).expand(*self.mesh_size)
         B_high = fields[..., -1].unsqueeze(-1).expand(*self.mesh_size)
 
         F, Gx, Gy, Gz = sample.get_hamiltonian_terms()
 
+        (vectors_u, vectors_v), (valid_lvl_down, valid_lvl_up), res_fields, resonance_energies, full_eigen_vectors =\
+            self.res_field(sample, self.resonance_freq, B_low, B_high, F, Gz)
 
-        batches = self.res_field(sample, resonance_frequency, B_low, B_high, F, Gz)
-        compute_out = self.compute_parameters(sample, F, Gx, Gy, Gz, batches)
+        res_fields, intensities, width, *extras = self.compute_parameters(sample, F, Gx, Gy, Gz,
+                                              vectors_u, vectors_v,
+                                              valid_lvl_down, valid_lvl_up,
+                                              res_fields,
+                                              resonance_energies,
+                                              full_eigen_vectors
+                                              )
 
-        compute_out, fields = self._postcompute_batch_data(compute_out, fields, F, Gx, Gy, Gz, **kwargs)
+        res_fields, intensities, width = self._postcompute_batch_data(
+            res_fields, intensities, width, F, Gx, Gy, Gz, *extras, **kwargs
+        )
 
         gauss = sample.gauss
         lorentz = sample.lorentz
-        return self._finalize(compute_out, gauss, lorentz, fields)
 
-    def _postcompute_batch_data(self, compute_out: tuple, fields: torch.Tensor,
-                                F: torch.Tensor, Gx: torch.Tensor, Gy: torch.Tensor, Gz: torch.Tensor, **kwargs):
-        return compute_out, fields
+        return self._finalize(res_fields, intensities, width, gauss, lorentz, fields)
+
+    def _postcompute_batch_data(self, res_fields: torch.Tensor, intensities: torch.Tensor, width: torch.Tensor,
+                                F: torch.Tensor, Gx: torch.Tensor, Gy: torch.Tensor, Gz: torch.Tensor, *extras,  **kwargs):
+        return res_fields, intensities, width
 
     def _finalize(self,
-                  compute_out: tuple,
+                  res_fields: torch.Tensor,
+                  intensities: torch.Tensor,
+                  width: torch.Tensor,
                   gauss: torch.Tensor,
                   lorentz: torch.Tensor,
                   fields: torch.Tensor):
-        return self.spectra_processor.finalize(compute_out, gauss, lorentz, fields)
+        return self.spectra_processor.finalize(res_fields, intensities, width, gauss, lorentz, fields)
 
-    def _precompute_batch_data(self, sample: spin_system.MultiOrientedSample, F, Gx, Gy, Gz, batch):
-        intensity = self.intensity_calculator(Gx, Gy, Gz, batch)
-        (vector_down, vector_up), (_, _),\
-            B_trans, mask_triu, indexes, resonance_energies, _ = batch
-
-        freq_to_field_val = self._freq_to_field(vector_down, vector_up, Gz, indexes)
-
-        width_square = self.broader(sample, vector_down, vector_up, B_trans, indexes)
-        return mask_triu, B_trans, intensity, width_square, indexes, freq_to_field_val
-
-    def _filter_by_max(self, occurrences_max, global_max):
-        updated_occurrences = []
-        for bi, row_idx, col_idx, pair_max in occurrences_max:
-            keep_local = torch.nonzero(pair_max / global_max >= self.threshold, as_tuple=False).squeeze(-1)
-            new_cold_idx = col_idx[keep_local]
-            if new_cold_idx.numel() > 0:
-                updated_occurrences.append((bi, row_idx, new_cold_idx, keep_local))
-        return updated_occurrences
-
-    def _assign_global_indexes(self,
-            occurrences: list[tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]]
-    ) -> tuple[
-        list[tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
-        int
-    ]:
-        """
-        'occurrences' is list of the next data:
-        the batch index
-        The row-batch indexes
-        The column indexes with respect to the triangular matrix of transitions
-        The keep_local. - The pairs that were saved in filter by max
-        The algorithm create global indexes
-
-        Example 1
-        row = [1 ,2, 3], col = [1, 2]
-        row = [1, 2, 3], col = [3, 4]
-        the output
-        row = [1 , 2, 3], col = [1, 2], glob_idx = [0, 1]
-        row = [1 , 2, 3], col = [3,  4], glob_idx = [2, 3]
-
-        Example 2
-        row = [1 ,2, 3], col = [1, 2]
-        row = [4, 5, 6], col = [1, 2]
-        the output
-        row = [1 , 2, 3], col = [1, 2], glob_idx = [0, 1]
-        row = [4 , 5, 6], col = [1,  2], glob_idx = [0, 1]
-
-        Example 3
-        row = [1 ,2], col = [1, 2]
-        row = [2, 3], col = [2, 3]
-        the output
-        row = [1 , 2], col = [1, 2], glob_idx = [0, 1]
-        row = [2 , 3], col = [2,  3], glob_idx = [2, 3]
-
-        Example 4
-        row = [1 ,2 , 3], col = [1, 2]
-        row = [4, 5, 6], col = [2, 3]
-        the output
-        row = [1 , 2, 3], col = [1, 2], glob_idx = [0, 1]
-        row = [4 , 5, 6], col = [2,  3], glob_idx = [1, 2]
-        """
-        col_to_slots = {}
-
-        out: list[tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
-        max_global = -1
-
-        for (batch_idx, rows, cols, keep_pairs) in occurrences:
-            rows_set = set(rows.tolist())
-            assigned_indices: list[int] = []
-            for c in cols.tolist():
-                slots = col_to_slots.get(int(c), [])
-                reused = False
-                for slot_idx, (gidx, used_rows) in enumerate(slots):
-                    if used_rows.isdisjoint(rows_set):
-                        assigned_indices.append(gidx)
-                        slots[slot_idx] = (gidx, used_rows.union(rows_set))
-                        reused = True
-                        break
-
-                if not reused:
-                    max_global += 1
-                    gidx = max_global
-                    assigned_indices.append(gidx)
-                    slots.append((gidx, set(rows_set)))
-                    col_to_slots[int(c)] = slots
-
-            global_idx_tensor = torch.tensor(assigned_indices, dtype=torch.long)
-            out.append((batch_idx, rows, cols, global_idx_tensor, keep_pairs))
-
-        return out, max_global + 1
-
-    def _first_pass(self, sample, F, Gx, Gy, Gz, batches):
-        cached_batches = []
-        occurences_max = []
-
-        global_max = torch.tensor(0)
-        for bi, batch in enumerate(batches):
-            mask_triu, B_trans_batch, intensity_batch, width_square_batch, mask_indexes,\
-                freq_to_field_val, *extras = \
-                self._precompute_batch_data(sample, F, Gx, Gy, Gz, batch)
-
-            row_idx = torch.nonzero(mask_indexes, as_tuple=False).squeeze(-1)
-            col_idx = torch.nonzero(mask_triu, as_tuple=False).squeeze(-1)
-
-
-            if row_idx.numel() > 0 and col_idx.numel() > 0:
-
-                pair_max = torch.amax(torch.abs(intensity_batch), dim=tuple(range(intensity_batch.ndim - 1)))
-                global_max = torch.max(global_max, torch.max(pair_max))
-                cached_batches.append(
-                    (mask_triu, B_trans_batch,
-                     intensity_batch,
-                     width_square_batch,
-                     mask_indexes, freq_to_field_val, *extras)
-                )
-                occurences_max.append((bi, row_idx, col_idx, pair_max))
-
-        return cached_batches, self._filter_by_max(occurences_max, global_max)
-
-    def _match_col_indexes(self, kept_pairs: torch.Tensor, col_idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        :param kept_pairs: The indexes that must be saved because the intensity
-        for some transitions is quite large. It is 1-dim tensor.
-        :param col_idx: The indexes of allowed transitions. It is 1-dim tensor.
-        :return: idx1, idx2. Where idx1 is mask over kept_pairs that appear in col_idx,
-        idx2 is mask over col_idx that appear in kept_pairs,
-        """
-        idx1 = torch.nonzero(torch.isin(kept_pairs, col_idx), as_tuple=True)[0]
-        idx2 = torch.nonzero(torch.isin(col_idx, kept_pairs), as_tuple=True)[0]
-        return idx1, idx2
-
-    def _init_extras(self, config_dims, m: int, device: torch.device):
-        """
-        Allocate all full-sized storage tensors based on param_specs.
-        """
-        extra_tensors = []
-        for param_spec in self._param_specs:
-            if param_spec.category == "scalar":
-                new_tensor = torch.zeros((*config_dims, m), dtype=param_spec.dtype,
-                                         device=device)
-            elif param_spec.category == "vector":
-                new_tensor = torch.zeros((*config_dims, m, self.spin_system_dim), dtype=param_spec.dtype,
-                                         device=device)
-            elif param_spec.category == "matrix":
-                new_tensor = torch.zeros((*config_dims, m, self.spin_system_dim, self.spin_system_dim),
-                                         dtype=param_spec.dtype, device=device)
-            else:
-                raise ValueError("Wrong category")
-            extra_tensors.append(new_tensor)
-        return extra_tensors
-
-    def _update_extras(self, extra_tensors: list[torch.Tensor], extras_batch: list[torch.Tensor],
-                       row_idx: torch.Tensor, col_base_idx: torch.Tensor, col_batch_idx: torch.Tensor):
-
+    def _mask_components(self, intensities_mask: torch.Tensor, *extras) -> list[tp.Any]:
+        updated_extras = []
         for idx, param_spec in enumerate(self._param_specs):
             if param_spec.category == "scalar":
-                extra_tensors[idx][row_idx[:, None], col_base_idx] = \
-                    extras_batch[idx][..., col_batch_idx]
+                updated_extras.append(extras[idx][..., intensities_mask])
 
             elif param_spec.category == "vector":
-                extra_tensors[idx][row_idx[:, None], col_base_idx, :] = \
-                    extras_batch[idx][..., col_batch_idx, :]
+                updated_extras.append(extras[idx][..., intensities_mask, :])
 
             elif param_spec.category == "matrix":
-                extra_tensors[idx][row_idx[:, None], col_base_idx, :, :] = \
-                    extras_batch[idx][..., col_batch_idx, :, :]
+                updated_extras.append(extras[idx][..., intensities_mask, :, :])
+        return updated_extras
+
+
+    def _mask_additional(self, vectors_down: torch.Tensor, vectors_up: torch.Tensor,
+                           lvl_down: torch.Tensor, lvl_up: torch.Tensor,
+                           resonance_energies: torch.Tensor,
+                           full_system_vectors: tp.Optional[torch.Tensor], intensities_mask: torch.Tensor):
+        return ()
+
+
+    def _compute_additional(self,
+                           sample: spin_system.MultiOrientedSample,
+                           F: torch.Tensor,
+                           Gx: torch.Tensor,
+                           Gy: torch.Tensor,
+                           Gz: torch.Tensor,
+                            *extras):
+        return extras
+
 
     def compute_parameters(self, sample: spin_system.MultiOrientedSample,
                            F: torch.Tensor,
                            Gx: torch.Tensor,
                            Gy: torch.Tensor,
                            Gz: torch.Tensor,
-                           batches: list[
-                               tuple[
-                                    tuple[torch.Tensor, torch.Tensor],
-                                    tuple[torch.Tensor, torch.Tensor],
-                                    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
-                                    torch.Tensor, torch.Tensor | None,
-                               ]]):
+                           vectors_down: torch.Tensor, vectors_up: torch.Tensor,
+                           lvl_down: torch.Tensor, lvl_up: torch.Tensor,
+                           res_fields: torch.Tensor,
+                           resonance_energies: torch.Tensor,
+                           full_system_vectors: tp.Optional[torch.Tensor]):
         """
         :param sample: The sample which transitions must be found
         :param Gx: x-part of Hamiltonian Zeeman Term
         :param Gy: y-part of Hamiltonian Zeeman Term
         :param Gz: z-part of Hamiltonian Zeeman Term
 
-        :param batches: list of next data:
-        - tuple of eigen vectors for resonance energy levels of low and high levels
-        - tuple of valid indexes of levels between which transition occurs
-        - magnetic field of transitions
-        - mask_trans - Boolean transition mask [batch_size, num valid transitions]. It is True if transition occurs
-        - mask_triu - Boolean triangular mask [total number of all possible transitions].
-        It is True if there is at least one element in batch for which transition between energy levels occurs.
-        num valid transitions = sum(mask_triu)
-        - indexes: Boolean mask of correct elements in batch
-        - resonance energies
-        - vector_full_system | None. The eigen vectors for all energy levels
+        :param Gx: x-part of Hamiltonian Zeeman Term
+        :param Gy: y-part of Hamiltonian Zeeman Term
+        :param Gz: z-part of Hamiltonian Zeeman Term
 
         :return:
         """
 
-        config_dims = (*self.batch_dims, *self.mesh_size)
-        batches, occurrences = self._first_pass(sample, F, Gx, Gy, Gz, batches)
-        occurrences, max_columns = self._assign_global_indexes(occurrences)
+        intensities = self.intensity_calculator.compute_intensity(
+            Gx, Gy, Gz, vectors_down, vectors_up, lvl_down, lvl_up, resonance_energies
+        )
 
-        res_fields = torch.zeros((*config_dims, max_columns), dtype=torch.float32, device=Gx.device)
-        intensities = torch.zeros((*config_dims, max_columns), dtype=torch.float32, device=Gx.device)
-        width_square = torch.zeros((*config_dims, max_columns), dtype=torch.float32, device=Gx.device)
-        freq_to_field_global = torch.zeros((*config_dims, max_columns), dtype=torch.float32, device=Gx.device)
+        intensities_mask = (intensities / intensities.abs().max() > self.threshold).any(dim=-2)
+        intensities = intensities[..., intensities_mask]
 
-        extra_tensors = self._init_extras(config_dims, max_columns, Gx.device)
-        num_pairs = (self.spin_system_dim ** 2 - self.spin_system_dim) // 2
-        mask_triu_general = torch.zeros(num_pairs, dtype=torch.bool)
+        extras = self._mask_additional(vectors_down,
+            vectors_up, lvl_down, lvl_up, resonance_energies,
+            full_system_vectors, intensities_mask)
 
-        for bi, rows_batch_idx, col_batch_idx, col_base_idx, keep_local in occurrences:
-            mask_triu, B_trans_batch, intensity_batch,\
-                width_square_batch, mask_indexes, freq_to_field_val, *extras_batch = batches[bi]
-            row_idx = torch.nonzero(mask_indexes).squeeze(-1)
-            if row_idx.numel() > 0 and col_base_idx.numel() > 0:
-                # mask_triu_general[..., col_batch_idx] = True
-                res_fields[row_idx[:, None], col_base_idx] = B_trans_batch[..., keep_local]
 
-                intensities[row_idx[:, None], col_base_idx] += intensity_batch[..., keep_local]
-                width_square[row_idx[:, None], col_base_idx] += width_square_batch[..., keep_local]
+        res_fields = res_fields[..., intensities_mask]
+        vectors_u = vectors_down[..., intensities_mask, :]
+        vectors_v = vectors_up[..., intensities_mask, :]
 
-                freq_to_field_global[row_idx[:, None], col_base_idx] += freq_to_field_val[..., keep_local]
-
-                self._update_extras(extra_tensors, extras_batch, row_idx, col_base_idx, keep_local)
-
-        intensities *= freq_to_field_global
+        freq_to_field = self._freq_to_field(vectors_u, vectors_v, Gz)
+        intensities *= freq_to_field
         intensities = intensities / intensities.abs().max()
-        width = self.broader.add_hamiltonian_straine(sample, width_square) * freq_to_field_global
+        width = self.broader(sample, vectors_u, vectors_v, res_fields) * freq_to_field
 
-        return mask_triu_general, res_fields, intensities, width, *extra_tensors
+        extras = self._compute_additional(
+            sample, F, Gx, Gy, Gz, *extras
+        )
+
+        return res_fields, intensities, width, *extras
 
 
 class StationarySpectraCreator(BaseSpectraCreator):
-    def _postcompute_batch_data(self, compute_out: tuple, fields: torch.Tensor,
+    def _postcompute_batch_data(self, res_fields: torch.Tensor, intensities: torch.Tensor, width: torch.Tensor,
                                 F: torch.Tensor, Gx: torch.Tensor, Gy: torch.Tensor, Gz: torch.Tensor):
-        return compute_out, fields
+        return res_fields, intensities, width
 
     def _init_spectra_processor(self,
                                 spectra_integrator: tp.Optional[BaseSpectraIntegrator],
@@ -874,40 +729,31 @@ class TruncatedSpectraCreatorTimeResolved(BaseSpectraCreator):
 
     def _get_param_specs(self) -> list[ParamSpec]:
         params = [
+            ParamSpec("scalar", torch.long),
+            ParamSpec("scalar", torch.long),
             ParamSpec("vector", torch.float32),
             ParamSpec("vector", torch.complex64),
             ParamSpec("vector", torch.complex64)
             ]
         return params
 
-    # REWRITE IT TO MAKE LOGIC BETTER
-    def _precompute_batch_data(self, sample: spin_system.MultiOrientedSample, F, Gx, Gy, Gz, batch):
-        """
-        :param sample:
-        :param Gx:
-        :param Gy:
-        :param Gz:
-        :param batch:
-        :return:
-        """
-        intensity = self.intensity_calculator(Gx, Gy, Gz, batch)
-        (vector_down, vector_up), (lvl_down, lvl_up),\
-            B_trans, mask_trans, mask_triu, indexes, resonance_energies, _ = batch
-        width_square = self.broader(sample, vector_down, vector_up, B_trans, indexes)
+    def _mask_additional(self, vectors_down: torch.Tensor, vectors_up: torch.Tensor,
+                           lvl_down: torch.Tensor, lvl_up: torch.Tensor,
+                           resonance_energies: torch.Tensor,
+                           full_system_vectors: tp.Optional[torch.Tensor], intensities_mask: torch.Tensor):
 
-        freq_to_field_val = self._freq_to_field(vector_down, vector_up, Gz, indexes)
-        return mask_trans, mask_triu, B_trans,\
-            intensity, width_square, indexes, freq_to_field_val, resonance_energies, vector_down, vector_up
+        return lvl_down, lvl_up, resonance_energies, vectors_down, vectors_up
 
-    def _postcompute_batch_data(self, compute_out: tuple, fields: torch.Tensor,
+    def _postcompute_batch_data(self, res_fields: torch.Tensor, intensities: torch.Tensor, width: torch.Tensor,
                                 F: torch.Tensor, Gx: torch.Tensor, Gy: torch.Tensor,
-                                Gz: torch.Tensor, time: torch.Tensor):
-        mask_triu, res_fields, intensities, width, *extras = compute_out
+                                Gz: torch.Tensor, time: torch.Tensor, *extras):
+        lvl_down, lvl_up, resonance_energies, vectors_down, vectors_up, *extras = extras
+
         population = self.intensity_calculator.calculate_population_evolution(
-            time, res_fields, mask_triu, *extras
+            time, res_fields, lvl_down, lvl_up, resonance_energies, vectors_down, vectors_up, *extras
         )
         intensities = (intensities.unsqueeze(0) * population)
-        return (mask_triu, res_fields, intensities, width), fields
+        return res_fields, intensities, width
 
     def _init_spectra_processor(self,
                                 spectra_integrator: tp.Optional[BaseSpectraIntegrator],
@@ -925,14 +771,27 @@ class CoupledSpectraCreatorTimeResolved(TruncatedSpectraCreatorTimeResolved):
 
     def _get_param_specs(self) -> list[ParamSpec]:
         params = [
+            ParamSpec("scalar", torch.long),
+            ParamSpec("scalar", torch.long),
+
             ParamSpec("vector", torch.float32),
             ParamSpec("vector", torch.complex64),
+
             ParamSpec("vector", torch.complex64),
             ParamSpec("matrix", torch.complex64)
             ]
         return params
 
-    def _precompute_batch_data(self, sample: spin_system.MultiOrientedSample, F, Gx, Gy, Gz, batch):
+    def _compute_additional(self, sample: spin_system.MultiOrientedSample,
+                           F: torch.Tensor,
+                           Gx: torch.Tensor,
+                           Gy: torch.Tensor,
+                           Gz: torch.Tensor,
+                           vectors_down: torch.Tensor, vectors_up: torch.Tensor,
+                           lvl_down: torch.Tensor, lvl_up: torch.Tensor,
+                           res_fields: torch.Tensor,
+                           resonance_energies: torch.Tensor,
+                           full_system_vectors: tp.Optional[torch.Tensor], *extras):
         """
         :param sample:
         :param Gx:
@@ -941,18 +800,13 @@ class CoupledSpectraCreatorTimeResolved(TruncatedSpectraCreatorTimeResolved):
         :param batch:
         :return:
         """
-        intensity = self.intensity_calculator(Gx, Gy, Gz, batch)
-        (vector_down, vector_up), (lvl_down, lvl_up),\
-            B_trans, mask_trans, mask_triu, indexes, resonance_energies, vector_full = batch
-        width_square = self.broader(sample, vector_down, vector_up, B_trans, indexes)
 
-        freq_to_field_val = self._freq_to_field(vector_down, vector_up, Gz, indexes)
-        return mask_trans, mask_triu, B_trans, intensity, width_square, indexes, freq_to_field_val, resonance_energies,\
-            vector_down, vector_up, vector_full
+        return lvl_down, lvl_up, resonance_energies, vectors_down, vectors_up, full_system_vectors
 
 
 class MultiSampleCreator:
     def __init__(self,
+                 resonance_freq: tp.Union[float, torch.Tensor],
                  creators: list[BaseSpectraCreator],
                  temperature: tp.Optional[float] = 293,
                  intensity_calculator: tp.Optional[MultiSampleIntensitiesCalculator] = None,
@@ -962,6 +816,7 @@ class MultiSampleCreator:
         """
         creators[i] is already configured for sample i (its spin_system_dim, mesh, …).
         """
+        self.resonance_freq = resonance_freq
         self.spin_system_dim = [creator.spin_system_dim for creator in creators]
         if len(creators) == 0:
             raise ValueError("Need at least one creator")

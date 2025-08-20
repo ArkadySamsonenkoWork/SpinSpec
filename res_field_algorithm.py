@@ -937,8 +937,7 @@ class BaseResonanceLocator:
 
     def _split_batch(self, mask_trans: torch.Tensor,
                      mask_triu: torch.Tensor,
-                     indexes: torch.Tensor,
-                     batches_triu: tp.Sequence[torch.Tensor], batches_general: tp.Sequence[torch.Tensor]):
+                     indexes: torch.Tensor):
         """
         :param mask_trans: The mask of True and False of real transitions. The shape is [..., n], where n is valid columns number
         :param mask_triu: The mask of True and False. The shape is [N], where N is number of all transitions. The number of True == n
@@ -1004,7 +1003,7 @@ class BaseResonanceLocator:
         indexes_true_positions = torch.where(indexes)[0]
 
         num_unique = len(counts)
-
+        result = []
         for pattern_idx in range(num_unique):
             if use_bitpack:
                 unique_int = unique_ints[pattern_idx]
@@ -1035,13 +1034,25 @@ class BaseResonanceLocator:
             if len(pattern_true_indices) > 0:
                 pos_to_set = triu_true_positions[pattern_true_indices]
                 mask_triu_updated[pos_to_set] = True
-
+            result.append((mask_triu_updated, indexes_updated, pattern_local_indices, pattern_true_indices))
             # Select batches using integer indices to avoid bool masking
-            batches_selected = \
-                [batch[pattern_local_indices].index_select(dim=len(original_shape) - 1, index=pattern_true_indices) for batch in batches_triu] + \
-                [batch[pattern_local_indices] for batch in batches_general]
 
-            yield mask_triu_updated, indexes_updated, batches_selected
+            #batches_selected = \
+            #    [batch[pattern_local_indices].index_select(dim=len(original_shape) - 1, index=pattern_true_indices) for batch in batches_triu] + \
+            #    [batch[pattern_local_indices] for batch in batches_general]
+
+        return result
+
+    def _get_resonance_data(self, resonance_field_data, mask_triu, mask_trans, indexes):
+        result = [
+            (mask_triu_new, indexes_new, pattern_local_indices, pattern_true_indices, step_B)
+            for step_B, mask_trans_i in resonance_field_data
+            for mask_triu_new, indexes_new, pattern_local_indices, pattern_true_indices in (
+                lambda mask_trans_updated, mask_triu_updated, step_B_updated:
+                self._split_batch(mask_trans_updated, mask_triu_updated, indexes)
+            )(*self._apply_roots_valid_mask(mask_trans, mask_trans_i, mask_triu, step_B))
+        ]
+        return result
 
     def _iterate_batch(self,
                        batch: tuple[
@@ -1092,39 +1103,38 @@ class BaseResonanceLocator:
         resonance_field_data = self._compute_resonance_fields(diff_eig_low, diff_eig_high, diff_deriv_low,
                                     diff_deriv_high, mask_trans, resonance_frequency)
 
-        # resonance_data = self._get_resonance_data(resonance_field_data, mask_triu, indexes)
+        resonance_field_data = self._get_resonance_data(resonance_field_data, mask_triu, mask_trans, indexes)
 
-        for step_B, mask_trans_i in resonance_field_data:
-            # Check if it is correct
-            mask_trans_updated, mask_triu_updated, step_B =\
-                self._apply_roots_valid_mask(mask_trans, mask_trans_i, mask_triu, step_B)
-
+        original_shape = mask_trans.shape
+        outputs = []
+        for mask_triu_new, indexes_new, pattern_local_indices, pattern_true_indices, step_B in resonance_field_data:
             resonance_energies = self._compute_resonance_energies(step_B,
                                                                   eig_values_low, eig_values_high,
                                                                   delta_B * deriv_low, delta_B * deriv_high
                                                                   )
+
             Bres = B_low.squeeze(dim=-1) + step_B * delta_B.squeeze(dim=-1)
+            resonance_energies_new = resonance_energies[pattern_local_indices].index_select(dim=len(original_shape) - 1, index=pattern_true_indices)
+            step_B_new = step_B[pattern_local_indices].index_select(dim=len(original_shape) - 1, index=pattern_true_indices)
+            Bres = Bres[pattern_local_indices].index_select(dim=len(original_shape) - 1, index=pattern_true_indices)
+            eig_vectors_low_new = eig_vectors_low[pattern_local_indices]
+            eig_vectors_high_new = eig_vectors_high[pattern_local_indices]
 
-            for mask_triu_new, indexes_new, resonance_data in self._split_batch(
-                mask_trans_updated, mask_triu_updated, indexes,
-                (resonance_energies, step_B, Bres), (eig_vectors_low, eig_vectors_high)
-                ):
-                resonance_energies, step_B, Bres, eig_vectors_low_new, eig_vectors_high_new = resonance_data
+            valid_lvl_down = lvl_down[mask_triu_new]
+            valid_lvl_up = lvl_up[mask_triu_new]
 
-                valid_lvl_down = lvl_down[mask_triu_new]
-                valid_lvl_up = lvl_up[mask_triu_new]
+            (vectors_u, vectors_v), vector_full_system = self._compute_eigenvectors(
+                eig_vectors_low_new, eig_vectors_high_new, valid_lvl_down, valid_lvl_up, step_B_new)
 
-                (vectors_u, vectors_v), vector_full_system = self._compute_eigenvectors(
-                    eig_vectors_low_new, eig_vectors_high_new, valid_lvl_down, valid_lvl_up, step_B)
-
-                out_res = (
-                    (vectors_u, vectors_v),
-                    (valid_lvl_down, valid_lvl_up),
-                    Bres, mask_triu_new,
-                    indexes_new,
-                    resonance_energies,
-                    vector_full_system)
-                outputs.append(out_res)
+            out_res = (
+                (vectors_u, vectors_v),
+                (valid_lvl_down, valid_lvl_up),
+                Bres, mask_triu_new,
+                indexes_new,
+                resonance_energies_new,
+                vector_full_system
+            )
+            outputs.append(out_res)
         return outputs
 
     def __call__(self, final_batches, resonance_frequency, *args, **kwargs):
