@@ -103,7 +103,7 @@ class BaseResonanceIntervalSolver(ABC):
     Base class for algorithm of resonance interval search
     """
     def __init__(self, spin_dim: int,
-                 eigen_finder: tp.Optional[BaseEigenSolver] = EighEigenSolver(), r_tol: float = 1e-4,
+                 eigen_finder: tp.Optional[BaseEigenSolver] = EighEigenSolver(), r_tol: float = 1e-5,
         max_iterations: float = 20, delta_field: float = 1e-8, device: torch.device = torch.device("cpu")):
         self.eigen_finder = eigen_finder
         self.r_tol = torch.tensor(r_tol)
@@ -261,6 +261,7 @@ class BaseResonanceIntervalSolver(ABC):
         # Process XOR case. It means that only one interval has resonance.
         # Note, that it is impossible that none interval has resonance
         if mask_xor.any():
+
             idx_xor = mask_xor.nonzero(as_tuple=True)[0]
             new_intervals.append(
                 self._compute_xor_interval(
@@ -369,6 +370,47 @@ class BaseResonanceIntervalSolver(ABC):
             row_indexes
         )
 
+    def _concatenate_batches(self, batches):
+        """
+        Concatenate a list of batches with nested structure along the first dimension.
+
+        Args:
+            batches: List of batches, where each batch has structure:
+                    tuple[
+                        tuple[torch.Tensor, torch.Tensor],  # pair 1
+                        tuple[torch.Tensor, torch.Tensor],  # pair 2
+                        tuple[torch.Tensor, torch.Tensor],  # pair 3
+                        tuple[torch.Tensor, torch.Tensor],  # pair 4
+                        torch.Tensor                        # single tensor
+                    ]
+
+        Returns:
+            Single batch with the same structure but concatenated tensors
+        """
+        if not batches:
+            return ()
+
+        concatenated_pairs = []
+        for pair_idx in range(4):
+            # Get all first tensors from pair_idx across all batches
+            first_tensors = [batch[pair_idx][0] for batch in batches]
+            # Get all second tensors from pair_idx across all batches
+            second_tensors = [batch[pair_idx][1] for batch in batches]
+
+            # Concatenate and create new pair
+            concatenated_pair = (
+                torch.cat(first_tensors, dim=0),
+                torch.cat(second_tensors, dim=0)
+            )
+            concatenated_pairs.append(concatenated_pair)
+
+        # Concatenate the single tensors (5th element)
+        single_tensors = [batch[4] for batch in batches]
+        concatenated_single = torch.cat(single_tensors, dim=0)
+
+        # Return the concatenated batch with same structure
+        return tuple(concatenated_pairs + [concatenated_single])
+
     def _finilize_batch(self,
                         eig_values_low: torch.Tensor, eig_values_mid: torch.Tensor, eig_values_high: torch.Tensor,
                         eig_vectors_low: torch.Tensor, eig_vectors_mid: torch.Tensor, eig_vectors_high: torch.Tensor,
@@ -416,7 +458,8 @@ class BaseResonanceIntervalSolver(ABC):
                     row_indexes,
                 )
             )
-        return new_intervals
+
+        return [self._concatenate_batches(new_intervals)]
 
     def _iterate_batch(self, batch: tuple[
                                  tuple[torch.Tensor, torch.Tensor],
@@ -1066,6 +1109,37 @@ class BaseResonanceLocator:
         ]
         return result
 
+    def _split_positions_unique(self, idx: torch.Tensor, num_buckets: tp.Optional[int] = None) -> tp.List[torch.Tensor]:
+        if idx.numel() == 0:
+            return []
+        if idx.dim() != 1:
+            raise ValueError("idx must be a 1D tensor")
+
+        # Get unique values, inverse indices, and counts
+        u, inverse, counts = torch.unique(idx, return_inverse=True, return_counts=True)
+        max_count = counts.max().item()
+        if num_buckets is None:
+            num_buckets = max_count
+        if num_buckets < max_count:
+            raise ValueError(f"num_buckets ({num_buckets}) < required minimal buckets ({max_count})")
+
+        # Compute group start indices
+        group_start = torch.cat([torch.tensor([0], device=idx.device), counts.cumsum(0)[:-1]])
+
+        # Sort indices by inverse and compute occurrence index
+        sorted_indices = torch.argsort(inverse)
+        sorted_inverse = inverse[sorted_indices]
+        occurrence_index_sorted = torch.arange(len(idx), device=idx.device) - group_start[sorted_inverse]
+        occurrence_index = torch.empty_like(occurrence_index_sorted)
+        occurrence_index[sorted_indices] = occurrence_index_sorted
+
+        # Group indices by occurrence index using bincount and split
+        counts_per_bucket = torch.bincount(occurrence_index, minlength=num_buckets)
+        sorted_by_bucket = torch.argsort(occurrence_index)
+        buckets_tensors = torch.split(sorted_by_bucket, counts_per_bucket.tolist())
+
+        return list(buckets_tensors)
+
     def _iterate_batch(self,
                        batch: tuple[
                                 tuple[torch.Tensor, torch.Tensor],
@@ -1138,15 +1212,17 @@ class BaseResonanceLocator:
             (vectors_u, vectors_v), vector_full_system = self._compute_eigenvectors(
                 eig_vectors_low_new, eig_vectors_high_new, valid_lvl_down, valid_lvl_up, step_B_new)
 
-            out_res = (
-                (vectors_u, vectors_v),
-                (valid_lvl_down, valid_lvl_up),
-                Bres, mask_triu_new,
-                row_indexes_new,
-                resonance_energies_new,
-                vector_full_system
-            )
-            outputs.append(out_res)
+            unique_positions = self._split_positions_unique(row_indexes_new)
+            for uniqic_pos in unique_positions:
+                out_res = (
+                    (vectors_u.index_select(dim=0, index=uniqic_pos), vectors_v.index_select(dim=0, index=uniqic_pos)),
+                    (valid_lvl_down, valid_lvl_up),
+                    Bres.index_select(dim=0, index=uniqic_pos), mask_triu_new,
+                    row_indexes_new.index_select(dim=0, index=uniqic_pos),
+                    resonance_energies_new.index_select(dim=0, index=uniqic_pos),
+                    vector_full_system
+                )
+                outputs.append(out_res)
         return outputs
 
     def __call__(self, final_batches, resonance_frequency, *args, **kwargs):
@@ -1488,7 +1564,7 @@ class ResField:
                 cached_batches.append((
                     (vectors_u, vectors_v),
                     (valid_lvl_down, valid_lvl_up),
-                    Bres, mask_triu, row_indexes, resonance_energies, vector_full_system
+                    Bres, row_indexes, resonance_energies, vector_full_system
                 ))
                 occurences.append((bi, row_indexes, col_idx))
         return cached_batches, occurences
@@ -1540,7 +1616,7 @@ class ResField:
 
         for bi, rows_batch_idx, col_batch_idx, col_base_idx in occurrences:
             (vectors_u_batch, vectors_v_batch), (valid_lvl_down_batch, valid_lvl_up_batch),\
-                resonance_field_batch, _, row_indexes, resonance_energies_batch, eigen_vectors_batched = batches[bi]
+                resonance_field_batch, row_indexes, resonance_energies_batch, eigen_vectors_batched = batches[bi]
 
             if row_indexes.numel() > 0 and col_base_idx.numel() > 0:
                 vectors_u[row_indexes[:, None], col_base_idx, :] = vectors_u_batch
@@ -1557,6 +1633,42 @@ class ResField:
 
         return (vectors_u, vectors_v), (valid_lvl_down, valid_lvl_up),\
             res_fields, resonance_energies, full_eigen_vectors
+
+    def concatenate_batches(self, batches: list[tuple]):
+        """
+        Concatenate a list of batches with nested structure along the first dimension.
+
+        Args:
+            batches: List of batches, where each batch has structure:
+                    tuple[
+                        tuple[torch.Tensor, torch.Tensor],  # pair 1
+                        tuple[torch.Tensor, torch.Tensor],  # pair 2
+                        tuple[torch.Tensor, torch.Tensor],  # pair 3
+                        tuple[torch.Tensor, torch.Tensor],  # pair 4
+                        torch.Tensor                        # single tensor
+                    ]
+
+        Returns:
+            Single batch with the same structure but concatenated tensors
+        """
+        if not batches:
+            return ()
+
+        concatenated_pairs = []
+        for pair_idx in range(4):
+            first_tensors = [batch[pair_idx][0] for batch in batches]
+            second_tensors = [batch[pair_idx][1] for batch in batches]
+
+            concatenated_pair = (
+                torch.cat(first_tensors, dim=0),
+                torch.cat(second_tensors, dim=0)
+            )
+            concatenated_pairs.append(concatenated_pair)
+        single_tensors = [batch[4] for batch in batches]
+        concatenated_single = torch.cat(single_tensors, dim=0)
+
+        # Return the concatenated batch with same structure
+        return tuple(concatenated_pairs + [concatenated_single])
 
     def __call__(self, sample: spin_system.BaseSample,
                  resonance_frequency: torch.Tensor,
@@ -1587,7 +1699,8 @@ class ResField:
         interval_solver, locator, args = self._solver_fabric(sample, F, resonance_frequency)
         batches = interval_solver(
             F, Gz, B_low, B_high, resonance_frequency, *args)
-        batches = locator(batches, resonance_frequency, *args)
+        concatenated = self.concatenate_batches(batches)
+        batches = locator([concatenated], resonance_frequency, *args)
         return self._combine_resonance_data(device=Gz.device, batches=batches)
 
 
