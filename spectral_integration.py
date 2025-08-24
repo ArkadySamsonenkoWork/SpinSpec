@@ -35,7 +35,7 @@ class EasySpinIntegrand(BaseIntegrand):
         self.pi_sqrt = torch.tensor(math.sqrt(math.pi))
         self.two = torch.tensor(2.0)
         self._arg = torch.tensor(0.0)
-        self.cutoff = torch.tensor(3.0)
+        self.cutoff = torch.tensor(4.0)
 
     def _absorption(self, arg: torch.Tensor, c_val: torch.Tensor):
         return torch.exp(-arg.square()) * c_val / self.pi_sqrt
@@ -107,6 +107,7 @@ class SpectraIntegratorEasySpinLike(BaseSpectraIntegrator):
         :return: result: Tensor of shape (..., N) with the value of the integral for each B
 
         """
+
         A_mean = A_mean * area
         width = width
         width = self.natural_width + width

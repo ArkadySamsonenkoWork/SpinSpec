@@ -168,7 +168,6 @@ class IntegrationProcessorBase(ABC):
                     intensities: torch.Tensor, areas: torch.Tensor):
         max_intensity = torch.amax(abs(intensities), dim=-1, keepdim=True)
         mask = ((intensities / max_intensity).abs() > self.threshold).any(dim=tuple(range(intensities.dim() - 1)))
-
         intensities = intensities[..., mask]
         width = width[..., mask]
         res_fields = res_fields[..., mask, :]
@@ -393,7 +392,7 @@ class Broadener:
         return self.add_hamiltonian_straine(sample, result)
 
     def add_hamiltonian_straine(self, sample: spin_system.MultiOrientedSample, squared_width):
-        hamiltonian_width = sample.build_hamiltonian_straineed().unsqueeze(-1).square()
+        hamiltonian_width = sample.build_hamiltonian_strained().unsqueeze(-1).square()
         return (squared_width + hamiltonian_width).sqrt()
 
 
@@ -524,6 +523,8 @@ class BaseSpectraCreator(ABC):
 
         if populator is not None:
             self.temperature = None
+        else:
+            self.temperature = temperature
 
     @abstractmethod
     def _init_spectra_processor(self,
@@ -543,7 +544,7 @@ class BaseSpectraCreator(ABC):
             else:
                 raise TypeError("You should pass sample or spin_system_dim, batch_dims, mesh arguments")
         else:
-            spin_system_dim = sample.spin_system.dim
+            spin_system_dim = sample.base_spin_system.dim
             batch_dims = sample.config_shape[:-1]
             mesh = sample.mesh
 
@@ -637,8 +638,7 @@ class BaseSpectraCreator(ABC):
                            F: torch.Tensor,
                            Gx: torch.Tensor,
                            Gy: torch.Tensor,
-                           Gz: torch.Tensor,
-                            *extras):
+                           Gz: torch.Tensor, *extras):
         return extras
 
 
@@ -695,7 +695,7 @@ class BaseSpectraCreator(ABC):
 
 class StationarySpectraCreator(BaseSpectraCreator):
     def _postcompute_batch_data(self, res_fields: torch.Tensor, intensities: torch.Tensor, width: torch.Tensor,
-                                F: torch.Tensor, Gx: torch.Tensor, Gy: torch.Tensor, Gz: torch.Tensor):
+                                F: torch.Tensor, Gx: torch.Tensor, Gy: torch.Tensor, Gz: torch.Tensor, *extras, **kwargs):
         return res_fields, intensities, width
 
     def _init_spectra_processor(self,
@@ -746,7 +746,7 @@ class TruncatedSpectraCreatorTimeResolved(BaseSpectraCreator):
 
     def _postcompute_batch_data(self, res_fields: torch.Tensor, intensities: torch.Tensor, width: torch.Tensor,
                                 F: torch.Tensor, Gx: torch.Tensor, Gy: torch.Tensor,
-                                Gz: torch.Tensor, time: torch.Tensor, *extras):
+                                Gz: torch.Tensor, time: torch.Tensor, *extras, **kwargs):
         lvl_down, lvl_up, resonance_energies, vectors_down, vectors_up, *extras = extras
 
         population = self.intensity_calculator.calculate_population_evolution(
@@ -791,7 +791,7 @@ class CoupledSpectraCreatorTimeResolved(TruncatedSpectraCreatorTimeResolved):
                            lvl_down: torch.Tensor, lvl_up: torch.Tensor,
                            res_fields: torch.Tensor,
                            resonance_energies: torch.Tensor,
-                           full_system_vectors: tp.Optional[torch.Tensor], *extras):
+                           full_system_vectors: tp.Optional[torch.Tensor], *extras, **kwargs):
         """
         :param sample:
         :param Gx:
@@ -897,4 +897,5 @@ class MultiSampleCreator:
             spectra = creator._finalize(compute_out, gauss, lorentz, fields)
             spectras.append(spectra)
         return torch.stack(spectras, dim=0)
+
 

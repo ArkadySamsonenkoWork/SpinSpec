@@ -16,7 +16,7 @@ class BoundaryHandler:
     def get_boundary(boundary: str | None, init_indexes: list[int], is_start: bool):
         if boundary == "reflection":
             offsets = (2, 1) if is_start else (-3, -2)
-        elif boundary == "periodic":
+        elif boundary == "a":
             offsets = (-3, -2) if is_start else (1, 2)
         elif boundary is None:
             return []
@@ -175,6 +175,42 @@ class MeshProcessorBase:
         self.last_point = boundaries_cond != "periodic"
 
     def _create_theta_lines(self, grid_frequency):
+        eps = 1e-8
+        init_lines = [ThetaLine(
+                theta=0.0,
+                points=1,
+                phi_limits=self.phi_limits,
+                last_point=self.last_point,
+                boundaries_cond=self.boundaries_cond
+        ),
+            ThetaLine(
+                theta=eps,
+                points=2,
+                phi_limits=self.phi_limits,
+                last_point=self.last_point,
+                boundaries_cond=self.boundaries_cond
+        ),
+        ThetaLine(
+                theta=2 * eps,
+                points=3,
+                phi_limits=self.phi_limits,
+                last_point=self.last_point,
+                boundaries_cond=self.boundaries_cond
+        )
+        ]
+
+        return init_lines + [
+            ThetaLine(
+                #theta=((np.pi /2) * (point - 3) / (grid_frequency - 3)),
+                theta=np.arccos(1 - (point - 3)**2 / (grid_frequency - 3)**2),
+                points=point,
+                phi_limits=self.phi_limits,
+                last_point=self.last_point,
+                boundaries_cond=self.boundaries_cond
+            ) for point in range(4, grid_frequency + 1)
+        ]
+
+    def _create_theta_lines_legacy(self, grid_frequency):
         return [
             ThetaLine(
                 theta=(np.pi / 2) * point / grid_frequency,

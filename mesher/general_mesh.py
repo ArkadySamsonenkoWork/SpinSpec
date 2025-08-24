@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 import sys
 import typing as tp
+from matplotlib import pyplot as plt
 
 import torch
 
@@ -104,6 +105,10 @@ class BaseMeshPowder(BaseMesh):
         R[..., 2, 2] = cos_theta
         return R
 
+    def areas(self):
+        vertices, triangles = self.post_mesh
+        return self.spherical_triangle_areas(vertices, triangles)
+
     @staticmethod
     def spherical_triangle_areas(vertices: torch.Tensor, triangles: torch.Tensor):
         """
@@ -168,6 +173,13 @@ class BaseMeshPowder(BaseMesh):
     @property
     def name(self) -> str:
         return "PowderMesh"
+
+    def triplot(self):
+        mesh, triplots = self.post_mesh
+        phi, theta = mesh[..., 0], mesh[..., 1]
+        plt.triplot(phi.numpy(), theta.numpy(), triplots)
+
+
 
 
 class BaseMeshAxial(BaseMeshPowder):

@@ -197,7 +197,6 @@ class ParamSpec:
         """Update the bounds for this parameter spec."""
         self.bounds = bounds
 
-
 class ParameterSpace:
     """Helper to manage a set of ParamSpec and conversions.
     Stores parameters in a fixed order. Supports parameters that are
@@ -451,9 +450,6 @@ class ParameterSpace:
         for param_name, bounds in bounds_dict:
             self._set_single_bounds(param_name, bounds)
 
-    def copy(self):
-        return copy.deepcopy(self)
-
     def suggest_optuna(self, trial) -> tp.Dict[str, float]:
         out = dict(self.fixed_params)  # start with fixed
         for s in self._varying_specs:
@@ -507,6 +503,20 @@ class TrialsTracker:
             }
             for i, (trial, loss) in enumerate(zip(self.trials, self.losses))
         ]
+
+
+class SpectraSimulator:
+    def __init__(self,
+                 sample_creator: tp.Callable[[dict[str, float], tp.Any], tp.Any],
+                 spectra_creator: tp.Callable[[tp.Any, torch.Tensor], torch.Tensor], *args):
+        self.sample_creator = sample_creator
+        self.spectra_creator = spectra_creator
+        self.args = args
+
+    def __call__(self, fields: torch.Tensor, params: dict[str, float]):
+        sample = self.sample_creator(params, *self.args)
+        return self.spectra_creator(sample, fields)
+
 
 class SpectrumFitter:
     """
