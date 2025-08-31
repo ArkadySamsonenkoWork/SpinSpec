@@ -8,6 +8,34 @@ from torch import nn
 
 import spin_system
 
+
+class ViewIndexator(nn.Module):
+    def _is_increasing_sequence(self, tensor):
+        if len(tensor) < 2:
+            return True
+        return torch.all(tensor[1:] - tensor[:-1] == 1)
+
+    def single_indexation(self, indexes: torch.Tensor, args: tp.Sequence[torch.Tensor]):
+        if len(indexes) == args[0].shape[0]:
+            return args
+
+        elif self._is_increasing_sequence(indexes):
+            min_idx = indexes[0]
+            max_idx = indexes[-1]
+            return (arg[(min_idx-1):(max_idx+1)] for arg in args)
+
+        else:
+            return (arg.index_select(dim=0, index=indexes) for arg in args)
+
+    def double_indexation(self, indexes_1: torch.Tensor, indexes_2: torch.Tensor, args: tp.Sequence[torch.Tensor]):
+        idx = torch.cat((indexes_1, indexes_2), dim=0)
+        n_1 = indexes_1.numel()
+
+        return ((reordered := ViewIndexator.single_indexation(idx, arg)[:n_1], reordered[n_1:]) for arg in args)
+
+
+
+
 class BaseEigenSolver(ABC):
     @abstractmethod
     def __call__(self, F: torch.Tensor, G: torch.Tensor, B: torch.Tensor):
@@ -111,6 +139,7 @@ class BaseResonanceIntervalSolver(ABC):
         self.delta_field = delta_field
         self.spin_dim = spin_dim
         self._triu_indices = torch.triu_indices(spin_dim, spin_dim, offset=1, device=device)
+        self.view_indexator = ViewIndexator()
 
     def _compute_resonance_functions(self, eig_values_low: torch.Tensor, eig_values_high: torch.Tensor,
                                     resonance_frequency: torch.Tensor) -> (torch.Tensor, torch.Tensor):
@@ -219,7 +248,7 @@ class BaseResonanceIntervalSolver(ABC):
         derivatives_high = self._compute_derivative(eig_vectors_high, G_idx)
         eig_values_estimation = 0.5 * (eig_values_high + eig_values_low) +\
                                       (B_high - B_low) / 8 * (derivatives_high - derivatives_low)
-        #eig_values_estimation = 0.5 * (eig_values_high + eig_values_low)
+
         epsilon = 2 * (eig_values_estimation - eig_values_mid).abs().max(dim=-1)[0]
         return epsilon, (derivatives_low, derivatives_high)
 
@@ -261,7 +290,6 @@ class BaseResonanceIntervalSolver(ABC):
         # Process XOR case. It means that only one interval has resonance.
         # Note, that it is impossible that none interval has resonance
         if mask_xor.any():
-
             idx_xor = mask_xor.nonzero(as_tuple=True)[0]
             new_intervals.append(
                 self._compute_xor_interval(
@@ -275,6 +303,12 @@ class BaseResonanceIntervalSolver(ABC):
                 )
             )
         return new_intervals
+
+    def _single_index_data(self, indexes: torch.Tensor, args):
+        if args[0].shape[0] == len(indexes):
+            return args
+        else:
+            return (arg.index_select(dim=0, index=indexes) for arg in args)
 
     def _compute_xor_interval(self,
             idx_xor: torch.Tensor,
@@ -310,14 +344,33 @@ class BaseResonanceIntervalSolver(ABC):
         """
         mask_left = mask_left.index_select(0, idx_xor)
 
-        B_low = torch.where(mask_left.unsqueeze(-1).unsqueeze(-1), B_low[idx_xor], B_mid[idx_xor])
-        B_high = torch.where(mask_left.unsqueeze(-1).unsqueeze(-1), B_mid[idx_xor], B_high[idx_xor])
-        eig_values_low = torch.where(mask_left.unsqueeze(1), eig_values_low[idx_xor], eig_values_mid[idx_xor])
-        eig_values_high = torch.where(mask_left.unsqueeze(1), eig_values_mid[idx_xor], eig_values_high[idx_xor])
-        eig_vectors_low = torch.where(
-            mask_left.unsqueeze(-1).unsqueeze(-1), eig_vectors_low[idx_xor], eig_vectors_mid[idx_xor])
-        eig_vectors_high = torch.where(
-            mask_left.unsqueeze(-1).unsqueeze(-1), eig_vectors_mid[idx_xor], eig_vectors_high[idx_xor])
+        if B_low.shape[0] == len(idx_xor):
+            pass
+
+        else:
+            B_low = B_low.index_select(dim=0, index=idx_xor)
+            B_mid = B_mid.index_select(dim=0, index=idx_xor)
+            B_high = B_high.index_select(dim=0, index=idx_xor)
+
+            eig_values_low = eig_values_low.index_select(dim=0, index=idx_xor)
+            eig_values_mid = eig_values_mid.index_select(dim=0, index=idx_xor)
+            eig_values_high = eig_values_high.index_select(dim=0, index=idx_xor)
+
+            eig_vectors_low = eig_vectors_low.index_select(dim=0, index=idx_xor)
+            eig_vectors_mid = eig_vectors_mid.index_select(dim=0, index=idx_xor)
+            eig_vectors_high = eig_vectors_high.index_select(dim=0, index=idx_xor)
+
+
+
+        torch.where(mask_left.unsqueeze(-1).unsqueeze(-1), B_low, B_mid, out=B_low)
+        torch.where(mask_left.unsqueeze(-1).unsqueeze(-1), B_mid, B_high, out=B_high)
+
+        torch.where(mask_left.unsqueeze(-1), eig_values_low, eig_values_mid, out=eig_values_low)
+        torch.where(mask_left.unsqueeze(-1), eig_values_mid, eig_values_high, out=eig_values_high)
+
+        torch.where(mask_left.unsqueeze(-1).unsqueeze(-1), eig_vectors_low, eig_vectors_mid, out=eig_vectors_low)
+        torch.where(mask_left.unsqueeze(-1).unsqueeze(-1), eig_vectors_mid, eig_vectors_high, out=eig_vectors_high)
+
 
         row_indexes = row_indexes.clone().index_select(0, idx_xor)
 
@@ -359,8 +412,12 @@ class BaseResonanceIntervalSolver(ABC):
                 )
         mask_left = mask_left.index_select(0, idx_xor)
 
-        derivatives_low = torch.where(mask_left.unsqueeze(1), derivatives_low[idx_xor], derivatives_mid[idx_xor])
-        derivatives_high = torch.where(mask_left.unsqueeze(1), derivatives_mid[idx_xor], derivatives_high[idx_xor])
+        derivatives_low = derivatives_low.index_select(dim=0, index=idx_xor)
+        derivatives_mid = derivatives_mid.index_select(dim=0, index=idx_xor)
+        derivatives_high = derivatives_high.index_select(dim=0, index=idx_xor)
+
+        torch.where(mask_left.unsqueeze(1), derivatives_low, derivatives_mid, out=derivatives_low)
+        torch.where(mask_left.unsqueeze(1), derivatives_mid, derivatives_high, out=derivatives_high)
 
         return (
             (eig_values_low, eig_values_high),
@@ -369,47 +426,6 @@ class BaseResonanceIntervalSolver(ABC):
             (B_low, B_high),
             row_indexes
         )
-
-    def _concatenate_batches(self, batches):
-        """
-        Concatenate a list of batches with nested structure along the first dimension.
-
-        Args:
-            batches: List of batches, where each batch has structure:
-                    tuple[
-                        tuple[torch.Tensor, torch.Tensor],  # pair 1
-                        tuple[torch.Tensor, torch.Tensor],  # pair 2
-                        tuple[torch.Tensor, torch.Tensor],  # pair 3
-                        tuple[torch.Tensor, torch.Tensor],  # pair 4
-                        torch.Tensor                        # single tensor
-                    ]
-
-        Returns:
-            Single batch with the same structure but concatenated tensors
-        """
-        if not batches:
-            return ()
-
-        concatenated_pairs = []
-        for pair_idx in range(4):
-            # Get all first tensors from pair_idx across all batches
-            first_tensors = [batch[pair_idx][0] for batch in batches]
-            # Get all second tensors from pair_idx across all batches
-            second_tensors = [batch[pair_idx][1] for batch in batches]
-
-            # Concatenate and create new pair
-            concatenated_pair = (
-                torch.cat(first_tensors, dim=0),
-                torch.cat(second_tensors, dim=0)
-            )
-            concatenated_pairs.append(concatenated_pair)
-
-        # Concatenate the single tensors (5th element)
-        single_tensors = [batch[4] for batch in batches]
-        concatenated_single = torch.cat(single_tensors, dim=0)
-
-        # Return the concatenated batch with same structure
-        return tuple(concatenated_pairs + [concatenated_single])
 
     def _finilize_batch(self,
                         eig_values_low: torch.Tensor, eig_values_mid: torch.Tensor, eig_values_high: torch.Tensor,
@@ -458,8 +474,7 @@ class BaseResonanceIntervalSolver(ABC):
                     row_indexes,
                 )
             )
-
-        return [self._concatenate_batches(new_intervals)]
+        return new_intervals
 
     def _iterate_batch(self, batch: tuple[
                                  tuple[torch.Tensor, torch.Tensor],
@@ -651,9 +666,11 @@ class GeneralResonanceIntervalSolver(BaseResonanceIntervalSolver):
         """
         res_low, res_high = self._compute_resonance_functions(
             eig_values_low, eig_values_high, resonance_frequency)
-        mask_delta = has_rapid_variation(res_low, res_high, deriv_max, B_low, B_high)
+        mask = has_rapid_variation(res_low, res_high, deriv_max, B_low, B_high)
         mask_sign_change = has_sign_change(res_low, res_high)
-        return torch.where(baseline_sign_mask, mask_delta, mask_sign_change)
+        torch.where(baseline_sign_mask, mask, mask_sign_change, out=mask)
+
+        return mask
 
     def determine_split_masks(self, eig_values_low, eig_values_mid, eig_values_high,
                                                     B_low, B_mid, B_high,
@@ -1109,37 +1126,6 @@ class BaseResonanceLocator:
         ]
         return result
 
-    def _split_positions_unique(self, idx: torch.Tensor, num_buckets: tp.Optional[int] = None) -> tp.List[torch.Tensor]:
-        if idx.numel() == 0:
-            return []
-        if idx.dim() != 1:
-            raise ValueError("idx must be a 1D tensor")
-
-        # Get unique values, inverse indices, and counts
-        u, inverse, counts = torch.unique(idx, return_inverse=True, return_counts=True)
-        max_count = counts.max().item()
-        if num_buckets is None:
-            num_buckets = max_count
-        if num_buckets < max_count:
-            raise ValueError(f"num_buckets ({num_buckets}) < required minimal buckets ({max_count})")
-
-        # Compute group start indices
-        group_start = torch.cat([torch.tensor([0], device=idx.device), counts.cumsum(0)[:-1]])
-
-        # Sort indices by inverse and compute occurrence index
-        sorted_indices = torch.argsort(inverse)
-        sorted_inverse = inverse[sorted_indices]
-        occurrence_index_sorted = torch.arange(len(idx), device=idx.device) - group_start[sorted_inverse]
-        occurrence_index = torch.empty_like(occurrence_index_sorted)
-        occurrence_index[sorted_indices] = occurrence_index_sorted
-
-        # Group indices by occurrence index using bincount and split
-        counts_per_bucket = torch.bincount(occurrence_index, minlength=num_buckets)
-        sorted_by_bucket = torch.argsort(occurrence_index)
-        buckets_tensors = torch.split(sorted_by_bucket, counts_per_bucket.tolist())
-
-        return list(buckets_tensors)
-
     def _iterate_batch(self,
                        batch: tuple[
                                 tuple[torch.Tensor, torch.Tensor],
@@ -1200,9 +1186,19 @@ class BaseResonanceLocator:
                                                                   )
 
             Bres = B_low.squeeze(dim=-1) + step_B * delta_B.squeeze(dim=-1)
-            resonance_energies_new = resonance_energies[pattern_local_indices].index_select(dim=len(original_shape) - 1, index=pattern_true_indices)
-            step_B_new = step_B[pattern_local_indices].index_select(dim=len(original_shape) - 1, index=pattern_true_indices)
-            Bres = Bres[pattern_local_indices].index_select(dim=len(original_shape) - 1, index=pattern_true_indices)
+
+
+            row_idx = pattern_local_indices.view(-1, 1)
+            col_idx = pattern_true_indices.view(1, -1)
+            idx = [slice(None)] * len(original_shape)
+            idx[0] = row_idx
+            idx[-1] = col_idx
+
+            resonance_energies_new = resonance_energies[tuple(idx)]
+            step_B_new = step_B[tuple(idx)]
+            Bres = Bres[tuple(idx)]
+
+
             eig_vectors_low_new = eig_vectors_low[pattern_local_indices]
             eig_vectors_high_new = eig_vectors_high[pattern_local_indices]
 
@@ -1212,17 +1208,15 @@ class BaseResonanceLocator:
             (vectors_u, vectors_v), vector_full_system = self._compute_eigenvectors(
                 eig_vectors_low_new, eig_vectors_high_new, valid_lvl_down, valid_lvl_up, step_B_new)
 
-            unique_positions = self._split_positions_unique(row_indexes_new)
-            for uniqic_pos in unique_positions:
-                out_res = (
-                    (vectors_u.index_select(dim=0, index=uniqic_pos), vectors_v.index_select(dim=0, index=uniqic_pos)),
-                    (valid_lvl_down, valid_lvl_up),
-                    Bres.index_select(dim=0, index=uniqic_pos), mask_triu_new,
-                    row_indexes_new.index_select(dim=0, index=uniqic_pos),
-                    resonance_energies_new.index_select(dim=0, index=uniqic_pos),
-                    vector_full_system
-                )
-                outputs.append(out_res)
+            out_res = (
+                (vectors_u, vectors_v),
+                (valid_lvl_down, valid_lvl_up),
+                Bres, mask_triu_new,
+                row_indexes_new,
+                resonance_energies_new,
+                vector_full_system
+            )
+            outputs.append(out_res)
         return outputs
 
     def __call__(self, final_batches, resonance_frequency, *args, **kwargs):
@@ -1342,16 +1336,16 @@ class GeneralResonanceLocator(BaseResonanceLocator):
         and mask where transition occurs
 
         """
-        eps = 1e-11
-        tresshold = 1e-10
+        eps = torch.tensor(1e-11, device=diff_eig_high.device)
+        tresshold = torch.tensor(1e-10, device=diff_eig_high.device)
         coef_3, coef_2, coef_1, coef_0 = self._compute_cubic_polinomial_coeffs(
             diff_eig_low, diff_eig_high, diff_deriv_low, diff_deriv_high)
         coef_0 = coef_0 - resonance_frequency
 
-        coef_3_valid = torch.where(coef_3.abs() >= tresshold, coef_3, eps)
-        a = coef_2 / coef_3_valid
-        b = coef_1 / coef_3_valid
-        c = coef_0 / coef_3_valid
+        torch.where(coef_3.abs() >= tresshold, coef_3, eps, out=coef_3)
+        a = coef_2 / coef_3
+        b = coef_1 / coef_3
+        c = coef_0 / coef_3
 
         p = b - a ** 2 / 3
         q = (2 * a ** 3) / 27 - (a * b) / 3 + c
@@ -1634,42 +1628,6 @@ class ResField:
         return (vectors_u, vectors_v), (valid_lvl_down, valid_lvl_up),\
             res_fields, resonance_energies, full_eigen_vectors
 
-    def concatenate_batches(self, batches: list[tuple]):
-        """
-        Concatenate a list of batches with nested structure along the first dimension.
-
-        Args:
-            batches: List of batches, where each batch has structure:
-                    tuple[
-                        tuple[torch.Tensor, torch.Tensor],  # pair 1
-                        tuple[torch.Tensor, torch.Tensor],  # pair 2
-                        tuple[torch.Tensor, torch.Tensor],  # pair 3
-                        tuple[torch.Tensor, torch.Tensor],  # pair 4
-                        torch.Tensor                        # single tensor
-                    ]
-
-        Returns:
-            Single batch with the same structure but concatenated tensors
-        """
-        if not batches:
-            return ()
-
-        concatenated_pairs = []
-        for pair_idx in range(4):
-            first_tensors = [batch[pair_idx][0] for batch in batches]
-            second_tensors = [batch[pair_idx][1] for batch in batches]
-
-            concatenated_pair = (
-                torch.cat(first_tensors, dim=0),
-                torch.cat(second_tensors, dim=0)
-            )
-            concatenated_pairs.append(concatenated_pair)
-        single_tensors = [batch[4] for batch in batches]
-        concatenated_single = torch.cat(single_tensors, dim=0)
-
-        # Return the concatenated batch with same structure
-        return tuple(concatenated_pairs + [concatenated_single])
-
     def __call__(self, sample: spin_system.BaseSample,
                  resonance_frequency: torch.Tensor,
                  B_low: torch.Tensor, B_high: torch.Tensor, F: torch.Tensor, Gz: torch.Tensor) ->\
@@ -1685,23 +1643,22 @@ class ResField:
         :param F: The magnetic free part of Hamiltonian
         :param Gz: z-part of Zeeman magnetic field term B * Gz
         :return: list of next data:
-        - tuple of eigen vectors for resonance energy levels of low and high levels
+        - tuple of the eigen vectors of high transition states and of low transition states and Vi and Vj where i>j is EPR transition
         - tuple of valid indexes of levels between which transition occurs
         - magnetic field of transitions
-        - mask_trans - Boolean transition mask [batch_size, num valid transitions]. It is True if transition occurs
-        - mask_triu - Boolean triangular mask [total number of all possible transitions].
-        It is True if there is at least one element in batch for which transition between energy levels occurs.
-        num valid transitions = sum(mask_triu)
-        - indexes: Boolean mask of correct elements in batch
         - resonance energies
         - vector_full_system | None. The eigen vectors for all energy levels
         """
+
         interval_solver, locator, args = self._solver_fabric(sample, F, resonance_frequency)
         batches = interval_solver(
             F, Gz, B_low, B_high, resonance_frequency, *args)
-        concatenated = self.concatenate_batches(batches)
-        batches = locator([concatenated], resonance_frequency, *args)
-        return self._combine_resonance_data(device=Gz.device, batches=batches)
+        batches = locator(batches, resonance_frequency, *args)
+        out = self._combine_resonance_data(device=Gz.device, batches=batches)
+        return out
+
+
+
 
 
 
