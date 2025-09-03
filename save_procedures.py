@@ -1,4 +1,5 @@
 import itertools
+import math
 import os
 
 import typing as tp
@@ -58,7 +59,7 @@ class SampleDict:
             'spin_system': self._serialize_spin_system(sample.base_spin_system, serialize_for_torch),
             'gauss': self._convert_tensor(sample.gauss, serialize_for_torch),
             'lorentz': self._convert_tensor(sample.lorentz, serialize_for_torch),
-            'hamiltonian_strained': self._convert_tensor(sample.base_hamiltonian_strained, serialize_for_torch),
+            'base_ham_strain': self._convert_tensor(sample.base_ham_strain, serialize_for_torch),
         }
 
     def _serialize_spin_system(self, spin_system, serialize_for_torch: bool) -> tp.Dict[str, tp.Any]:
@@ -149,7 +150,7 @@ class SampleDict:
 class EasySpinSaverSampleDict:
     hz_to_MHz = 1e-6
     T_to_mT = 1e3
-
+    g_easy_spin_strain_converter = 2 * math.log(2)
     def get_dict(self, sample: BaseSample):
         out = self._serialize_sample(sample)
         return out
@@ -159,11 +160,11 @@ class EasySpinSaverSampleDict:
 
         lorentz = sample.lorentz.detach().cpu().item()
         gauss = sample.gauss.detach().cpu().item()
-        hamiltonian_strained = self._convert_tensor(sample.base_hamiltonian_strained)
+        ham_strain = self._convert_tensor(sample.base_ham_strain)
 
         sys_dict = self._serialize_spin_system(spin_system)
-        sys_dict["HStrain"] = hamiltonian_strained * self.hz_to_MHz
-        sys_dict["lwpp"] = np.array([gauss, lorentz]) * self.T_to_mT
+        sys_dict["HStrain"] = ham_strain * self.hz_to_MHz
+        sys_dict["lw"] = np.array([gauss, lorentz]) * self.T_to_mT
 
         return sys_dict
 
@@ -192,7 +193,8 @@ class EasySpinSaverSampleDict:
 
     def _serialize_nuclei(self, nuclei: list[particles.Nucleus]):
         if nuclei:
-            return {"Nucs": [nucleus.nucleus_str for nucleus in nuclei]}
+
+            return {"Nucs": ",".join([nucleus.nucleus_str for nucleus in nuclei])}
         else:
             return {}
 
@@ -214,7 +216,8 @@ class EasySpinSaverSampleDict:
             g_strain = self._convert_tensor(strain) if strain is not None else np.array([0.0, 0.0, 0.0])
             g_strains.append(g_strain)
 
-        return {"g": np.array(g_tensors), "gStrain": np.array(g_strains), "gFrame": np.array(g_frames)}
+        return {"g": np.array(g_tensors),
+                "gStrain": np.array(g_strains) / self.g_easy_spin_strain_converter, "gFrame": np.array(g_frames)}
 
     def _serialize_electron_nuclei(self,
                                    electrons,
@@ -225,9 +228,9 @@ class EasySpinSaverSampleDict:
         num_electrons = len(electrons)
         num_nuclei = len(nuclei)
 
-        tensors = np.zeros((num_electrons, 3 * num_nuclei), dtype=np.float64)
-        strains = np.zeros((num_electrons, 3 * num_nuclei), dtype=np.float64)
-        frames = np.zeros((num_electrons, 3 * num_nuclei), dtype=np.float64)
+        tensors = np.zeros((num_nuclei, num_electrons * 3), dtype=np.float64)
+        strains = np.zeros((num_nuclei, num_electrons * 3), dtype=np.float64)
+        frames = np.zeros((num_nuclei, num_electrons * 3), dtype=np.float64)
 
         if electron_nuclei:
 
@@ -238,7 +241,7 @@ class EasySpinSaverSampleDict:
             for el_idx in range(num_electrons):
                 for nuc_idx in range(num_nuclei):
 
-                    start_pos = nuc_idx * 3
+                    start_pos = el_idx * 3
 
                     if (el_idx, nuc_idx) in interaction_dict:
                         interaction = interaction_dict[(el_idx, nuc_idx)]
@@ -246,12 +249,12 @@ class EasySpinSaverSampleDict:
                         strain = interaction.strain
                         strain = self._convert_tensor(strain) if strain else [0, 0, 0]
 
-                        tensors[el_idx, start_pos:start_pos + 3] = self._convert_tensor(interaction.components)
-                        frames[el_idx, start_pos:start_pos + 3] = self._convert_tensor(interaction.frame)
-                        strains[el_idx, start_pos:start_pos + 3] = strain
-
+                        tensors[nuc_idx, start_pos:start_pos + 3] = self._convert_tensor(interaction.components)
+                        frames[nuc_idx, start_pos:start_pos + 3] = self._convert_tensor(interaction.frame)
+                        strains[nuc_idx, start_pos:start_pos + 3] = strain
+            print(np.array(tensors))
             return {"A": np.array(tensors) * self.hz_to_MHz,
-                    "AStrain": np.array(frames),
+                    # "AStrain": np.array(frames),    I didn't understand the AStrain logic in Easyspin. So I disolved it. It should be one or many or what.!!
                     "AFrame": np.array(strains) * self.hz_to_MHz}
 
         else:
@@ -269,9 +272,9 @@ class EasySpinSaverSampleDict:
         dipole_tensor = np.zeros((int(num_electrons * (num_electrons - 1) / 2), 3), dtype=np.float64)
         dipole_frame_tensor = np.zeros((int(num_electrons * (num_electrons - 1) / 2), 3), dtype=np.float64)
 
-        zfs_array = np.zeros((int(num_electrons * (num_electrons - 1) / 2), 3), dtype=np.float64)
-        zfs_frame = np.zeros((int(num_electrons * (num_electrons - 1) / 2), 3), dtype=np.float64)
-        zfz_strain = np.zeros((int(num_electrons * (num_electrons - 1) / 2), 3), dtype=np.float64)
+        zfs_array = np.zeros((int(num_electrons), 2), dtype=np.float64)
+        zfs_frame = np.zeros((int(num_electrons), 3), dtype=np.float64)
+        zfz_strain = np.zeros((int(num_electrons), 2), dtype=np.float64)
 
         coupling_dict = {}
         zero_field = {}
@@ -281,20 +284,23 @@ class EasySpinSaverSampleDict:
             else:
                 zero_field[(el_idx_1, el_idx_2)] = interaction
 
-        position = 0
+        position_zfs = 0
+        position_dip_dip = 0
         for el_idx_1 in range(num_electrons):
-            for el_idx_2 in range(el_idx_1 + 1, num_electrons):
+            for el_idx_2 in range(el_idx_1, num_electrons):
 
                 if (el_idx_1, el_idx_2) in coupling_dict:
+                    print((el_idx_1, el_idx_2))
                     interaction = coupling_dict[(el_idx_1, el_idx_2)]
 
                     tensor = self._convert_tensor(interaction.components)
                     J = np.mean(tensor)
                     dip = tensor - J
 
-                    J_tensor[position] = J
-                    dipole_tensor[position] = dip
-                    dipole_frame_tensor[position] = self._convert_tensor(interaction.frame)
+                    J_tensor[position_dip_dip] = J
+                    dipole_tensor[position_dip_dip] = dip
+                    dipole_frame_tensor[position_dip_dip] = self._convert_tensor(interaction.frame)
+                    position_dip_dip += 1
 
                 if (el_idx_1, el_idx_2) in zero_field:
                     zfs_flag = True
@@ -304,15 +310,24 @@ class EasySpinSaverSampleDict:
                     frame = self._convert_tensor(interaction.frame)
 
                     strain = interaction.strain
-                    strain = self._convert_tensor(strain) if strain else [0, 0, 0]
+                    strain = self._convert_tensor(strain) if strain is not None else [0, 0, 0]
 
-                    zfs_array[position] = tensor
-                    zfs_frame[position] = frame
-                    zfz_strain[position] = strain
+                    D = 3 * tensor[-1] / 2
+                    E = abs((tensor[0] - tensor[1]) / 2)
 
-                position += 1
+                    zfs_array[position_zfs] = np.array([D, E])
+                    zfs_frame[position_zfs] = frame
+
+                    D_str = 3 * strain[-1] / 2
+                    E_str = abs(((strain[0] - strain[1]) / 2))
+
+                    zfz_strain[position_zfs] = np.array([D_str, E_str])
+
+                    position_zfs += 1
+
         out_dict = {}
         if zfs_flag:
+            print(np.array(zfs_array))
             out_dict = {"D": np.array(zfs_array) * self.hz_to_MHz, "DFrame": np.array(zfs_frame),
                         "DStrain": np.array(zfz_strain) * self.hz_to_MHz}
 
@@ -328,7 +343,7 @@ class EasySpinSaverSampleDict:
 
         out_dict = {}
         num_nuclei = len(nuclei)
-        if num_nuclei:
+        if num_nuclei and nuclei_nuclei:
             Q_array = np.zeros(int(num_nuclei * (num_nuclei - 1) / 2), dtype=np.float64)
             frame_array = np.zeros((int(num_nuclei * (num_nuclei - 1) / 2), 3), dtype=np.float64)
 
@@ -397,6 +412,24 @@ def save(
         field: tp.Optional[tp.Union[torch.Tensor, np.ndarray]] = None,
         format_type="torch"
 ):
+    """
+    Save experimental and sample parameters
+    :param filepath: The file path where data should be saved. Should include the desired
+        file extension or directory path depending on format_type.
+    :param sample: BaseSample instance. Default is None
+    :param spectra_creator: SpectraCreate instance. Default is None
+    :param field: The magnetic field torch/numpy array. Should be in Tesla units
+
+    :param format_type: {'pytorch', 'npy', 'easyspin'}, optional
+        The output format for saved data:
+
+        - 'pytorch': Saves data as PyTorch tensors (.pt files)
+        - 'npy': Saves data as NumPy arrays (.npy files)
+        - 'easyspin': Creates EasySpin-compatible Sys and Exp parameter files
+
+        Default is 'pytorch'.t
+    :return: None
+    """
 
     if format_type is None:
         ext = os.path.splitext(filepath)[1].lower()
@@ -424,12 +457,13 @@ def save(
     return format_handlers[format_type](filepath, sample_dict, creator_dict, field)
 
 
-def save_npy(filepath: str, sample_dict: dict, creator_dict: dict[str, tp.Any],
+def save_npy(filepath: str, sample_dict: dict[str, tp.Any], creator_dict: dict[str, tp.Any],
              field: tp.Optional[tp.Union[torch.Tensor, np.ndarray]] = None):
     out = {"sample": sample_dict}
     out["creator_dict"] = creator_dict
     out["field"] = parse_field(field)
     np.save(filepath, out)
+
 
 def save_torch(filepath: str, sample_dict: dict, creator_dict: dict[str, tp.Any],
                field: tp.Optional[tp.Union[torch.Tensor, np.ndarray]] = None):
@@ -437,6 +471,7 @@ def save_torch(filepath: str, sample_dict: dict, creator_dict: dict[str, tp.Any]
     out["creator_dict"] = creator_dict
     out["field"] = parse_field(field)
     torch.save(out, filepath)
+
 
 def save_npz(filepath: str, sample_dict: dict, creator_dict: dict[str, tp.Any],
              field: tp.Optional[tp.Union[torch.Tensor, np.ndarray]] = None):
@@ -449,6 +484,7 @@ def save_npz(filepath: str, sample_dict: dict, creator_dict: dict[str, tp.Any],
         out["Exp"]["nPoints"] = field_dict["field_num"]
     scipy.io.savemat(filepath, out, oned_as='row')
 
+
 def parse_field(field: tp.Optional[tp.Union[torch.Tensor, np.ndarray]] = None):
     if field is None:
         return {}
@@ -460,6 +496,8 @@ def parse_field(field: tp.Optional[tp.Union[torch.Tensor, np.ndarray]] = None):
 
 
 class SampleLoader:
+    g_easy_spin_strain_converter = 2 * math.log(2)
+
     def load_sample_from_dict(self, sample_dict: dict, format_type: str = 'pytorch') -> BaseSample:
         format_handlers = {
             'pytorch': self._load_pytorch_sample,
@@ -479,7 +517,7 @@ class SampleLoader:
             spin_system=spin_system,
             gauss=sample_dict['gauss'],
             lorentz=sample_dict['lorentz'],
-            hamiltonian_strained=sample_dict['hamiltonian_strained']
+            ham_strain=sample_dict['ham_strain']
         )
         return sample
 
@@ -490,7 +528,7 @@ class SampleLoader:
             spin_system=spin_system,
             gauss=torch.tensor(sample_dict['gauss'], dtype=torch.float32),
             lorentz=torch.tensor(sample_dict['lorentz'], dtype=torch.float32),
-            hamiltonian_strained=sample_dict['hamiltonian_strained']
+            ham_strain=sample_dict['ham_strain']
         )
 
         return sample
@@ -499,24 +537,34 @@ class SampleLoader:
         MHz_to_hz = 1e6
         mT_to_T = 1e-3
 
-        lwpp = sample_dict.get('lwpp', np.array([[0.0, 0.0]]))
-        gauss = torch.tensor(lwpp[0][0] * mT_to_T, dtype=torch.float32)
-        lorentz = torch.tensor(lwpp[0][1] * mT_to_T, dtype=torch.float32)
+        lorentz_conversion = math.sqrt(2 * math.log(2))
+        gauss_conversion = math.sqrt(3)
+
+        if "lw" in sample_dict:
+            lw = sample_dict.get('lw', np.array([[0.0, 0.0]]))
+            gauss = torch.tensor(lw[0][0] * mT_to_T, dtype=torch.float32)
+            lorentz = torch.tensor(lw[0][1] * mT_to_T, dtype=torch.float32)
+
+        elif "lwpp" in sample_dict:
+            lwpp = sample_dict.get('lwpp', np.array([[0.0, 0.0]]))
+            gauss = torch.tensor(lwpp[0][0] * mT_to_T, dtype=torch.float32) * gauss_conversion
+            lorentz = torch.tensor(lwpp[0][1] * mT_to_T, dtype=torch.float32) * lorentz_conversion
+
 
         spin_system = self._deserialize_easyspin_spin_system(sample_dict)
 
         if 'HStrain' in sample_dict:
-            hamiltonian_strained = torch.tensor(
+            ham_strain = torch.tensor(
                 sample_dict['HStrain'] * MHz_to_hz, dtype=torch.float32
-            )
+            )[0]
         else:
-            hamiltonian_strained = None
+            ham_strain = None
 
         sample = MultiOrientedSample(
             spin_system=spin_system,
             gauss=gauss,
             lorentz=lorentz,
-            hamiltonian_strained=hamiltonian_strained
+            ham_strain=ham_strain
         )
 
         return sample
@@ -566,14 +614,15 @@ class SampleLoader:
 
         nuclei = []
         if 'Nucs' in sys_dict:
-            for nuc_str in sys_dict['Nucs']:
+
+            for nuc_str in sys_dict['Nucs'].tolist()[0].split(","):
                 nucleus = particles.Nucleus(nuc_str)  # Assuming this method exists
                 nuclei.append(nucleus)
 
         g_tensors = []
         if 'g' in sys_dict:
             g_components = sys_dict['g']
-            g_strains = sys_dict.get('gStrain', np.zeros_like(g_components))
+            g_strains = sys_dict.get('gStrain', np.zeros_like(g_components)) * self.g_easy_spin_strain_converter
             g_frames = sys_dict.get('gFrame', np.zeros_like(g_components))
 
             for i in range(len(g_components)):
@@ -594,11 +643,11 @@ class SampleLoader:
             for el_idx in range(len(electrons)):
                 for nuc_idx in range(len(nuclei)):
                     start_pos = nuc_idx * 3
-                    components = A_tensor[el_idx, start_pos:start_pos + 3]
+                    components = A_tensor[nuc_idx, start_pos:start_pos + 3]
 
                     if np.any(components):  # Only add if non-zero
-                        strain_vals = A_strains[el_idx, start_pos:start_pos + 3] * MHz_to_hz
-                        frame_vals = A_frames[el_idx, start_pos:start_pos + 3]
+                        strain_vals = A_strains[nuc_idx, start_pos:start_pos + 3] * MHz_to_hz
+                        frame_vals = A_frames[nuc_idx, start_pos:start_pos + 3]
 
                         strain = torch.tensor(strain_vals, dtype=torch.float32) if np.any(strain_vals) else None
                         frame = torch.tensor(frame_vals, dtype=torch.float32) if np.any(frame_vals) else None
@@ -637,7 +686,8 @@ class SampleLoader:
 
         return spin_system
 
-    def _add_easyspin_electron_electron(self, sys_dict: dict, spin_system: SpinSystem, electron_electron: list):
+    def _add_easyspin_electron_electron(self, sys_dict: dict[str, tp.Any],
+                                        spin_system: SpinSystem, electron_electron: list[tuple[int, int, Interaction]]):
         """Helper to add electron-electron interactions from EasySpin format."""
         MHz_to_hz = 1e6
         num_electrons = len(spin_system.electrons)
@@ -705,7 +755,8 @@ class SampleLoader:
 class CreatorLoader:
     """Reconstructs BaseSpectraCreator objects from dictionary representations."""
 
-    def load_creator_from_dict(self, sample: MultiOrientedSample, creator_dict: dict, format_type: str = 'pytorch') -> BaseSpectraCreator:
+    def load_creator_from_dict(self, sample: MultiOrientedSample, creator_dict: dict, format_type: str = 'pytorch') ->\
+            BaseSpectraCreator:
         """Load a BaseSpectraCreator from a dictionary based on format type."""
         format_handlers = {
             'pytorch': self._load_pytorch_creator,
@@ -749,6 +800,17 @@ class CreatorLoader:
 
 
 def load(filepath: str, format_type: str = None) -> tp.Dict[str, tp.Any]:
+    """
+    :param filepath: load data from filepath
+    :param format_type: {'pytorch', 'npy', 'easyspin'}, optional
+        The output format for saved data:
+
+        - 'pytorch': Load data from .pt files
+        - 'npy': Load data from .npy files
+        - 'easyspin': Load EasySpine data. EasySpin out should contain Sys and Exp structures
+        Default is 'pytorch'.
+    :return: dict of loaded data: sample, spectracreator, field
+    """
 
     if format_type is None:
         ext = os.path.splitext(filepath)[1].lower()

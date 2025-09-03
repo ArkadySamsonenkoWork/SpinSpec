@@ -11,6 +11,7 @@ import optuna
 from scipy.spatial.distance import cdist
 from sklearn.preprocessing import StandardScaler
 
+import spin_system
 
 sys.path.append("..")
 from spectra_processing import normalize_spectrum
@@ -25,7 +26,7 @@ class TrialResult(tp.TypedDict):
     distance: float
 
 
-def print_trial_results(results: TrialResult, max_params=None, precision=6):
+def print_trial_results(results: tp.Union[TrialResult, list[TrialResult]], max_params=None, precision=6) -> None:
     """
     Print trial results.
 
@@ -89,12 +90,12 @@ def print_trial_results(results: TrialResult, max_params=None, precision=6):
             print(f"  ... and {remaining} more parameters")
 
 
-def print_params(params: dict[str, float], max_params=None, precision=6):
+def print_params(params: dict[str, float], max_params=None, precision=6) -> None:
     """
-    :param params: the dict of parameter names and theris valuee
+    :param params: the dict of parameter names and their values
     :param max_params: maximum number of parameters
-    :param precision:
-    :return:
+    :param precision: Number of decimal places for numeric values
+    :return: None
     """
 
     param_names = list(params.keys())
@@ -125,6 +126,7 @@ def print_params(params: dict[str, float], max_params=None, precision=6):
         remaining = len(params) - max_params
         print(f"  ... and {remaining} more parameters")
 
+
 @dataclass
 class FitResult:
     best_params: tp.Dict[str, float]
@@ -142,27 +144,59 @@ class ExperementalParameters:
 
 
 @dataclass
-class MinimaCluster:
-    center_params: tp.Dict[str, float]
-    best_loss: float
-    members: tp.List[tp.Dict[str, float]]
-
-
-@dataclass
 class NevergradTrial:
     params: tp.Dict[str, float]
     value: float
     _trial_id: int
 
+    def __repr__(self):
+        return f"_trial_id: {self._trial_id}, loss: {self.value}"
+
+    def __str__(self):
+        return f"_trial_id: {self._trial_id}, loss: {self.value}"
+
+
+class TrialsTracker:
+    def __init__(self):
+        self.trials = []
+        self.losses = []
+        self.step = 0
+
+    def __call__(self, optimizer: ng.optimization.Optimizer,
+                 candidate: ng.p.Instrumentation, loss: float):
+        """Callback function called after each evaluation"""
+        self.trials.append(candidate.value[0])
+        self.losses.append(loss)
+        self.step += 1
+
+        # Optional: print progress
+        if self.step % 10 == 0:
+            print(f"Step {self.step}: Loss = {loss:.6f}")
+
+    def get_best_trial(self):
+        """Get the trial with the lowest loss"""
+        best_idx = np.argmin(self.losses)
+        return {
+            '_trial_id': best_idx + 1,
+            'params': self.trials[best_idx],
+            'value': self.losses[best_idx]
+        }
+
+    def get_all_trials(self):
+        """Get all trials as a list of dictionaries"""
+        return [
+            {
+                '_trial_id': i + 1,
+                'params': trial,
+                'value': loss
+            }
+            for i, (trial, loss) in enumerate(zip(self.trials, self.losses))
+        ]
+
 
 class LogTransform:
-    def __init__(self, bounds: tp.Tuple[float, float], default: tp.Optional[float] = None):
-        self.bounds = bounds
-        self.default = default
-        self.log_bounds = (math.log(bounds[0]), math.log(bounds[1]))
-
     def __call__(self, x: float) -> float:
-        return math.exp(x)
+        return math.pow(10, x)
 
     def inverse(self, y: float) -> float:
         return math.log(y)
@@ -174,16 +208,24 @@ class ParamSpec:
 
     Attributes:
         name: parameter name
+
         bounds: (low, high) bounds for optimizer search (floats)
+
         default: optional default value to use for initialization
+
         transform: optional callable applied to a raw optimizer value to map
-                   it to the physical parameter (useful for log-scales)
+                   it to the physical parameter (for example, log-scales)
+
+        vary: bool: Whether the parameter should vary or not.
+        In the latter case, this is equivalent to specifying the parameter in fixed_parameters.
+        If you don't plan to vary the parameter, then the more correct way is to specify it in fixed_parameters.
+
     """
     name: str
     bounds: tp.Tuple[float, float]
     default: tp.Optional[float] = None
     transform: tp.Optional[tp.Callable[[float], float]] = None
-    vary = True
+    vary: bool = True
 
     def clip(self, x: float) -> float:
         lo, hi = self.bounds
@@ -197,21 +239,24 @@ class ParamSpec:
         """Update the bounds for this parameter spec."""
         self.bounds = bounds
 
+
 class ParameterSpace:
-    """Helper to manage a set of ParamSpec and conversions.
-    Stores parameters in a fixed order. Supports parameters that are
-    fixed (not varied during optimization) and variable parameters. Fixed
-    parameters can be provided either by using ParamSpec(vary=False) or
-    via the `fixed_params` mapping.
-    """
+    print_precision: int = 4
     def __init__(self, specs: tp.Sequence[ParamSpec],
-                 fixed_params: tp.Optional[tp.Dict[str, float]] = None, print_precision: int=6):
+                 fixed_params: tp.Optional[tp.Dict[str, float]] = None):
+        """
+        :param specs: The sequence of ParamSpec instances.
+        The list include parameters that should be varied (if spec.vary = True. For more details
+        see ParamSpec documentation)
+        :param fixed_params: The parameters that are fixed during fit.
+        """
         self.specs = list(specs)
 
         self.fixed_params: tp.Dict[str, float] = {} if fixed_params is None else dict(fixed_params)
+        self.fixed_params.update({s.name: s.default for s in self.specs if not getattr(s, "vary")})
+
         self._varying_specs = [s for s in self.specs if getattr(s, "vary", True)]
         self.varying_names = [s.name for s in self._varying_specs]
-
         self.varying_params = {s.name: s.default for s in self._varying_specs}
 
         for name in list(self.fixed_params.keys()):
@@ -219,7 +264,6 @@ class ParameterSpace:
                 idx = next(i for i, s in enumerate(self._varying_specs) if s.name == name)
                 del self._varying_specs[idx]
                 self.varying_names.remove(name)
-        self.print_precision = print_precision
 
     def __deepcopy__(self, memo):
         new_obj = type(self).__new__(type(self))
@@ -258,22 +302,20 @@ class ParameterSpace:
     def __iter__(self):
         return iter(self.__dict__().items())
 
-    def __str__(self) -> str:
+    def __repr__(self) -> str:
         """
         Print parameters space
         """
 
-        # Initialize the text string
         text = ""
 
-        # Start form fixed parameters
         text += f"____Fixed parameters_____ \n"
         text += "-" * 40 + "\n"
         param_names = list(self.fixed_params.keys())
         for key, value in self.fixed_params.items():
             max_name_len = max(len(name) for name in param_names) if param_names else 0
             if isinstance(value, float):
-                if abs(value) > 1000000:
+                if abs(value) > 1000:
                     value_str = f"{value:.{self.print_precision - 2}e}"
                 else:
                     value_str = f"{value:.{self.print_precision}f}"
@@ -294,7 +336,7 @@ class ParameterSpace:
             (low, up) = spec.bounds
 
             if isinstance(value, float):
-                if abs(value) > 1000000:
+                if abs(value) > 1000:
                     value_str = f"{value:.{self.print_precision - 2}e}"
                 else:
                     value_str = f"{value:.{self.print_precision}f}"
@@ -310,7 +352,7 @@ class ParameterSpace:
                 low = str(low)
 
             if isinstance(up, float):
-                if abs(up) > 1000000:
+                if abs(up) > 1000:
                     up = f"{up:+.{self.print_precision - 2}e}"
                 else:
                     up = f"{up:+.{self.print_precision}f}"
@@ -409,6 +451,10 @@ class ParameterSpace:
                 break
 
     def set_default(self, params: dict[str, float]):
+        """
+        :param params: the dict of parameters. Set default value for parameters given in params
+        :return:
+        """
         for key, value in params.items():
             if key in self.fixed_params:
                 self.fixed_params[key] = value
@@ -439,7 +485,6 @@ class ParameterSpace:
                     low, up = spec.bounds
                     delta = (up - low) * alpha
                     spec.bounds = (default - delta, default + delta)
-
                     break
 
     def set_bounds(self, bounds_dict: tp.Dict[str, tp.Tuple[float, float]]):
@@ -458,7 +503,6 @@ class ParameterSpace:
             out[s.name] = s.apply(val)
         return out
 
-    # Nevergrad instrumentation helper - only instrument varying parameters
     def instrument_nevergrad(self) -> ng.p.Instrumentation:
         params = []
         for s in self._varying_specs:
@@ -467,54 +511,29 @@ class ParameterSpace:
         return ng.p.Instrumentation(*params)
 
 
-class TrialsTracker:
-    def __init__(self):
-        self.trials = []
-        self.losses = []
-        self.step = 0
-
-    def __call__(self, optimizer: ng.optimization.Optimizer,
-                 candidate: ng.p.Instrumentation, loss: float):
-        """Callback function called after each evaluation"""
-        self.trials.append(candidate.value[0])
-        self.losses.append(loss)
-        self.step += 1
-
-        # Optional: print progress
-        if self.step % 10 == 0:
-            print(f"Step {self.step}: Loss = {loss:.6f}")
-
-    def get_best_trial(self):
-        """Get the trial with the lowest loss"""
-        best_idx = np.argmin(self.losses)
-        return {
-            '_trial_id': best_idx + 1,
-            'params': self.trials[best_idx],
-            'value': self.losses[best_idx]
-        }
-
-    def get_all_trials(self):
-        """Get all trials as a list of dictionaries"""
-        return [
-            {
-                '_trial_id': i + 1,
-                'params': trial,
-                'value': loss
-            }
-            for i, (trial, loss) in enumerate(zip(self.trials, self.losses))
-        ]
-
-
-class SpectraSimulator:
+class CWSpectraSimulator:
+    """
+    Example of CW spectra simulator.
+    """
     def __init__(self,
-                 sample_creator: tp.Callable[[dict[str, float], tp.Any], tp.Any],
+                 sample_updator: tp.Callable[[dict[str, float], tp.Any], tp.Any],
                  spectra_creator: tp.Callable[[tp.Any, torch.Tensor], torch.Tensor], *args):
-        self.sample_creator = sample_creator
+        """
+        :param sample_updator: Callable object that updates sample
+        :param spectra_creator: Callable object that creates spectra
+        :param args:
+        """
+        self.sample_updator = sample_updator
         self.spectra_creator = spectra_creator
         self.args = args
 
     def __call__(self, fields: torch.Tensor, params: dict[str, float]):
-        sample = self.sample_creator(params, *self.args)
+        """
+        :param fields: magnetic fields in Tesla units
+        :param params: parameters of param space
+        :return:
+        """
+        sample = self.sample_updator(params, *self.args)
         return self.spectra_creator(sample, fields)
 
 
@@ -544,26 +563,54 @@ class SpectrumFitter:
 
     def __init__(
         self,
-        B: tp.Union[np.ndarray, torch.Tensor] | list[tp.Union[np.ndarray, torch.Tensor]],
+        x_exp: tp.Union[np.ndarray, torch.Tensor] | list[tp.Union[np.ndarray, torch.Tensor]],
         y_exp: tp.Union[np.ndarray, torch.Tensor] | list[tp.Union[np.ndarray, torch.Tensor]],
         param_space: ParameterSpace,
-        simulate_spectrum_callable: tp.Callable[
+        spectra_simulator: tp.Callable[
             [list[torch.Tensor] | torch.Tensor, tp.Dict[str, float], tp.Dict],
              torch.Tensor | list[torch.Tensor]
         ],
         norm_mode: str = "integral",
-        device: tp.Optional[torch.device] = None,
         objective=objectives.MSEObjective(),
-        weights: list[float] = None
+        weights: list[float] = None,
+        device: tp.Optional[torch.device] = None,
     ):
+        """
+        :param x_exp: Experimental x-axis data. It can be magnetic field (T), time (s), or 2d-array (for time-resolved).
+            It is possible to pass a list for multi-object fit
+        :param y_exp: Experimental y-axis data.
+        :param param_space: The object of ParameterSpace class where all varying parameters are included
+        :param spectra_simulator: Any callable object that takes x_data and parameters and returns simulated
+            spectra or list of simulated spectra.
+            It is highly recommended for all new parameters to use update methods:
+            sample.update(new_params) or spec_creator.update_config(config)
+
+            Example:
+            class CWSpectraSimulator:
+                def __init__(self,
+                             sample_updator: tp.Callable[[dict[str, float], tp.Any], tp.Any],
+                             spectra_creator: tp.Callable[[tp.Any, torch.Tensor], torch.Tensor], *args):
+                    self.sample_updator = sample_updator
+                    self.spectra_creator = spectra_creator
+                    self.args = args
+
+                def __call__(self, fields: torch.Tensor, params: dict[str, float]):
+                    sample = self.sample_updator(params, *self.args)
+                    return self.spectra_creator(sample, fields)
+
+        :param norm_mode: Norm mode to fit data. 'integral' / 'max'
+        :param device: Device for computation
+        :param objective: Used objective function. It should be an inheritor of objectives.BaseObjective
+        :param weights: The weights for multi-data fit. Default is None
+        """
         self.device = torch.device("cpu") if device is None else device
         self.norm_mode = norm_mode
-        self._simulate_callable = simulate_spectrum_callable
+        self._simulate_callable = spectra_simulator
 
-        self.B, self.y_exp, self.multisample = self._set_experemental(B, y_exp)
+        self.x_exp, self.y_exp, self.multisample = self._set_experemental(x_exp, y_exp)
 
         if self.multisample and (weights is None):
-            self.weights = torch.ones(len(self.B), dtype=torch.float32, device=self.device)
+            self.weights = torch.ones(len(self.x_exp), dtype=torch.float32, device=self.device)
         elif weights is None:
             self.weights = None
         else:
@@ -598,35 +645,49 @@ class SpectrumFitter:
         else:
             return self._objective(torch.zeros_like(self.y_exp), self.y_exp).reciprocal()
 
-    def simulate_single_spectrum(self, params: tp.Dict[str, float], **kwargs) -> torch.Tensor:
-        return normalize_spectrum(self.B, self._simulate_callable(self.B, params, **kwargs), mode=self.norm_mode)
+    def _simulate_single_spectrum(self, params: tp.Dict[str, float], **kwargs) -> torch.Tensor:
+        return normalize_spectrum(self.x_exp, self._simulate_callable(self.x_exp, params, **kwargs), mode=self.norm_mode)
 
-    def simulate_spectral_set(self, params: tp.Dict[str, float], **kwargs) -> list[torch.Tensor]:
-        models = self._simulate_callable(self.B, params, **kwargs)
+    def _simulate_spectral_set(self, params: tp.Dict[str, float], **kwargs) -> list[torch.Tensor]:
+        models = self._simulate_callable(self.x_exp, params, **kwargs)
         for idx in range(len(models)):
-            models[idx] = normalize_spectrum(self.B[idx], models[idx], mode=self.norm_mode)
+            models[idx] = normalize_spectrum(self.x_exp[idx], models[idx], mode=self.norm_mode)
         return models
 
     def simulate_spectroscopic_data(self, params: tp.Dict[str, float], **kwargs) -> list[torch.Tensor] | torch.Tensor:
+        """
+        :param params: fict of parameter names: parameter values.
+        The names of parameters are names from param_space.
+        Example:
+        fitter.simulate_spectroscopic_data(dict(param_space))
+        :param kwargs:
+        :return: Simulated spectra - list or single spectra
+        """
         if self.multisample:
-            model = self.simulate_spectral_set(params, **kwargs)
+            model = self._simulate_spectral_set(params, **kwargs)
         else:
-            model = self.simulate_single_spectrum(params, **kwargs)
+            model = self._simulate_single_spectrum(params, **kwargs)
         return model
 
     def simulate_spectra_from_trial_params(self, trial_params: tp.Dict[str, float], **kwargs) ->\
             list[torch.Tensor] | torch.Tensor:
+        """
+        :param trial_params: Simulate spectra from parameters given as trial_params (only varied parameters)
+        As fixed_parameters the parameters from self.param_space are used
+        :param kwargs:
+        :return: Simulated spectra - list or single spectra
+        """
         return self.simulate_spectroscopic_data({**self.param_space.fixed_params, **trial_params}, **kwargs)
 
-    def loss_from_params(self, params: tp.Dict[str, float], **kwargs) -> torch.Tensor:
+    def _loss_from_params(self, params: tp.Dict[str, float], **kwargs) -> torch.Tensor:
         """Compute model - experiment residuals as a torch.Tensor."""
         with torch.no_grad():
             if self.multisample:
-                models = self.simulate_spectral_set(params, **kwargs)
+                models = self._simulate_spectral_set(params, **kwargs)
                 loss = sum(self.weights[idx] * self._loss_normalization[idx] * self._objective(
                     models[idx], self.y_exp[idx]) for idx in range(len(models))) / len(models)
             else:
-                model = self.simulate_single_spectrum(params, **kwargs)
+                model = self._simulate_single_spectrum(params, **kwargs)
                 loss = self._loss_normalization * self._objective(model, self.y_exp)
             return loss
 
@@ -643,15 +704,16 @@ class SpectrumFitter:
 
     def fit_optuna(
         self,
-        n_trials: int = 100,
+        show_progress: bool,
+        seed: tp.Optional[int],
+        return_best_spectrum: bool,
+
+        n_trials: int = 300,
         timeout: tp.Optional[float] = None,
         n_jobs: int = 1,
         sampler: tp.Optional[optuna.samplers.BaseSampler] = None,
         study_name: tp.Optional[str] = None,
-        show_progress: bool = True,
-        seed: tp.Optional[int] = None,
-        return_best_spectrum: bool = True,
-            **kwargs,
+        **kwargs,
     ) -> FitResult:
         """Fit using Optuna.
 
@@ -659,11 +721,16 @@ class SpectrumFitter:
         """
         def loss_function(trial):
             p = self.param_space.suggest_optuna(trial)
-            loss = self.loss_from_params(p, **kwargs)
+            loss = self._loss_from_params(p, **kwargs)
             return loss
 
         if sampler is None:
-            sampler = optuna.samplers.TPESampler(seed=seed, multivariate=True)
+            sampler = optuna.samplers.CmaEsSampler(
+                seed=seed,
+                n_startup_trials=50)
+            #sampler = optuna.samplers.TPESampler(seed=seed, multivariate=True)
+
+
         study = optuna.create_study(direction="minimize", sampler=sampler, study_name=study_name, load_if_exists=True)
         optuna.logging.set_verbosity(optuna.logging.WARNING)
         study.optimize(
@@ -677,12 +744,14 @@ class SpectrumFitter:
 
     def fit_nevergrad(
         self,
+        show_progress: bool,
+        seed: tp.Optional[int],
+        return_best_spectrum: bool,
+
         budget: int = 200,
         optimizer_name: str = "TwoPointsDE",
-        seed: tp.Optional[int] = None,
-        show_progress: bool = True,
-        return_best_spectrum: bool = True,
         track_trials: bool = True,
+
         **kwargs,
     ) -> FitResult:
         """Fit using Nevergrad (if installed)."""
@@ -696,10 +765,12 @@ class SpectrumFitter:
 
         def _loss_from_tuple(*args):
             params = self.param_space.vector_to_dict(args)
-            return self.loss_from_params(params).item()
+            return self._loss_from_params(params).item()
 
         if show_progress:
-            opt.register_callback("tell", ng.callbacks.ProgressBar())
+            progress_bar = ng.callbacks.ProgressBar()
+            progress_bar.update_frequency = 25
+            opt.register_callback("tell", progress_bar)
 
         trials_tracker = None
         if track_trials:
@@ -718,30 +789,75 @@ class SpectrumFitter:
             trials = self._tracker_to_trials(trials_tracker)
 
         return FitResult(
-            best_params, self.loss_from_params({**self.param_space.fixed_params, **best_params}), best_spec,
+            best_params, self._loss_from_params({**self.param_space.fixed_params, **best_params}), best_spec,
             {"backend": "nevergrad", "optimizer": optimizer_name, "trials": trials}
         )
 
     def fit(
         self,
-        method: str = "optuna",
-        **kwargs,
+        backend: str = "optuna",
+        seed: tp.Optional[int] = None,
+        show_progress: bool = True,
+        return_best_spectrum: bool = True,
+
+        **backend_kwargs,
     ) -> FitResult:
-        method = method.lower()
+        """
+        All fitting methods can be viewed in SpectrumFitter.__available_optimizer__
+
+        :param backend: optuna / nevergrad. Sets which library should be used to fit data.
+            Optuna supports not as many methods as nevergrad but they are quite powerful. Default fitting method is TPE.
+            TPE has quite high exploration abilities and not as dramatic speed of work as Bayesian models.
+            After the initial fitting process it is recommended to reduce
+            the bounds and continue fitting with any method of convex optimization from Nevergrad:
+            For example, with COBYLA.
+
+        :param backend_kwargs: The kwargs of fit settings described in optuna / nevergrad library
+            NOTE! Optuna and Nevergrad have different backend parameters.
+            We have saved the initial naming from these libraries
+
+            Key differences:
+                                        optuna                                   nevergrad
+            ----------------------------------------------------------------------------------------------------
+            method type          optuna.samplers.BaseSampler                    str object
+            ----------------------------------------------------------------------------------------------------
+            number of iterations      n_trials                                    budget
+            ----------------------------------------------------------------------------------------------------
+
+        :return: None
+        """
+        method = backend.lower()
         if method == "optuna":
-            return self.fit_optuna(**kwargs)
+            return self.fit_optuna(seed=seed, show_progress=show_progress,
+                                   return_best_spectrum=return_best_spectrum, **backend_kwargs
+                                   )
         if method in ("nevergrad", "ng"):
-            return self.fit_nevergrad(**kwargs)
+            return self.fit_nevergrad(seed=seed, show_progress=show_progress,
+                                      return_best_spectrum=return_best_spectrum, **backend_kwargs
+                                      )
         raise ValueError(f"Unknown fit method: {method}")
 
 
 class SpaceSearcher:
+    """
+    For some cases not only the best fitting parameters are useful but all 'good' parameters.
+    Space searcher try to catch 'good' parameters that are far from the best fit parameters.
+    """
     def __init__(
         self,
-        loss_rel_tol: float = 0.5,
+        loss_rel_tol: float = 1.0,
         top_k: int = 5,
         distance_fraction: float = 0.2,
     ):
+        """
+        :param loss_rel_tol: loss_trial / loss_best: cutoff parameter
+            that sets the acceptable loss of trial. Default is 1
+        :param top_k: Returns only top_k lowest-loss trials.
+        :param distance_fraction: Among all 'good' trials with low loss it
+            accepts only trials with Euclidean distance in scaled (-1, 1) parameters < distance_fraction * max_distance
+
+            To compute distance the parameters are scaled to (-1, 1)
+        """
         self.loss_rel_tol = float(loss_rel_tol)
         self.top_k = int(top_k)
         self.distance_fraction = float(distance_fraction)
@@ -777,7 +893,6 @@ class SpaceSearcher:
         param_matrix shape: (n_trials, n_varying_params)
         losses: array of length n_trials (float)
         trial_indices: list of optuna trial numbers corresponding to rows
-        If top_k is given, returns only top_k lowest-loss trials.
         """
         backend = fit_result.optimizer_info["backend"]
 
@@ -796,6 +911,12 @@ class SpaceSearcher:
         return trials, param_names
 
     def __call__(self, fit_result: FitResult, param_names: list[str] | None = None):
+        """
+        :param fit_result: The output of fitter.
+        :param param_names: The names of parameters that should be included in search procedure.
+        Default value is None means that all spec (varying) parameters should be included.
+        :return:
+        """
         trials, param_names = self._extract_trials_from_fit(fit_result, param_names)
         P, L, trial_numbers = self._parse_trials(trials, param_names)
         best_params = fit_result.best_params

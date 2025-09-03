@@ -1,5 +1,6 @@
 import torch
 
+
 class RelaxationRateTempDep:
     """Base class for relaxation speed temperature dependencies."""
 
@@ -117,7 +118,6 @@ class RelaxationRateMatrix:
             [self._convert_to_rate(entry) for entry in row]
             for row in relaxation_speeds
         ]
-
     def _convert_to_rate(self, entry):
         if isinstance(entry, RelaxationRateTempDep):
             return entry

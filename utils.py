@@ -16,24 +16,11 @@ def apply_expanded_rotations(R: torch.Tensor, T: torch.Tensor):
     Returns:
       torch.Tensor: Rotated tensors of shape [..., r, 3, 3].
     """
-    # Add a new dimension for the rotation dimension.
-    # Now T has shape [..., 1, 3, 3]
     T = T.unsqueeze(-3)
 
-    # Expand R to allow broadcasting:
-    # R is reshaped from [r, 3, 3] to [1, r, 3, 3]
     R_exp = R.unsqueeze(0)
-
-    # First multiply: compute R * T.
-    # Broadcasting aligns the new dimension in T with the r dimension in R.
-    # The resulting shape is [..., r, 3, 3]
     RT = torch.matmul(R_exp, T)
-
-    # Compute the transpose of R on the last two dimensions.
     R_T = R_exp.transpose(-2, -1)
-
-    # Second multiplication: compute (R * T) * R^T.
-    # The final shape is [..., r, 3, 3]
     rotated_T = torch.matmul(RT, R_T)
 
     return rotated_T
@@ -64,6 +51,7 @@ def __apply_expanded_rotations(R: torch.Tensor, T: torch.Tensor):
     :return: The rotated tensors with the shape [..., rotation_dim, 3, 3]
     """
     return torch.einsum('rij, ...jk, rlk -> ...ril', R, T, R)
+
 
 def __apply_single_rotation(R: torch.Tensor, T: torch.Tensor):
     """
@@ -99,7 +87,6 @@ def rotation_matrix_to_euler_angles(R: torch.Tensor, convention: str = "zyz"):
     """
     Convert a 3x3 rotation matrix to ZYZ Euler angles.
     """
-    # Extract elements from rotation matrix
     r11, r12, r13 = R[..., 0, 0], R[..., 0, 1], R[..., 0, 2]
     r21, r22, r23 = R[..., 1, 0], R[..., 1, 1], R[..., 1, 2]
     r31, r32, r33 = R[..., 2, 0], R[..., 2, 1], R[..., 2, 2]
@@ -119,11 +106,9 @@ def rotation_matrix_to_euler_angles(R: torch.Tensor, convention: str = "zyz"):
     else:
         # Singular case: beta ≈ 0 or π
         if torch.abs(beta) < 1e-6:  # beta ≈ 0
-            # When beta ≈ 0, only alpha + gamma is determined
             alpha = torch.atan2(r12, r11)
             gamma = torch.tensor(0.0, dtype=R.dtype, device=R.device)
         else:  # beta ≈ π
-            # When beta ≈ π, only alpha - gamma is determined
             alpha = torch.atan2(-r12, r11)
             gamma = torch.tensor(0.0, dtype=R.dtype, device=R.device)
     return torch.tensor([alpha, beta, gamma])

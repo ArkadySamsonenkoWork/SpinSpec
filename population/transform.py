@@ -95,30 +95,50 @@ def get_transformation_coeffs(basis_old: torch.Tensor, basis_new: torch.Tensor):
         │ s                                         │
         │ ↓                                         │
         └───────────────────────────────────────────┘
+
+    :param basis_old: eigen vectors of initial spin system states. The shape is [...., K, K]
+    :param basis_new: eigen vectors of new spin system states (In magnetic field, for example).
+    The shape is [...., K, K]
+    :return: Transformation coefficients. The shape is [...., K, K]
     """
 
     transforms = basis_transformation(basis_old, basis_new)
     return transforms.abs().square()
 
 
-def transform_rates_matrix(initial_rates, coeffs):
+def transform_rates_matrix(initial_rates: torch.Tensor, coeffs: torch.Tensor) -> torch.Tensor:
     """
-    Transform rates given in matrix form to new basis set.
-    K (b_new_1 - > b_new_2) = |⟨b_new_1|b_old_1⟩|² * |⟨b_new_2|b_old_2⟩|² * K(b_old_1 - > b_old_2)
+    Transform transition rates from matrix form to new basis set.
+    K(b_new_1 -> b_new_2) = |⟨b_new_1|b_old_1⟩|² * |⟨b_new_2|b_old_2⟩|² * K(b_old_1 -> b_old_2)
+
+    WARNING: This transformation applies only when initial transition levels (i, j)
+    do not transform into identical levels.
+    If transitions exist between levels K1 <-> K2 and they transform into identical levels
+    (N = a*K1 + b*K2), correlation terms arise between levels that pure relaxation rates
+    cannot describe correctly.
+
+    :param initial_rates: Transition rates matrix. Shape [..., K, K]. Diagonal elements must be zero
+    :param coeffs: Transformation coefficients (see get_transformation_coeffs). Shape [..., K, K]
+    :return: Transformed rate matrix
     """
     return coeffs @ initial_rates @ coeffs.transpose(-1, -2)
 
 
-def transform_rates_vector(initial_rates, coeffs):
+def transform_rates_vector(initial_rates: torch.Tensor, coeffs: torch.Tensor) -> torch.Tensor:
     """
     Transform rates given in vector form to new basis set.
     K (b_new_1) = |⟨b_new_1|b_old_1⟩|² * K (b_old_1)
+    :param initial_rates: Transition rates matrix. Shape [..., K].
+    :param coeffs: Transformation coefficients (see get_transformation_coeffs). Shape [..., K, K]
+    :return: Transformed rate matrix
     """
     return torch.matmul(coeffs, initial_rates)
 
 
-def transform_kinetic_rates(kinetic_diag_matrix, coeffs):
+def transform_kinetic_rates(kinetic_diag_matrix: torch.Tensor, coeffs: torch.Tensor) -> torch.Tensor:
     """
-
+    :param kinetic_diag_matrix:
+    :param coeffs:
+    :return:
     """
     return torch.matmul(coeffs, kinetic_diag_matrix)

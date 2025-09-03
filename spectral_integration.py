@@ -35,7 +35,7 @@ class EasySpinIntegrand(BaseIntegrand):
         self.pi_sqrt = torch.tensor(math.sqrt(math.pi))
         self.two = torch.tensor(2.0)
         self._arg = torch.tensor(0.0)
-        self.cutoff = torch.tensor(4.0)
+        self.cutoff = torch.tensor(3.0)
 
     def _absorption(self, arg: torch.Tensor, c_val: torch.Tensor):
         return torch.exp(-arg.square()) * c_val / self.pi_sqrt
@@ -53,7 +53,7 @@ class EasySpinIntegrand(BaseIntegrand):
 
 
 class BaseSpectraIntegrator:
-    def __init__(self, harmonic: int = 1, natural_width: float = 1e-4, chunk_size=128):
+    def __init__(self, harmonic: int = 1, natural_width: float = 1e-6, chunk_size=128):
         self.harmonic = harmonic
         self.natural_width = natural_width
         self.chunk_size = chunk_size
@@ -75,7 +75,7 @@ class BaseSpectraIntegrator:
 
 # IT MUST BE CORRECTED TO SPEED UP COMPUTATIONS
 class SpectraIntegratorEasySpinLike(BaseSpectraIntegrator):
-    def __init__(self, harmonic: int = 1, natural_width: float = 1e-4, chunk_size=128):
+    def __init__(self, harmonic: int = 1, natural_width: float = 1e-5, chunk_size=128):
         """
         :param harmonic: The harmonic of the spectra. 0 is an absorptions, 1 is derivative
         """
@@ -85,7 +85,8 @@ class SpectraIntegratorEasySpinLike(BaseSpectraIntegrator):
 
         self.three = torch.tensor(3)
         self.infty_ratio = EasySpinIntegrand(harmonic)
-        self.nine = torch.tensor(9.0)
+        self.width_conversion = torch.tensor(1 / 9)
+        self.additional_factor = 1
 
     def integrate(self, res_fields: torch.Tensor,
                   width: torch.Tensor, A_mean: torch.Tensor,
@@ -108,20 +109,25 @@ class SpectraIntegratorEasySpinLike(BaseSpectraIntegrator):
 
         """
 
+        spectral_width = spectral_field[1] - spectral_field[0]
         A_mean = A_mean * area
-        width = width
-        width = self.natural_width + width
+
+        width = torch.where(width > self.natural_width, width, width + self.natural_width)
         res_fields, _ = torch.sort(res_fields, dim=-1, descending=True)
         B1, B2, B3 = torch.unbind(res_fields, dim=-1)
-
 
         d13 = (B1 - B3) / width
         d23 = (B2 - B3) / width
         d12 = (B1 - B2) / width
 
-        additional_width_square = ((d13.square() + d23.square() + d12.square()) / self.nine)
+        additional_width_square = ((d13.square() + d23.square() + d12.square()) * self.width_conversion)
 
-        extended_width = width * (1 + additional_width_square).sqrt()
+        width = torch.where(width > 2 * self.natural_width, width, width + 2 * self.natural_width)
+        extended_width = (width.square() * (1 + additional_width_square) + spectral_width.square()).sqrt()
+
+        extended_width = torch.where(extended_width < spectral_width, extended_width, extended_width + spectral_width)
+
+
         B_mean = (B1 + B2 + B3) / self.three
         c_extended = self.two_sqrt / extended_width
 
@@ -139,7 +145,7 @@ class SpectraIntegratorEasySpinLike(BaseSpectraIntegrator):
 
 
 class AxialSpectraIntegratorEasySpinLike(SpectraIntegratorEasySpinLike):
-    def __init__(self, harmonic: int = 1, natural_width: float = 1e-4, chunk_size=128):
+    def __init__(self, harmonic: int = 1, natural_width: float = 1e-6, chunk_size=128):
         super().__init__(harmonic, natural_width, chunk_size)
         """
         :param harmonic: The harmonic of the spectra. 0 is an absorptions, 1 is derivative
@@ -215,7 +221,8 @@ class SpectraIntegratorEasySpinLikeTimeResolved(SpectraIntegratorEasySpinLike):
 
         """
         area = area.unsqueeze(0)
-        A_mean = A_mean * area
+        A_mean = (A_mean * area).unsqueeze(-2)
+
 
         width = width
         width = self.natural_width + width
@@ -227,14 +234,11 @@ class SpectraIntegratorEasySpinLikeTimeResolved(SpectraIntegratorEasySpinLike):
         d23 = (B2 - B3) / width
         d12 = (B1 - B2) / width
 
-        additional_width_square = ((d13.square() + d23.square() + d12.square()) / self.nine)
+        additional_width_square = ((d13.square() + d23.square() + d12.square()) * self.width_conversion)
 
         extended_width = width * (1 + additional_width_square).sqrt()
         B_mean = (B1 + B2 + B3) / self.three
         c_extended = self.two_sqrt / extended_width
-        c_extended = c_extended.unsqueeze(0)
-        B_mean = B_mean.unsqueeze(0)
-        spectral_field = spectral_field.unsqueeze(-1)
 
 
         def integrand(B_val: torch.Tensor):
@@ -242,13 +246,14 @@ class SpectraIntegratorEasySpinLikeTimeResolved(SpectraIntegratorEasySpinLike):
             :param B_val: the value of  spectral magnetic field
             :return: The total intensity at this magnetic field
             """
-            arg = (B_mean - B_val) * c_extended
-            ratio = torch.exp(-arg.square()) * c_extended / self.pi_sqrt
-            return (ratio * A_mean).sum(dim=-1)
 
-        result = torch.stack([integrand(b_val) for b_val in spectral_field], dim=0)
+            ratio = self.infty_ratio(B_mean, c_extended, B_val)
+            weighted_ratio = ratio.unsqueeze(-3) * A_mean
+            return weighted_ratio.sum(dim=-1)
+
+        chunks = spectral_field.split(self.chunk_size, dim=-1)
+        result = torch.cat([integrand(ch.unsqueeze(-1)) for ch in chunks], dim=-1)
         return result
-
 
 class MeanIntegrator(BaseSpectraIntegrator):
     def __init__(self, harmonic: int = 1, natural_width: float = 1e-4, chunk_size: int = 128):

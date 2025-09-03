@@ -22,7 +22,7 @@ class ViewIndexator(nn.Module):
         elif self._is_increasing_sequence(indexes):
             min_idx = indexes[0]
             max_idx = indexes[-1]
-            return (arg[(min_idx-1):(max_idx+1)] for arg in args)
+            return (arg[(min_idx-1):max_idx] for arg in args)
 
         else:
             return (arg.index_select(dim=0, index=indexes) for arg in args)
@@ -30,8 +30,9 @@ class ViewIndexator(nn.Module):
     def double_indexation(self, indexes_1: torch.Tensor, indexes_2: torch.Tensor, args: tp.Sequence[torch.Tensor]):
         idx = torch.cat((indexes_1, indexes_2), dim=0)
         n_1 = indexes_1.numel()
+        reordered_array = self.single_indexation(idx, args)
 
-        return ((reordered := ViewIndexator.single_indexation(idx, arg)[:n_1], reordered[n_1:]) for arg in args)
+        return (reordered[:n_1] for reordered in reordered_array)
 
 
 
@@ -239,7 +240,7 @@ class BaseResonanceIntervalSolver(ABC):
         where K is spin system dimension
         :param B_low: The lower magnetic field The shape is [..., 1, 1]
         :param B_high: The higher magnetic field The shape is [..., 1, 1]
-        :param row_indexes: Indexes where Gz must be sliced. The bool tensor with the shape of the initial shape [...]
+        :param row_indexes: Indexes where Gz must be sliced. The long-indexes tensor. The shape == reduced number of  indexes
         :param G: The magnetic field dependant part of the Hamiltonian: F + G * B. The shape is [..., K, K]
         :return: epsilon is epsilon mistake. The tensor with the shape [...]
         """
@@ -291,6 +292,7 @@ class BaseResonanceIntervalSolver(ABC):
         # Note, that it is impossible that none interval has resonance
         if mask_xor.any():
             idx_xor = mask_xor.nonzero(as_tuple=True)[0]
+            mask_left = mask_left.index_select(0, idx_xor)
             new_intervals.append(
                 self._compute_xor_interval(
                     idx_xor,
@@ -322,7 +324,7 @@ class BaseResonanceIntervalSolver(ABC):
         """
         :param idx_xor: the xor indexes of the left and right mask
          It means that resonance happens in the one interval left or right. The shape is [...]
-        :param mask_left: the left mask with the values in batches where resonance happens. The shape is [...]
+        :param mask_left: the left mask with the values in batches where resonance happens. The shape is [reduced number of  indexes]
         :param mask_right: the right mask with the values in batches where resonance happens. The shape is [...]
         :param eig_values_low: energies in the ascending order at B_low magnetic field.
         The shape is [..., K], where K is spin system dimension.
@@ -339,11 +341,9 @@ class BaseResonanceIntervalSolver(ABC):
         :param B_low: The lower magnetic field The shape is [..., 1, 1]
         :param B_mid: The middel magnetic field The shape is [..., 1, 1]
         :param B_high: The high magnetic field The shape is [..., 1, 1]
-        :param row_indexes: Indexes where Gz must be sliced. The bool tensor with the shape of the INITIAL batch-mesh shape
+        :param row_indexes: Indexes where Gz must be sliced. The long-indexes tensor. The shape == reduced number of  indexes
         :return: tuple of eig_values, eig_vectors, magnetic fields, and new indexes
         """
-        mask_left = mask_left.index_select(0, idx_xor)
-
         if B_low.shape[0] == len(idx_xor):
             pass
 
@@ -396,7 +396,7 @@ class BaseResonanceIntervalSolver(ABC):
         tuple[torch.Tensor, torch.Tensor],
         tuple[torch.Tensor, torch.Tensor], torch.Tensor
     ]:
-
+        mask_left = mask_left.index_select(0, idx_xor)
         (
          (eig_values_low, eig_values_high),
          (eig_vectors_low, eig_vectors_high),
@@ -410,11 +410,12 @@ class BaseResonanceIntervalSolver(ABC):
                     B_low, B_mid, B_high,
                     row_indexes,
                 )
-        mask_left = mask_left.index_select(0, idx_xor)
-
-        derivatives_low = derivatives_low.index_select(dim=0, index=idx_xor)
-        derivatives_mid = derivatives_mid.index_select(dim=0, index=idx_xor)
-        derivatives_high = derivatives_high.index_select(dim=0, index=idx_xor)
+        if derivatives_low.shape[0] == len(idx_xor):
+            pass
+        else:
+            derivatives_low = derivatives_low.index_select(dim=0, index=idx_xor)
+            derivatives_mid = derivatives_mid.index_select(dim=0, index=idx_xor)
+            derivatives_high = derivatives_high.index_select(dim=0, index=idx_xor)
 
         torch.where(mask_left.unsqueeze(1), derivatives_low, derivatives_mid, out=derivatives_low)
         torch.where(mask_left.unsqueeze(1), derivatives_mid, derivatives_high, out=derivatives_high)
@@ -514,8 +515,6 @@ class BaseResonanceIntervalSolver(ABC):
         converged_idx = converged_mask.nonzero(as_tuple=True)[0]
         active_idx = active_mask.nonzero(as_tuple=True)[0]
 
-        # На этом шаге нужно также разделить инетервал на две части. eig_values_mid, eig_vectors_mid уже посчитаны!!
-        # Но нужно тогда пересчитывать derivatives
         if converged_mask.any():
             row_indexes_conv = row_indexes.clone()[converged_idx]
             # indexes_conv[indexes_conv == True] = converged_mask
@@ -1019,7 +1018,7 @@ class BaseResonanceLocator:
         """
         :param mask_trans: The mask of True and False of real transitions. The shape is [..., n], where n is valid columns number
         :param mask_triu: The mask of True and False. The shape is [N], where N is number of all transitions. The number of True == n
-        :param row_indexes: The indexes are mask of True and False. The shape is [global_batch_indexes].
+        :param row_indexes: The indexes where batch was computed. The shape is [...].
         It shows what transitions among global transitions are considered. indexes[indexes==True].shape = [...]
         :return: tuple[mask_triu_updated, row_indexes]
 
@@ -1264,7 +1263,6 @@ class GeneralResonanceLocator(BaseResonanceLocator):
                                                   resonance_frequency)
         if not results or all(roots.numel() == 0 for roots, _ in results):
             return []
-
         outs = []
         for roots, mask_roots in results:
             pair_mask = torch.clone(mask_trans)
@@ -1356,7 +1354,6 @@ class GeneralResonanceLocator(BaseResonanceLocator):
         mask_one_root = ~mask_three_roots
         roots_case1 = torch.empty((mask_three_roots.sum(), 3), dtype=a.dtype, device=a.device).fill_(float('inf'))
         roots_case2 = torch.empty((mask_one_root.sum(), 1), dtype=a.dtype, device=a.device).fill_(float('inf'))
-
 
         if mask_three_roots.any():
             roots_case1 = self._find_three_roots(a[mask_three_roots], p[mask_three_roots], q[mask_three_roots])

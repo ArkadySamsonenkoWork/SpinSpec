@@ -2,6 +2,7 @@ from torch import nn
 import torch
 import constants
 
+
 class StationaryPopulator:
     def __init__(self, temperature: float = 300.0):
         """

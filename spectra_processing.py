@@ -2,7 +2,9 @@ from scipy.sparse import diags
 from scipy.sparse.linalg import spsolve
 import torch
 import numpy as np
+from scipy.ndimage import uniform_filter1d
 
+import typing as tp
 
 def normalize_spectrum(B: torch.Tensor,
                        y: torch.Tensor,
@@ -80,6 +82,16 @@ def correct_baseline_polynomial(x_vals: np.ndarray, y_vals: np.ndarray, mask: np
     return y_corrected, baseline
 
 
+def correct_baseline_saturation(y_vals: np.ndarray, sat_last_indexes: int):
+    """
+    Remove baseline by fitting polynomial to regions excluding the peak
+    """
+    satur_value = y_vals[-sat_last_indexes:].mean()
+    baseline = np.ones_like(y_vals) * satur_value
+    y_corrected = y_vals - satur_value
+    return y_corrected, baseline
+
+
 def correct_baseline_als(y_vals: np.ndarray, mask: np.ndarray, lam=1e6, p=0.01, niter=10):
     """
     ALS baseline with masking capability
@@ -120,16 +132,48 @@ def correct_baseline_als(y_vals: np.ndarray, mask: np.ndarray, lam=1e6, p=0.01, 
     return y_vals - z, z
 
 
+def _percentile_baseline(x_vals, y_vals, window_size=None, percentile=10,
+                         proximity_threshold=0.15):
+    """
+    Detect baseline using local percentile analysis.
+    Points close to local low percentile are likely baseline.
+    """
+    if window_size is None:
+        window_size = len(y_vals) // 20
+
+    baseline_mask = np.zeros(len(y_vals), dtype=bool)
+
+    # Calculate local percentiles using sliding window
+    half_window = window_size // 2
+    for i in range(len(y_vals)):
+        start = max(0, i - half_window)
+        end = min(len(y_vals), i + half_window + 1)
+
+        local_percentile = np.percentile(y_vals[start:end], percentile)
+
+        # Check if current point is close to local percentile
+        if y_vals[i] <= local_percentile * (1 + proximity_threshold):
+            baseline_mask[i] = True
+
+    return baseline_mask
+
+
 def correct_baseline(x_vals: np.ndarray, y_vals: np.ndarray,
-                     baseline_areas: list[tuple[float, float]],
-                     method="poly", poly_order=0, lam=2e7, p=0.05, niter=10):
-    mask = create_baseline_mask(x_vals, baseline_areas)
-    if method == "poly":
-        y_corrected, baseline = correct_baseline_polynomial(x_vals, y_vals, mask, poly_order=poly_order)
-    elif method == "als":
-        y_corrected, baseline = correct_baseline_als(y_vals, mask, lam=lam, p=p, niter=niter)
+                     baseline_areas: tp.Optional[list[tuple[float, float]]] = None,
+                     method="poly", poly_order=0, lam=2e7, p=0.05, niter=10, sat_last_indexes=10):
+    if method is "saturation":
+        y_corrected, baseline = correct_baseline_saturation(y_vals, sat_last_indexes=sat_last_indexes)
     else:
-        raise ValueError("Wrong method. It must be 'poly' or 'als'")
+        if baseline_areas is None:
+            mask = _percentile_baseline(x_vals, y_vals)
+        else:
+            mask = create_baseline_mask(x_vals, baseline_areas)
+        if method == "poly":
+            y_corrected, baseline = correct_baseline_polynomial(x_vals, y_vals, mask, poly_order=poly_order)
+        elif method == "als":
+            y_corrected, baseline = correct_baseline_als(y_vals, mask, lam=lam, p=p, niter=niter)
+        else:
+            raise ValueError("Wrong method. It must be 'poly' or 'als'")
 
     return y_corrected, baseline
 

@@ -14,13 +14,14 @@ from . import time_population
 from .temperature_dependance import profiles
 
 sample_kinetic = tp.NewType("sample_kinetic", tuple[torch.Tensor, torch.Tensor,
-                                                   torch.Tensor, torch.Tensor,
-                                                   torch.Tensor, torch.Tensor,
-                                                   torch.Tensor, torch.Tensor, torch.Tensor])
+                                                    torch.Tensor, torch.Tensor,
+                                                    torch.Tensor, torch.Tensor,
+                                                    torch.Tensor, torch.Tensor, torch.Tensor])
+
 
 @dataclass
 class BaseSampleContext:
-    free_probs: tp.Union[torch.Tensor, tp.Callable[[torch.Tensor],torch.Tensor]]
+    free_probs: tp.Union[torch.Tensor, tp.Callable[[torch.Tensor], torch.Tensor]]
 
 
 @dataclass
@@ -41,15 +42,19 @@ class TempDepContext(TripletMechanismContext):
 
 
 @dataclass
-class KineticContext(BaseSampleContext):
+class KineticContext:
     sample_contexts: list[BaseSampleContext]
     kinetic_rates: list[torch.Tensor]
     concentrations: list[float]
 
 
 class ConstTempGeneralMechanism(tr_utils.TransitionMatrixGenerator):
-    def __init__(self, context: BaseSampleContext, temp: torch.Tensor):
-        super().__init__(context)
+    """
+    It is constant temperature relaxation mechanism. The most simple Relaxation. It is assumed that for all
+    [...] batch dimensions, including orientations the probabilities of transitions are the same.
+    """
+    def __init__(self, context: BaseSampleContext, temp: torch.Tensor, *args, **kwargs):
+        super().__init__(context, *args, **kwargs)
         self.free_probs = context.free_probs
         self.temp = temp
 
@@ -63,13 +68,18 @@ class ConstTempGeneralMechanism(tr_utils.TransitionMatrixGenerator):
 
 
 class BaseTripletMechanismGenerator(tr_utils.TransitionMatrixGenerator):
-    def __init__(self, context: TripletMechanismContext, system_eigen_vectors: torch.Tensor):
-        super().__init__(context)
-        self.system_vectors = system_eigen_vectors
+    """
+    Triplet mechainsm describe the next mechanism. Let's consider the system in the magnetic field and without it.
+    Let's denote the eigen vectors in magnetic field as V_new, without field V_old.
+    Then In the absence of magnetic field the
+    """
+    def __init__(self, context: TripletMechanismContext, system_vectors: torch.Tensor, *args, **kwargs):
+        super().__init__(context, *args, **kwargs)
+        self.system_vectors = system_vectors
         self.context = context
         self.basis_coeffs = transform.get_transformation_coeffs(
-            context.transform_probs.unsqueeze(-3),
-            system_eigen_vectors
+            context.zero_field_vectors.unsqueeze(-3),
+            system_vectors
         )
 
     def _compute_probs(self,
@@ -83,8 +93,8 @@ class BaseTripletMechanismGenerator(tr_utils.TransitionMatrixGenerator):
 
 
 class ConstTempTripletMechanismGenerator(BaseTripletMechanismGenerator):
-    def __init__(self, context: T1Context | None, temp: torch.Tensor, system_vectors: torch.Tensor):
-        super().__init__(context, system_vectors)
+    def __init__(self, context: T1Context | None, temp: torch.Tensor, system_vectors: torch.Tensor, *args, **kwargs):
+        super().__init__(context, system_vectors, *args, **kwargs)
         self.temp = temp
 
         self.probs = self._compute_probs(
@@ -102,11 +112,11 @@ class ConstTempTripletMechanismGenerator(BaseTripletMechanismGenerator):
 
 
 class TempDepTripletMechanismGenerator(BaseTripletMechanismGenerator):
-    def __init__(self, context: TempDepContext, system_vectors: torch.Tensor):
-        super().__init__(context, system_vectors)
+    def __init__(self, context: TempDepContext, system_vectors: torch.Tensor, *args, **kwargs):
+        super().__init__(context, system_vectors, *args, **kwargs)
         self.profile = context.profile
-        self.free_probs_transform = context.profile
-        self.free_probs = context.profile
+        self.free_probs_transform = context.transform_probs
+        self.free_probs = context.free_probs
 
     def _temperature(self, time: torch.Tensor) -> torch.Tensor | None:
         """Return temperature(s) at times t"""
@@ -120,13 +130,12 @@ class TempDepTripletMechanismGenerator(BaseTripletMechanismGenerator):
         )
 
 
-class TransitionMatrixGeneratorKinetic(tr_utils.TransitionMatrixGenerator):
+class TransitionMatrixGeneratorKinetic(tr_utils.BaseMatrixGenerator):
     def __init__(self,
                  context: KineticContext,
                  temp: torch.Tensor,
                  eigen_vectors_list,
-                 transition_matrix_generators: list[tr_utils.TransitionMatrixGenerator]):
-        super().__init__(context)
+                 transition_matrix_generators: list[tr_utils.TransitionMatrixGenerator], *args, **kwargs):
         self.transition_matrix_generators = transition_matrix_generators
         self.num_blocks = len(eigen_vectors_list)
         self.temp = torch.tensor(temp)
@@ -197,6 +206,10 @@ class TransitionMatrixGeneratorKinetic(tr_utils.TransitionMatrixGenerator):
 
 
 class T1Population(time_population.BaseTimeDependantPopulator):
+    """
+    Computes the T1 relaxation of a spin system.
+    It changes the populations of the transition levels and measure relaxation of population
+    """
     def __init__(self,
                  context: T1Context,
                  tr_matrix_generator_cls: tp.Type[tr_utils.TransitionMatrixGenerator] =
@@ -212,13 +225,18 @@ class T1Population(time_population.BaseTimeDependantPopulator):
         energies = copy.deepcopy(energies)
         return res_fields, lvl_down, lvl_up, energies, vector_down, vector_up
 
-    def _post_compute(self, initial_populations, time_dep_population,
-                      lvl_down, lvl_up, *args, **kwargs):
-        indexes = torch.arange(initial_populations.shape[-2], device=initial_populations.device)
-        time_intensities = time_dep_population[..., indexes, lvl_down] - time_dep_population[..., indexes, lvl_up]
+    def _post_compute(self, time_intensities: torch.Tensor, *args, **kwargs):
+        """
+        :param time_intensities: The population difference between transitioning energy levels depending on time.
+            The shape is [time, ....]
+        :return: intensity of transitions due to population difference
+        """
         return time_intensities
 
-    def _initial_populations(self, energies, lvl_down, lvl_up, *args, **kwargs):
+    def _initial_populations(self, energies: torch.Tensor,
+                             lvl_down: torch.Tensor,
+                             lvl_up: torch.Tensor,
+                             *args, **kwargs):
         populations = nn.functional.softmax(-constants.unit_converter(energies) / self.init_temp, dim=-1)
         new_populations = copy.deepcopy(populations)
         indexes = torch.arange(energies.shape[-2], device=energies.device)
@@ -226,8 +244,14 @@ class T1Population(time_population.BaseTimeDependantPopulator):
         new_populations[..., indexes, lvl_up] = populations[..., indexes, lvl_down]
         return new_populations
 
-    def _init_tr_matrix_generator(self, res_fields, lvl_down, lvl_up, time, vector_down,
-                                  vector_up, energies, *args, **kwargs):
+    def _init_tr_matrix_generator(self,
+                                  time: torch.Tensor,
+                                  res_fields: torch.Tensor,
+                                  lvl_down: torch.Tensor,
+                                  lvl_up: torch.Tensor,
+                                  vector_down: torch.Tensor,
+                                  vector_up: torch.Tensor,
+                                  energies: torch.Tensor, *args, **kwargs):
         tr_matrix_generator = self.tr_matrix_generator_cls(self.context, self.init_temp, args[0])
         return tr_matrix_generator
 
@@ -244,17 +268,32 @@ class TempDepTrPopulation(time_population.BaseTimeDependantPopulator):
         """
         super().__init__(context, tr_matrix_generator_cls, solver, init_temp)
 
-    def _init_tr_matrix_generator(self, res_fields, lvl_down, lvl_up, time, vector_down,
+    def _init_tr_matrix_generator(self, time, res_fields, lvl_down, lvl_up, vector_down,
                                   vector_up, energies, *args, **kwargs):
         tr_matrix_generator = self.tr_matrix_generator_cls(self.context, args[0])
         return tr_matrix_generator
+
+    def _initial_populations(
+            self, energies: torch.Tensor, lvl_down: torch.Tensor, lvl_up: torch.Tensor,
+            *args, **kwargs
+    ):
+
+        return nn.functional.softmax(-constants.unit_converter(energies) / self.init_temp, dim=-1)
+
+    def _post_compute(self, time_intensities: torch.Tensor, *args, **kwargs):
+        """
+        :param time_intensities: The population difference between transitioning energy levels depending on time.
+            The shape is [time, ....]
+        :return: intensity of transitions due to population difference
+        """
+        return time_intensities - time_intensities[0].unsqueeze(0)
 
 
 class KineticPopulator(time_population.BaseTimeDependantPopulator):
     def __init__(self,
                  context: KineticContext,
-                 tr_matrix_generator_cls: tp.Type[TransitionMatrixGeneratorKinetic],
                  sample_tr_matrix_generators: list[tp.Type[tr_utils.TransitionMatrixGenerator]],
+                 tr_matrix_generator_cls: tp.Type[TransitionMatrixGeneratorKinetic] = TransitionMatrixGeneratorKinetic,
                  solver: tp.Callable = tr_utils.EvolutionVectorSolver.odeint_solver,
                  init_temp: float = 300):
         """
@@ -283,11 +322,13 @@ class KineticPopulator(time_population.BaseTimeDependantPopulator):
     def _init_tr_matrix_generator(self,
                                   eigen_vectors_seq: list[torch.Tensor],
                                   *args, **kwargs
-                                  ) -> tr_utils.TransitionMatrixGenerator:
+                                  ) -> tr_utils.BaseMatrixGenerator:
         contexts = self.context.sample_contexts
         tr_matrix_generators = []
-        for eigen_vector, context in zip(eigen_vectors_seq, contexts):
-            tr_matrix_generators.append(self.tr_matrix_generator_cls(context))
+        for idx, (eigen_vector, context) in enumerate(zip(eigen_vectors_seq, contexts)):
+            tr_matrix_generators.append(self.sample_tr_matrix_generators_cls[idx](context,
+                                                                                  self.init_temp,
+                                                                                  eigen_vector))
         tr_matrix_generator = self.tr_matrix_generator_cls(self.context,
                                                            self.init_temp,
                                                            eigen_vectors_seq,
@@ -296,7 +337,7 @@ class KineticPopulator(time_population.BaseTimeDependantPopulator):
 
     def _compute_relaxation_sample(self, idx: int,
                                    sample_main: sample_kinetic,
-                                   samples_reference: sample_kinetic,
+                                   samples_reference: list[sample_kinetic],
                                    spin_indexes: list[list[int]],
                                    time: torch.Tensor):
         energies_reference_seq = []
@@ -324,8 +365,18 @@ class KineticPopulator(time_population.BaseTimeDependantPopulator):
 
         populations = populations[..., spin_indexes[idx]]
         initial_populations = initial_populations[..., spin_indexes[idx]]
-        res = self._post_compute(initial_populations, populations, lvl_down_main, lvl_up_main)
+        res = self._compute_transition_population_difference(initial_populations, populations,
+                                                             lvl_down_main, lvl_up_main)
+        res = self._post_compute(res)
         return res
+
+    def _post_compute(self, time_intensities: torch.Tensor, *args, **kwargs):
+        """
+        :param time_intensities: The population difference between transitioning energy levels depending on time.
+            The shape is [time, ....]
+        :return: intensity of transitions due to population difference
+        """
+        return time_intensities - time_intensities[0].unsqueeze(0)
 
     def _get_spin_indexes(self, spin_dimensions: list[int]) -> list[list[int]]:
         starts = [0] + list(itertools.accumulate(spin_dimensions[:-1]))
@@ -333,6 +384,8 @@ class KineticPopulator(time_population.BaseTimeDependantPopulator):
 
     def __call__(self, time: torch.Tensor,
                  samples: list[sample_kinetic], spin_dimensions: list[int], *args, **kwargs):
+
+
         samples_num = len(samples)
         spin_indexes = self._get_spin_indexes(spin_dimensions)
         results = []

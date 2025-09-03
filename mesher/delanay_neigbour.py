@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 
 from sklearn.neighbors import BallTree
+from sklearn.metrics import pairwise_distances
 from .general_mesh import BaseMesh, BaseMeshPowder
 
 
@@ -32,7 +33,7 @@ class ThetaLine:
         self.theta = theta
         self.latent_points = points
         self.last_point = last_point
-        self.boundaries_cond = boundaries_cond
+        self.boundaries_cond = None  # Sould be rebuild
         self.visible_points = self._compute_visible_points()
 
     def _compute_visible_points(self):
@@ -122,6 +123,112 @@ class ThetaLine:
                 for point in range(self.latent_points)]
 
 
+class RBFInterpolator:
+    def __init__(self,
+                 interpolating_indexes: list[int],
+                 base_vertices: list[tuple[float, float]] | np.ndarray,
+                 extended_vertices: list[tuple[float, float]],
+                 kernel: str = "gaussian",
+                 epsilon: float = 1.0):
+        """
+        Radial Basis Function (RBF) interpolator on the sphere.
+
+        :param interpolating_indexes: Mapping of base mesh indices to actual data indices.
+        :param base_vertices: List of (lat, lon) base mesh vertices in radians.
+        :param extended_vertices: List of (lat, lon) extended mesh vertices in radians.
+        :param kernel: Choice of kernel: "gaussian", "multiquadric", "inverse_multiquadric", "linear", "cubic", "thin_plate".
+        :param epsilon: Shape parameter for kernels like Gaussian/MQ/IMQ.
+        """
+        self.kernel = kernel
+        self.epsilon = epsilon
+
+        base = self._to_lat_long(base_vertices)
+        extended = self._to_lat_long(extended_vertices)
+
+        self.base = base
+        self.extended = extended
+        self.interp_indexes = torch.as_tensor(interpolating_indexes)
+        self.extended_size = extended.shape[0]
+
+        dists = pairwise_distances(base, base, metric="haversine")
+        self.K = self._rbf(dists)
+
+        dists_ext = pairwise_distances(extended, base, metric="haversine")
+        self.K_ext = self._rbf(dists_ext)
+
+        self.K_torch = torch.tensor(self.K, dtype=torch.float32)
+        self.K_ext_torch = torch.tensor(self.K_ext, dtype=torch.float32)
+
+        jitter = 1e-4
+        K = 0.5 * (self.K_torch.double() + self.K_torch.double().T)
+
+
+        K = K + jitter * torch.eye(K.shape[0], dtype=K.dtype)
+        U, S, Vh = torch.linalg.svd(K)
+
+        S_inv = torch.where(S > 1e-10, 1.0 / S, torch.zeros_like(S))
+        self.K_inv = (Vh.mT @ torch.diag(S_inv) @ U.mT).to(torch.float32)
+
+
+
+    def _to_lat_long(self, array: list[tuple[float, float]]):
+        array = np.array(array)[:, ::-1]
+        array[:, 0] = np.pi / 2 - array[:, 0]
+        return array
+
+    def _rbf(self, r: np.ndarray) -> np.ndarray:
+        """Radial basis functions."""
+        eps = self.epsilon
+        if self.kernel == "gaussian":
+            return np.exp(-(eps * r) ** 2)
+        elif self.kernel == "multiquadric":
+            return np.sqrt(1.0 + (eps * r) ** 2)
+        elif self.kernel == "inverse_multiquadric":
+            return 1.0 / np.sqrt(1.0 + (eps * r) ** 2)
+        elif self.kernel == "linear":
+            return r
+        elif self.kernel == "cubic":
+            return r ** 3
+        elif self.kernel == "thin_plate":
+            return (r ** 2) * np.log(r + 1e-6)
+        else:
+            raise ValueError(f"Unknown kernel: {self.kernel}")
+
+    def __call__(self, f_values: torch.Tensor) -> torch.Tensor:
+        """
+        Interpolate values at extended points using RBF interpolation.
+
+        :param f_values: Tensor of shape (..., N), where N = number of base vertices.
+        :return: Interpolated values of shape (..., M), where M = number of extended vertices.
+        """
+
+        y = f_values.mT
+
+        alpha = self.K_inv @ y
+        f_extended = (self.K_ext_torch @ alpha).mT
+
+        return f_extended
+
+
+class Kernels:
+    @staticmethod
+    def rbf(kernel: str, r: np.ndarray, epsilon: float) -> np.ndarray:
+        """Radial basis functions."""
+        eps = epsilon
+        if kernel == "gaussian":
+            return np.exp(-(eps * r) ** 2)
+        elif kernel == "inverse_multiquadric":
+            return 1.0 / np.sqrt(1.0 + (eps * r) ** 2)
+        elif kernel == "linear":
+            return 1 / (r + 1e-8 * eps)
+        elif kernel == "quadratic":
+            return 1 / (r + 1e-8 * eps) ** 2
+        elif kernel == "thin_plate":
+            return 1 / ((r + 1e-8 * eps) * np.log(r + 1e-6))
+        else:
+            raise ValueError(f"Unknown kernel: {kernel}")
+
+
 class NearestNeighborsInterpolator:
     def __init__(self,
                  interpolating_indexes: list[int],
@@ -129,6 +236,7 @@ class NearestNeighborsInterpolator:
                  extended_vertices: list[tuple[float, float]],
                  k: int):
         """
+
         Initialize the interpolator with the base mesh vertices and extended mesh vertices.
         Uses a BallTree for efficient nearest neighbor search.
         """
@@ -137,11 +245,10 @@ class NearestNeighborsInterpolator:
         tree = BallTree(self._to_lat_long(base_vertices), metric="haversine")
         distances, indexes = tree.query(self._to_lat_long(extended_vertices), k=self.k)
 
-        distances = distances * 6371000
-        clipped = np.clip(distances, a_min=1e-8, a_max=None) ** 2
-        inv_distances = torch.tensor(1.0 / clipped, dtype=torch.float32)
+        clipped = np.clip(distances, a_min=1e-11, a_max=None)
 
-        # Normalize weights
+
+        inv_distances = torch.tensor(Kernels().rbf(kernel="quadratic", r=clipped, epsilon=1), dtype=torch.float32)
         self.weights = inv_distances / inv_distances.sum(dim=-1, keepdim=True)
 
         self.interp_indexes = torch.as_tensor(interpolating_indexes)
@@ -159,6 +266,8 @@ class NearestNeighborsInterpolator:
         :param f_values: Tensor of shape (..., N), where N is the number of base vertices.
         :return: Interpolated values of shape (..., M), where M is the number of extended vertices.
         """
+
+        """
         shape = f_values.shape
         f_extended = torch.zeros((*shape[:-1], self.extended_size), dtype=f_values.dtype)
         mapped_indexes = self.interp_indexes[self.indexes]
@@ -166,6 +275,27 @@ class NearestNeighborsInterpolator:
         for idx in range(self.k):
             f_extended += f_values[..., mapped_indexes[..., idx]] * self.weights[..., idx]
         return f_extended
+        """
+
+        orig_shape = f_values.shape  # (..., orig_size)
+        batch_shape = orig_shape[:-1]
+        orig_size = orig_shape[-1]
+
+        mapped = self.interp_indexes[self.indexes].long().to(f_values.device)
+        weights = self.weights.to(f_values.device)
+
+        if mapped.ndim == 2:
+            mapped = mapped.unsqueeze(0).expand(*batch_shape, mapped.shape[-2], mapped.shape[-1])
+        elif mapped.ndim == f_values.ndim - 1:
+            mapped = mapped.unsqueeze(0).expand(*batch_shape, mapped.shape[-2], mapped.shape[-1])
+        else:
+            if mapped.shape[:-2] != batch_shape:
+                mapped = mapped.expand(*batch_shape, mapped.shape[-2], mapped.shape[-1])
+        ext_size = mapped.shape[-2]
+        k = mapped.shape[-1]
+        expanded = f_values.unsqueeze(-2).expand(*batch_shape, ext_size, orig_size)
+        gathered = torch.take_along_dim(expanded, mapped, dim=-1)
+        return (gathered * weights).sum(dim=-1)
 
 class MeshProcessorBase:
     def __init__(self, init_grid_frequency, phi_limits, boundaries_cond):
@@ -295,9 +425,10 @@ class InterpolatingMeshProcessor(MeshProcessorBase):
 
         self.post_indexes = torch.tensor(self._get_post_indexes(self.base_theta_lines))
         self.final_vertices, self.simplices = self._get_post_mesh()
-        self.interpolator = self._get_interpolator(self.final_vertices)
 
         self.init_vertices = self._assemble_vertices(self.base_theta_lines, "init_phi_theta")
+        self.interpolator = self._get_interpolator(self.final_vertices)
+
         self.extended_size = self.final_vertices.shape[0]
 
     def _get_post_mesh(self):
@@ -318,7 +449,8 @@ class InterpolatingMeshProcessor(MeshProcessorBase):
 
     def _get_interpolator(self, extended_vertices):
         indexes, phi_theta = self._get_interpolating_phi_theta(self.base_theta_lines)
-        return NearestNeighborsInterpolator(indexes, phi_theta, extended_vertices, k=8)
+        #indexes, _ = self._get_interpolating_phi_theta(self.base_theta_lines)
+        return NearestNeighborsInterpolator(indexes, phi_theta, extended_vertices, k=5)
 
     def post_process(self, f_values: torch.Tensor):
         return self.interpolator(f_values)

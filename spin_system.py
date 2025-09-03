@@ -20,6 +20,7 @@ import utils
 
 from mesher import BaseMesh
 
+
 # Подумать над изменением логики.
 def kronecker_product(matrices: list) -> torch.Tensor:
     """Computes the Kronecker product of a list of matrices."""
@@ -69,19 +70,20 @@ def transform_tensor_components(tensor_components: torch.Tensor, transformation_
     """
     return torch.einsum('...ij,...jkl->...ikl', transformation_matrix, tensor_components)
 
+
 # Возможно, стоит переделать логику работы расчёта тензоров через тенорное произведение. Сделать отдельный тип данных.
 # Сейчас каждый спин даёт матрицу [K, K] и расчёт взаимодействией не оптимальный
 def init_tensor(
-        components: tp.Union[torch.Tensor,tp.Sequence[float], float],  device: torch.device, dtype: torch.dtype
+        components: tp.Union[torch.Tensor, tp.Sequence[float], float],  device: torch.device, dtype: torch.dtype
 ):
     if isinstance(components, torch.Tensor):
         tensor = components.to(device=device, dtype=dtype)
         if tensor.shape[-1] == 3:
             return tensor
-        elif tensor.numel() == 2:
+        elif tensor.shape[-1] == 2:
             axis_val, z_val = tensor[0], tensor[1]
             return torch.tensor([axis_val, axis_val, z_val], device=device, dtype=dtype)
-        elif tensor.numel() == 1:
+        elif tensor.shape[-1] == 1:
             value = tensor.item()
             return torch.full((3,), value, device=device, dtype=dtype)
         else:
@@ -107,7 +109,7 @@ def init_tensor(
 
 
 def init_de_tensor(
-        components: tp.Union[torch.Tensor,tp.Sequence[float], float],  device: torch.device, dtype: torch.dtype
+        components: tp.Union[torch.Tensor, tp.Sequence[float], float],  device: torch.device, dtype: torch.dtype
 ):
     if isinstance(components, torch.Tensor):
         tensor = components.to(device=device, dtype=dtype)
@@ -154,7 +156,6 @@ def init_de_tensor(
         raise TypeError(f"components must be a tensor, list, tuple, or scalar, got {type(components)}")
 
 
-
 class BaseInteraction(ABC):
     @property
     @abstractmethod
@@ -183,14 +184,24 @@ class BaseInteraction(ABC):
     def config_shape(self):
         pass
 
+    @property
+    @abstractmethod
+    def strain_correlation(self):
+        """
+        :return: The correlation matrix of strain parameters
+        """
+        pass
+
     def __len__(self):
         return len(self.components)
 
-    def __str__(self):
+    def __repr__(self):
         if hasattr(self.components, 'tolist'):
-            components_str = [f"{val:.4f}" for val in self.components.tolist()]
+            components_str = [f"{val:.2e}" if abs(val) >= 1e4 else f"{val:.4f}"
+                              for val in self.components.tolist()]
         else:
-            components_str = [f"{val:.4f}" for val in self.components]
+            components_str = [f"{val:.2e}" if abs(val) >= 1e4 else f"{val:.4f}"
+                              for val in self.components]
 
         lines = [
             f"Principal values: [{', '.join(components_str)}]",
@@ -213,7 +224,8 @@ class BaseInteraction(ABC):
         if self.strain is not None:
             if hasattr(self.strain, 'tolist'):
                 strain_vals = self.strain.tolist()
-                strain_str = [f"{val:.4f}" for val in strain_vals]
+                strain_str = [f"{val:.2e}" if abs(val) >= 1e4 else f"{val:.4f}"
+                              for val in strain_vals]
                 lines.append(f"Strain: [{', '.join(strain_str)}]")
             else:
                 lines.append(f"Strain: {self.strain}")
@@ -265,6 +277,8 @@ class Interaction(BaseInteraction):
         if (self._strain is not None) and (self._strain.shape != self.shape):
             raise ValueError("The strain shape must be equal to shape of the initial components."
                              "Please point it as x, y, z components")
+
+        self._strain_correlation = torch.eye(3, device=device, dtype=dtype)
 
     def _construct_rot_matrix(self, frame: tp.Optional[torch.tensor], batch_shape):
         if frame is None:
@@ -324,18 +338,28 @@ class Interaction(BaseInteraction):
             return None
         else:
             return self._strain.unsqueeze(-1).unsqueeze(-1) *\
-                torch.einsum("...ik, ...jk->...kij", self._rot_matrix, self._rot_matrix)
+               torch.einsum("...ik, ...jk->...kij", self._rot_matrix, self._rot_matrix)
+
 
     @property
     def tensor(self):
+        """
+        :return: the full tensor of interaction with shape [..., 3, 3] with applied rotation
+        """
         return self._tensor()
 
     @property
     def strain(self):
+        """
+        :return: None or tensor with shape [..., 3]
+        """
         return self._strain
 
     @property
     def strained_tensor(self):
+        """
+        :return: None or the tensor with shape [...., 3, 3, 3], where first '3' is x, y, z components
+        """
         return self._strained_tensor()
 
     @property
@@ -344,33 +368,141 @@ class Interaction(BaseInteraction):
 
     @property
     def components(self):
+        """
+        :return: tensor with shape [..., 3] - the principle components of a tensor
+        """
         return self._components
 
     @property
     def frame(self):
+        """
+        :return: angles with ZYZ' notation.
+        """
         return self._frame
 
     @frame.setter
     def frame(self, frame):
         if frame is None:
-            self._frame = torch.tensor([0.0, 0.0, 0.0]) # alpha, beta, gamma
+            self._frame = torch.tensor([0.0, 0.0, 0.0])  # alpha, beta, gamma
         self._rot_matrix = self.euler_to_rotmat(self._frame)
 
+    @property
+    def strain_correlation(self):
+        """
+        In some cases the components of the interaction can correlate.
+        To implement this correlation the strain_correlation matrix is used. For example, in the case of D/E interaction
+        strain_correlation = [[-1/3, 1], [-1/3, -1], [2/3, 0]] - the matrix of trnasformation of Dx, Dy, Dz to D and E
+        :return:
+        """
+        return self._strain_correlation
 
-class ZeroFieldInteraction(Interaction):
+    @strain_correlation.setter
+    def strain_correlation(self, correlation_matrix: torch.Tensor):
+        self._strain_correlation = correlation_matrix
+
+    def __add__(self, other):
+        if not isinstance(other, Interaction):
+            raise TypeError("Can only add Interaction objects together")
+
+        if torch.allclose(self.frame, other.frame, atol=1e-6):
+            new_frame = self.frame.clone()
+            new_components = self.components + other.components
+        else:
+            tensor_self = self._tensor()
+            tensor_other = other._tensor()  # [..., 3, 3]
+            combined_tensor = tensor_self + tensor_other
+
+            eigenvalues, eigenvectors = torch.linalg.eigh(combined_tensor)
+
+            sorted_indices = torch.argsort(eigenvalues, dim=-1, descending=True)
+            new_components = torch.gather(eigenvalues, -1, sorted_indices)
+
+            new_rot_matrix = eigenvectors[..., sorted_indices].transpose(-2, -1)
+            new_frame = utils.rotation_matrix_to_euler_angles(new_rot_matrix)
+
+        if self.strain is not None and other.strain is not None:
+            new_strain = self.strain + other.strain
+            correlation_matrix = torch.cat((self.strain_correlation, other.strain_correlation), dim=-1)
+            #  It is suggested that D,E are not correlated
+
+        elif self.strain is not None:
+            new_strain = self.strain.clone()
+            correlation_matrix = self.strain_correlation.clone()
+
+        elif other.strain is not None:
+            new_strain = other.strain.clone()
+            correlation_matrix = other.strain_correlation.clone()
+
+        else:
+            new_strain = None
+            correlation_matrix = torch.eye(3, dtype=new_components.dtype, device=new_components.device)
+
+        interaction = Interaction(
+            components=new_components,
+            frame=new_frame,
+            strain=new_strain,
+            device=self.components.device,
+            dtype=self.components.dtype
+        )
+        interaction.strain_correlation = correlation_matrix
+        return interaction
+
+
+class DEInteraction(Interaction):
     def __init__(self, components: torch.Tensor,
                  frame: torch.Tensor = None, strain: torch.Tensor = None,
                  device=torch.device("cpu"), dtype=torch.float32):
+        """
+        DEInteraction is given by two components D and E. To transform to x, y, z components the next equation is used:
+        Dx = -D * 1/3 + E
+        Dy = -D * 1/3 - E
+        Dz = D * 2/3
+
+                Note on DE Interaction vs. Simple Interaction
+        The DE Interaction is equivalent to simple Interaction in terms of components when
+        the trace of the tensor equals zero,
+        but they are not equivalent in terms of strains.
+        In DE Interaction, the D and E components (or only D) have a distribution,
+        whereas in simple interaction, the components Dx, Dy, and Dz are distributed.
+
+        :param components:
+        torch.Tensor | Sequence[float] | float
+            The tensor components, provided in one of the following forms:
+              - A scalar. It is only D value.
+              - A sequence of two values (D and E values).
+        The possible units are [T, Hz, dimensionless]
+
+        :param frame:
+        torch.Tensor | Sequence[float] optional
+            Orientation of the tensor. Can be provided as:
+              - A 1D tensor of shape (3,) representing Euler angles in ZYZ' convention.
+              - A 2D tensor of shape (3, 3) representing a rotation matrix.
+            Default is `None`, meaning lab frame.
+
+        :param strain:
+        torch.Tensor| Sequence[float] | float, optional
+            Parameters describing interaction broadening or distribution.
+            Default is `None`.
+
+        :param device:
+
+        :param dtype:
+        """
         components = init_de_tensor(components, device, dtype)
-        strain = init_tensor(strain, device=device, dtype=dtype) if strain is not None else None
+        strain = init_de_tensor(strain, device=device, dtype=dtype) if strain is not None else None
         super().__init__(components, frame, strain, device, dtype)
+
+        # D, E to Dx, Dy, Dz transformation
+        self._strain_correlation = torch.tensor([[-1/3, 1], [-1/3, -1], [2/3, 0]], dtype=dtype, device=device)
+
 
 
 class MultiOrientedInteraction(BaseInteraction):
-    def __init__(self, oriented_tensor, strained_tensor, config_shape):
+    def __init__(self, oriented_tensor, strained_tensor, config_shape, strain_correlation: torch.Tensor):
         self._oriented_tensor = oriented_tensor
         self._strained_tensor = strained_tensor
         self._config_shape = config_shape
+        self._strain_correlation = strain_correlation
 
     @property
     def tensor(self):
@@ -383,6 +515,14 @@ class MultiOrientedInteraction(BaseInteraction):
     @property
     def config_shape(self):
         return self.tensor.shape[:-2]
+
+    @property
+    def strain_correlation(self):
+        return self._strain_correlation
+
+    @strain_correlation.setter
+    def strain_correlation(self, correlation_matrix: torch.Tensor):
+        self._strain_correlation = correlation_matrix
 
 
 class SpinSystem:
@@ -489,13 +629,41 @@ class SpinSystem:
                electron_nuclei: list[tuple[int, int, BaseInteraction]] | None = None,
                electron_electron: list[tuple[int, int, BaseInteraction]] | None = None,
                nuclei_nuclei: list[tuple[int, int, BaseInteraction]] | None = None):
+        """
+        Update the parameters of spin system. No recomputation of spin vectors does not occur
+        :param g_tensors:
+        list[BaseInteraction]
+            g-tensors corresponding to each electron in `electrons`.
+            Each element must be an instance of `BaseInteraction` (e.g., `Interaction`).
 
-        self.g_tensors = g_tensors if g_tensors else self.g_tensors
-        self.electron_nuclei = electron_nuclei if electron_nuclei else []
-        self.electron_electron = electron_electron if electron_electron else []
-        self.nuclei_nuclei = nuclei_nuclei if nuclei_nuclei else []
+        :param electron_nuclei:
+        list[tuple[int, int, BaseInteraction]], optional
+            Hyperfine interactions between electrons and nuclei.
+            Each tuple is of the form (electron_index, nucleus_index, interaction_tensor).
+            Default is `None`.
 
-    def __str__(self):
+        :param electron_electron:
+        list[tuple[int, int, BaseInteraction]], optional
+            Dipolar or exchange interactions between pairs of electrons.
+            Each tuple is of the form (electron_index, electron_index, interaction_tensor).
+            Default is `None`.
+
+        :param nuclei_nuclei:
+        list[tuple[int, int, BaseInteraction]], optional
+            Dipolar or J-coupling interactions between pairs of nuclei.
+            Each tuple is of the form (nucleus_index, nucleus_index, interaction_tensor).
+            Default is `None`
+        """
+
+        self.g_tensors = g_tensors if g_tensors is not None else self.g_tensors
+        self.electron_nuclei = electron_nuclei if electron_nuclei is not None else []
+        self.electron_electron = electron_electron if electron_electron is not None else []
+        self.nuclei_nuclei = nuclei_nuclei if nuclei_nuclei is not None else []
+
+    def __repr__(self):
+        hz_to_mhz = 1e-6
+        T_to_mt = 1e3
+
         lines = ["=" * 60]
         lines.append("SPIN SYSTEM SUMMARY")
         lines.append("=" * 60)
@@ -506,9 +674,9 @@ class SpinSystem:
         if self.electrons:
             electron_info = []
             for i, electron in enumerate(self.electrons):
-                spin_str = f"S={electron.spin}"
-                if hasattr(electron, 'g_factor'):
-                    spin_str += f", g={electron.g_factor:.4f}"
+                spin_str = f"S={electron.spin} \n"
+                g_gactor_str = str(self.g_tensors[i]).replace('\n', '\n      ')
+                spin_str += g_gactor_str
                 electron_info.append(f"  e{i}: {spin_str}")
 
             lines.append(f"Electrons ({len(self.electrons)}):")
@@ -571,17 +739,18 @@ class SpinSystem:
         lines.append("\n" + "=" * 60)
         return '\n'.join(lines)
 
+
 class BaseSample:
     def __init__(self, spin_system: SpinSystem,
-                 hamiltonian_strained: tp.Optional[tp.Union[torch.Tensor, float]] = None,
-                 gauss: torch.Tensor | None = None,
-                 lorentz: torch.Tensor | None = None, *args, **kwargs):
+                 ham_strain: tp.Optional[tp.Union[torch.Tensor, float]] = None,
+                 gauss: tp.Optional[tp.Union[torch.Tensor, float]] = None,
+                 lorentz: tp.Optional[tp.Union[torch.Tensor, float]] = None, *args, **kwargs):
         """
         :param spin_system:
         SpinSystem
             The spin system describing electrons, nuclei, and their interactions.
 
-        :param hamiltonian_strained:
+        :param ham_strain:
         torch.Tensor, optional
             Anisotropic line width, due to the unresolved hyperfine interactions.
             The tensor components, provided in one of the following forms:
@@ -605,27 +774,35 @@ class BaseSample:
 
         self.base_spin_system = spin_system
         self.modified_spin_system = copy.deepcopy(spin_system)
-        self.hamiltonian_strained = self._init_ham_str(hamiltonian_strained)
-        self.base_hamiltonian_strained = copy.deepcopy(self.hamiltonian_strained)
+        self._ham_strain = self._init_ham_str(ham_strain)
+        self.base_ham_strain = copy.deepcopy(self._ham_strain)
 
         if gauss is None:
             self.gauss = torch.tensor(0.0, device=spin_system.device)
         else:
-            self.gauss = gauss
+            self.gauss = torch.tensor(gauss)
 
         if lorentz is None:
             self.lorentz = torch.tensor(0.0, device=spin_system.device)
         else:
-            self.lorentz = lorentz
+            self.lorentz = torch.tensor(lorentz)
 
-    def _init_ham_str(self, hamiltonian_strained: torch.Tensor):
-        if hamiltonian_strained is None:
-            hamiltonian_strained = torch.zeros(3, dtype=torch.float32)
+    def _init_ham_str(self, ham_strain: torch.Tensor):
+        if ham_strain is None:
+            ham_strain = torch.zeros(3, dtype=torch.float32)
         else:
-            hamiltonian_strained = init_tensor(hamiltonian_strained, device=torch.device("cpu"), dtype=torch.float32)
-        return hamiltonian_strained
+            ham_strain = init_tensor(ham_strain, device=torch.device("cpu"), dtype=torch.float32)
+        return ham_strain
 
-    def update(self):
+    def update(self,
+               g_tensors: list[BaseInteraction] = None,
+               electron_nuclei: list[tuple[int, int, BaseInteraction]] | None = None,
+               electron_electron: list[tuple[int, int, BaseInteraction]] | None = None,
+               nuclei_nuclei: list[tuple[int, int, BaseInteraction]] | None = None,
+               ham_strain: tp.Optional[torch.Tensor] = None,
+               gauss: tp.Union[torch.Tensor, float] = None,
+               lorentz: tp.Union[torch.Tensor, float] = None
+               ):
         raise NotImplementedError
 
     @property
@@ -660,7 +837,7 @@ class BaseSample:
         """Constructs the zero-field Hamiltonian F."""
         F = torch.zeros((*self.config_shape, self.modified_spin_system.dim, self.modified_spin_system.dim), dtype=torch.complex64,
                         device=self.modified_spin_system.device)
-        for n_idx_1, n_idx_2, interaction in self.modified_spin_system.electron_nuclei:
+        for n_idx_1, n_idx_2, interaction in self.modified_spin_system.nuclei_nuclei:
             interaction = interaction.tensor.to(torch.complex64)
             F += scalar_tensor_multiplication(
                 self.modified_spin_system.operator_cache[len(self.modified_spin_system.electrons) + n_idx_1],
@@ -678,7 +855,8 @@ class BaseSample:
 
     def _build_electron_zeeman_terms(self) -> torch.Tensor:
         """Constructs the Zeeman interaction terms Gx, Gy, Gz. for electron spins with give g-tensors"""
-        G = torch.zeros((*self.config_shape, 3, self.modified_spin_system.dim, self.modified_spin_system.dim), dtype=torch.complex64,
+        G = torch.zeros((*self.config_shape, 3, self.modified_spin_system.dim, self.modified_spin_system.dim),
+                        dtype=torch.complex64,
                         device=self.modified_spin_system.device)
         for idx, g_tensor in enumerate(self.modified_spin_system.g_tensors):
             g = g_tensor.tensor.to(torch.complex64)
@@ -688,7 +866,8 @@ class BaseSample:
 
     def _build_nucleus_zeeman_terms(self) -> torch.Tensor:
         """Constructs the Nucleus interaction terms Gx, Gy, Gz. for nucleus spins"""
-        G = torch.zeros((*self.config_shape, 3, self.modified_spin_system.dim, self.modified_spin_system.dim), dtype=torch.complex64,
+        G = torch.zeros((*self.config_shape, 3, self.modified_spin_system.dim, self.modified_spin_system.dim),
+                        dtype=torch.complex64,
                         device=self.modified_spin_system.device)
         for idx, nucleus in enumerate(self.modified_spin_system.nuclei):
             g = nucleus.g_factor
@@ -740,6 +919,7 @@ class BaseSample:
             else:
                 g = g.to(torch.complex64)
                 yield (
+                    g_tensor.strain_correlation.to(torch.complex64),
                     self.modified_spin_system.operator_cache[idx],
                     g[..., :, 2, :] * constants.BOHR / constants.PLANCK)
 
@@ -750,49 +930,54 @@ class BaseSample:
 
     def build_electron_nuclei_straine(self) -> torch.Tensor:
         """Constructs the nuclei strained part."""
-        for e_idx, n_idx, electron_nuclei in self.modified_spin_system.electron_nuclei:
-            electron_nuclei = electron_nuclei.strained_tensor
+        for e_idx, n_idx, electron_nuclei_interaction in self.modified_spin_system.electron_nuclei:
+            electron_nuclei = electron_nuclei_interaction.strained_tensor
             if electron_nuclei is None:
                 pass
             else:
                 electron_nuclei = electron_nuclei.to(torch.complex64)
                 yield (
+                    electron_nuclei_interaction.strain_correlation.to(torch.complex64),
                     self.modified_spin_system.operator_cache[e_idx],
                     self.modified_spin_system.operator_cache[len(self.modified_spin_system.electrons) + n_idx],
                     electron_nuclei)
 
     def build_electron_electron_straine(self) -> torch.Tensor:
         """Constructs the electron-electron strained part."""
-        for e_idx_1, e_idx_2, electron_electron in self.modified_spin_system.electron_electron:
-            electron_electron = electron_electron.strained_tensor.to(torch.complex64)
+        for e_idx_1, e_idx_2, electron_electron_interaction in self.modified_spin_system.electron_electron:
+            electron_electron = electron_electron_interaction.strained_tensor
             if electron_electron is None:
                 pass
             else:
+                electron_electron = electron_electron.to(torch.complex64)
                 yield (
+                    electron_electron_interaction.strain_correlation.to(torch.complex64),
                     self.modified_spin_system.operator_cache[e_idx_1],
                     self.modified_spin_system.operator_cache[e_idx_2],
                     electron_electron)
 
-    def __str__(self):
-        spin_system_summary = self.base_spin_system.__str__()
-        lines = []
+    def __repr__(self):
+        spin_system_summary = str(self.base_spin_system)
 
+        lines = []
         lines.append(spin_system_summary)
         lines.append("\n" + "=" * 60)
         lines.append("GENERAL INFO: ")
         lines.append("=" * 60)
 
-        lines.append(f"lorentz: {self.lorentz.item()}")
-        lines.append(f"gauss: {self.gauss.item()}")
-        ham_str = self.base_hamiltonian_strained
-        lines.append(f"gauss: {ham_str.tolist()}")
+        lines.append(f"lorentz: {self.lorentz.item():.5f} T")
+        lines.append(f"gauss: {self.gauss.item():.5f} T")
+        ham_str = self.base_ham_strain
+        ham_components = [f"{val:.4e}" if abs(val) >= 1e4 else f"{val:.4f}"
+                         for val in ham_str.tolist()]
+        lines.append(f"ham_str: {ham_components} Hz")
 
         return '\n'.join(lines)
 
 
 class SpinSystemOrientator:
     """
-    The helper class that allow to
+    The helper class that allow toa
     transform spin system to spin system at different rotation angles.
     Effectively rotate all Hamiltonian parts
     """
@@ -851,10 +1036,17 @@ class SpinSystemOrientator:
         interactions = [g_tensor for g_tensor in spin_system.g_tensors] + \
                        [el_nuc[-1] for el_nuc in spin_system.electron_nuclei] +\
                        [el_el[-1] for el_el in spin_system.electron_electron]
+        strain_correlations = [g_tensor.strain_correlation for g_tensor in spin_system.g_tensors] + \
+                       [el_nuc[-1].strain_correlation for el_nuc in spin_system.electron_nuclei] +\
+                       [el_el[-1].strain_correlation for el_el in spin_system.electron_electron]
+
         interactions_tensors, strained_tensors = self.interactions_to_multioriented(interactions, rotation_matrices)
         interactions =\
-            [MultiOrientedInteraction(interactions_tensor, strained_tensor, config_shape) for
-             interactions_tensor, strained_tensor in zip(interactions_tensors, strained_tensors)]
+            [
+                MultiOrientedInteraction(interactions_tensor, strained_tensor, config_shape, strain_correlation) for
+                interactions_tensor, strained_tensor, strain_correlation in
+                zip(interactions_tensors, strained_tensors, strain_correlations)
+            ]
 
         spin_system = self._apply_reverse_transform(spin_system, interactions)
         return spin_system
@@ -862,7 +1054,7 @@ class SpinSystemOrientator:
 
 class MultiOrientedSample(BaseSample):
     def __init__(self, spin_system: SpinSystem,
-                 hamiltonian_strained: tp.Optional[torch.Tensor] = None,
+                 ham_strain: tp.Optional[torch.Tensor] = None,
                  gauss: torch.Tensor = None,
                  lorentz: torch.Tensor = None,
                  mesh: tp.Optional[BaseMesh] = None,
@@ -872,7 +1064,7 @@ class MultiOrientedSample(BaseSample):
         SpinSystem
             The spin system describing electrons, nuclei, and their interactions.
 
-        :param hamiltonian_strained:
+        :param ham_strain:
         torch.Tensor, optional
             Anisotropic line width, due to the unresolved hyperfine interactions.
             The tensor components, provided in one of the following forms:
@@ -894,12 +1086,12 @@ class MultiOrientedSample(BaseSample):
         If it is None it wiil be initialize as DelaunayMeshNeighbour with initialsize = 20
         """
 
-        super().__init__(spin_system, hamiltonian_strained, gauss, lorentz)
+        super().__init__(spin_system, ham_strain, gauss, lorentz)
         self.mesh = self._init_mesh(mesh)
         rotation_matrices = self.mesh.rotation_matrices
 
-        self._hamiltonian_strained = self._expand_hamiltonian(
-            self.hamiltonian_strained,
+        self._ham_strain = self._expand_hamiltonian(
+            self.base_ham_strain,
             self.orientation_vector(rotation_matrices)
         )
         self.modified_spin_system = SpinSystemOrientator()(spin_system, rotation_matrices)
@@ -909,44 +1101,87 @@ class MultiOrientedSample(BaseSample):
             mesh = mesher.DelaunayMeshNeighbour()
         return mesh
 
-    def _expand_hamiltonian(self, hamiltonian_strained: torch.Tensor, orientation_vector: torch.Tensor):
-        return torch.einsum("...i, ri -> ...r", hamiltonian_strained**2, orientation_vector**2).sqrt()
+    def _expand_hamiltonian(self, ham_strain: torch.Tensor, orientation_vector: torch.Tensor):
+        return torch.einsum("...i, ri -> ...r", ham_strain**2, orientation_vector**2).sqrt()
 
     def orientation_vector(self, rotation_matrices: torch.Tensor):
         return rotation_matrices[..., -1, :]
 
-    def build_hamiltonian_strained(self) -> torch.Tensor:
+    def build_ham_strain(self) -> torch.Tensor:
         """Constructs the zero-field strained part of Hamiltonian"""
-        return self._hamiltonian_strained
+        return self._ham_strain
 
     def update(self,
                g_tensors: list[BaseInteraction] = None,
                electron_nuclei: list[tuple[int, int, BaseInteraction]] | None = None,
                electron_electron: list[tuple[int, int, BaseInteraction]] | None = None,
                nuclei_nuclei: list[tuple[int, int, BaseInteraction]] | None = None,
-               hamiltonian_strained: tp.Optional[torch.Tensor] = None,
-               gauss: torch.Tensor = None,
-               lorentz: torch.Tensor = None
+               ham_strain: tp.Optional[torch.Tensor] = None,
+               gauss: tp.Union[torch.Tensor, float] = None,
+               lorentz: tp.Union[torch.Tensor, float] = None
                ):
+        """
+        Update the parameters of a sample. No recomputation of spin vectors does not occur
+        :param g_tensors:
+        list[BaseInteraction]
+            g-tensors corresponding to each electron in `electrons`.
+            Each element must be an instance of `BaseInteraction` (e.g., `Interaction`).
+
+        :param electron_nuclei:
+        list[tuple[int, int, BaseInteraction]], optional
+            Hyperfine interactions between electrons and nuclei.
+            Each tuple is of the form (electron_index, nucleus_index, interaction_tensor).
+            Default is `None`.
+
+        :param electron_electron:
+        list[tuple[int, int, BaseInteraction]], optional
+            Dipolar or exchange interactions between pairs of electrons.
+            Each tuple is of the form (electron_index, electron_index, interaction_tensor).
+            Default is `None`.
+
+        :param nuclei_nuclei:
+        list[tuple[int, int, BaseInteraction]], optional
+            Dipolar or J-coupling interactions between pairs of nuclei.
+            Each tuple is of the form (nucleus_index, nucleus_index, interaction_tensor).
+            Default is `None`
+
+        :param ham_strain:
+        torch.Tensor, optional
+            Anisotropic line width, due to the unresolved hyperfine interactions.
+            The tensor components, provided in one of the following forms:
+              - A scalar (for isotropic interaction).
+              - A sequence of two values (axial and z components).
+              - A sequence of three values (principal components).
+
+        :param gauss:
+        torch.Tensor, optional
+            Gaussian broadening parameter(s). Defines inhomogeneous linewidth
+            contributions (e.g., due to static disorder). Default is `None`.
+
+        :param lorentz:
+        torch.Tensor, optional
+            Lorentzian broadening parameter(s). Defines homogeneous linewidth
+            contributions (e.g., due to relaxation). Default is `None`
+        """
 
         rotation_matrices = self.mesh.rotation_matrices
         self.base_spin_system.update(g_tensors, electron_nuclei, electron_electron, nuclei_nuclei)
 
-        if hamiltonian_strained is not None:
-            hamiltonian_strained = self._init_ham_str(hamiltonian_strained)
-            self.hamiltonian_strained = self._expand_hamiltonian(
-                hamiltonian_strained,
+        if ham_strain is not None:
+            self.base_ham_strain = self._init_ham_str(ham_strain)
+            self._ham_strain = self._expand_hamiltonian(
+                self.base_ham_strain,
                 self.orientation_vector(rotation_matrices)
             )
 
         if gauss is None:
             self.gauss = torch.tensor(0.0, device=self.base_spin_system.device)
         else:
-            self.gauss = gauss
+            self.gauss = torch.tensor(gauss)
 
         if lorentz is None:
             self.lorentz = torch.tensor(0.0, device=self.base_spin_system.device)
         else:
-            self.lorentz = lorentz
+            self.lorentz = torch.tensor(lorentz)
 
-        self.spin_system = SpinSystemOrientator()(self.base_spin_system, rotation_matrices)
+        self.modified_spin_system = SpinSystemOrientator()(self.base_spin_system, rotation_matrices)
