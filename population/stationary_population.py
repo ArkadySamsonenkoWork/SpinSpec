@@ -3,18 +3,24 @@ import torch
 import constants
 
 
-class StationaryPopulator:
-    def __init__(self, temperature: float = 300.0):
+class StationaryPopulator(nn.Module):
+    """
+    Compute the intensity of transition part depending ot population at some temperature
+    (i -> j): (exp(-Ej/ kT) - exp(-Ei / kT)) / (sum (exp) )
+    """
+    def __init__(self, temperature: float = 300.0, device: torch.device = torch.device("cpu")):
         """
         :param temperature: temperature in K
         """
-        self.temperature = temperature
+        super().__init__()
+        self.register_buffer("temperature", torch.tensor(temperature, device=device))
+        self.device = device
 
-    def __call__(self, energies, lvl_down, lvl_up):
+    def forward(self, energies, lvl_down, lvl_up):
         """
         :param energies: energies in Hz
         :return: population_differences
         """
         populations = nn.functional.softmax(-constants.unit_converter(energies) / self.temperature, dim=-1)
-        indexes = torch.arange(populations.shape[-2], device=populations.device)
+        indexes = torch.arange(populations.shape[-2], device=self.device)
         return populations[..., indexes, lvl_down] - populations[..., indexes, lvl_up]

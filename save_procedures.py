@@ -383,7 +383,7 @@ class CreatorDict:
         return format_handlers[format_type](creator)
 
     def _get_easyspin(self, creator: BaseSpectraCreator):
-        temperature = creator.temperature
+        temperature = creator.intensity_calculator.temperature
         temperature = temperature if temperature is None else np.array(temperature).astype(np.float64)
         frequency = creator.resonance_freq.detach().cpu().numpy().astype(np.float64)
 
@@ -391,13 +391,13 @@ class CreatorDict:
         return out_dict
 
     def _get_pytorch(self, creator: BaseSpectraCreator):
-        temperature = creator.temperature
+        temperature = creator.intensity_calculator.temperature
         frequency = creator.resonance_freq
         out_dict = {"temperature": temperature, "res_freq": frequency}
         return out_dict
 
     def _get_npy(self, creator: BaseSpectraCreator):
-        temperature = creator.temperature
+        temperature = creator.intensity_calculator.temperature
         temperature = temperature if temperature is None else np.array(temperature).astype(np.float64)
         frequency = creator.resonance_freq.detach().cpu().numpy().astype(np.float64)
 

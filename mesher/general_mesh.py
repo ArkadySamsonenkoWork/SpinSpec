@@ -4,14 +4,17 @@ import typing as tp
 from matplotlib import pyplot as plt
 
 import torch
+import torch.nn as nn
 
 sys.path.append("..")
 import utils
 
 
-class BaseMesh(ABC):
+class BaseMesh(nn.Module, ABC):
     @abstractmethod
-    def __init__(self, *args, **kwargs):
+    def __init__(self, device: torch.device = torch.device("cpu"), *args, **kwargs):
+        super().__init__()
+        self.device = device
         self._rotation_matrices: tp.Optional[torch.Tensor] = None
 
     @property
@@ -31,14 +34,16 @@ class BaseMesh(ABC):
 
 
 class CrystalMesh(BaseMesh):
-    def __init__(self, euler_angles: torch.Tensor, convention: str = "zyz"):
+    def __init__(self, euler_angles: torch.Tensor,
+                 device: torch.device = torch.device("cpu"), convention: str = "zyz"):
         """
         :param euler_angles: torch.Tensor of shape (..., 3) containing Euler angles in radians
         :param convention: str, rotation convention (default 'xyz')
                        Supported: 'zyz', 'xyz', 'xzy', 'yxz', 'yzx', 'zxy', 'zyx'
         :return: torch.Tensor of shape (..., 3, 3) containing rotation matrices
         """
-        self._rotation_matrices = utils.euler_angles_to_matrix(euler_angles, convention)
+        super().__init__(device=device)
+        self._rotation_matrices = utils.euler_angles_to_matrix(euler_angles.to(device=device), convention)
 
     @property
     def rotation_matrices(self):
@@ -55,7 +60,8 @@ class CrystalMesh(BaseMesh):
 
 class BaseMeshPowder(BaseMesh):
     @abstractmethod
-    def __init__(self, *args, **kwargs):
+    def __init__(self, device: torch.device = torch.device("cpu"), *args, **kwargs):
+        super().__init__(device=device)
         self._rotation_matrices: tp.Optional[torch.Tensor] = None
 
     @property
@@ -167,7 +173,7 @@ class BaseMeshPowder(BaseMesh):
         pass
 
     @abstractmethod
-    def post_process(self, f_function: torch.Tensor):
+    def forward(self, f_function: torch.Tensor):
         pass
 
     @property
@@ -184,8 +190,8 @@ class BaseMeshPowder(BaseMesh):
 
 class BaseMeshAxial(BaseMeshPowder):
     @abstractmethod
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, device: torch.device = torch.device("cpu"), *args, **kwargs):
+        super().__init__(device=device, *args, **kwargs)
 
     @property
     def initial_size(self):
@@ -254,5 +260,5 @@ class BaseMeshAxial(BaseMeshPowder):
         pass
 
     @abstractmethod
-    def post_process(self, f_function: torch.Tensor):
+    def forward(self, f_function: torch.Tensor):
         pass

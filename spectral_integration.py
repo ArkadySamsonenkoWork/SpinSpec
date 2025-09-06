@@ -1,10 +1,12 @@
 from abc import ABC, abstractmethod
 import math
+import typing as tp
 
 import torch
+import torch.nn as nn
 
-class BaseIntegrand(ABC):
-    def _sum_method_fabric(self, harmonic: int = 0):
+class BaseIntegrand(nn.Module, ABC):
+    def _sum_method_fabric(self, harmonic: int = 0) -> tp.Callable[[tp.Any, tp.Any], torch.Tensor]:
         if harmonic == 0:
             return self._absorption
         elif harmonic == 1:
@@ -13,15 +15,15 @@ class BaseIntegrand(ABC):
             raise ValueError("Harmonic must be 0 or 1")
 
     @abstractmethod
-    def _absorption(self, *args, **kwargs):
+    def _absorption(self, *args, **kwargs) -> torch.Tensor:
         pass
 
     @abstractmethod
-    def _derivative(self, *args, **kwargs):
+    def _derivative(self, *args, **kwargs) -> torch.Tensor:
         pass
 
     @abstractmethod
-    def __call__(self, *args, **kwargs):
+    def forward(self, *args, **kwargs) -> torch.Tensor:
         pass
 
 
@@ -30,12 +32,12 @@ class EasySpinIntegrand(BaseIntegrand):
     Calculates the term like in EasySpin article
     """
 
-    def __init__(self, harmonic: int):
+    def __init__(self, harmonic: int, device: torch.device = torch.device("cpu")):
+        super().__init__()
         self.sum_method = self._sum_method_fabric(harmonic)
-        self.pi_sqrt = torch.tensor(math.sqrt(math.pi))
-        self.two = torch.tensor(2.0)
-        self._arg = torch.tensor(0.0)
-        self.cutoff = torch.tensor(3.0)
+        self.register_buffer("pi_sqrt", torch.tensor(math.sqrt(math.pi), device=device))
+        self.register_buffer("two", torch.tensor(2.0, device=device))
+        self.register_buffer("cutoff", torch.tensor(3.0, device=device))
 
     def _absorption(self, arg: torch.Tensor, c_val: torch.Tensor):
         return torch.exp(-arg.square()) * c_val / self.pi_sqrt
@@ -43,7 +45,7 @@ class EasySpinIntegrand(BaseIntegrand):
     def _derivative(self, arg: torch.Tensor, c_val: torch.Tensor):
         return self.two * arg * torch.exp(-arg.square()) * c_val * c_val / self.pi_sqrt
 
-    def __call__(self, B_mean, c_extended, B_val):
+    def forward(self, B_mean: torch.Tensor, c_extended: torch.Tensor, B_val: torch.Tensor):
         arg = (B_mean - B_val) * c_extended
         out = torch.zeros_like(arg)
         mask = arg.abs() <= self.cutoff
@@ -52,14 +54,25 @@ class EasySpinIntegrand(BaseIntegrand):
         return out
 
 
-class BaseSpectraIntegrator:
-    def __init__(self, harmonic: int = 1, natural_width: float = 1e-6, chunk_size=128):
+class BaseSpectraIntegrator(nn.Module):
+    def __init__(self, harmonic: int = 1, natural_width: float = 1e-6, chunk_size=128,
+                 device: torch.device = torch.device("cpu")
+                 ):
+        super().__init__()
         self.harmonic = harmonic
-        self.natural_width = natural_width
+
+        self.register_buffer("natural_width", torch.tensor(natural_width, device=device))
         self.chunk_size = chunk_size
+        self.infty_ratio = EasySpinIntegrand(harmonic, device=device)
+
+        self.register_buffer("pi_sqrt", torch.tensor(math.sqrt(math.pi), device=device))
+        self.register_buffer("two_sqrt", torch.tensor(math.sqrt(2.0), device=device))
+        self.register_buffer("three", torch.tensor(3.0, device=device))
+        self.register_buffer("width_conversion", torch.tensor(1/9, device=device))
+        self.register_buffer("additional_factor", torch.tensor(1.0, device=device))
 
     @abstractmethod
-    def integrate(self, res_fields: torch.Tensor,
+    def forward(self, res_fields: torch.Tensor,
                   width: torch.Tensor, A_mean: torch.Tensor,
                   area: torch.Tensor, spectral_field: torch.Tensor):
         """
@@ -73,22 +86,15 @@ class BaseSpectraIntegrator:
         pass
 
 
-# IT MUST BE CORRECTED TO SPEED UP COMPUTATIONS
 class SpectraIntegratorEasySpinLike(BaseSpectraIntegrator):
-    def __init__(self, harmonic: int = 1, natural_width: float = 1e-5, chunk_size=128):
+    def __init__(self, harmonic: int = 1, natural_width: float = 1e-5, chunk_size=128,
+                 device: torch.device = torch.device("cpu")):
         """
         :param harmonic: The harmonic of the spectra. 0 is an absorptions, 1 is derivative
         """
-        super().__init__(harmonic, natural_width, chunk_size)
-        self.pi_sqrt = torch.tensor(math.sqrt(math.pi))
-        self.two_sqrt = torch.tensor(math.sqrt(2.0))
+        super().__init__(harmonic, natural_width, chunk_size, device=device)
 
-        self.three = torch.tensor(3)
-        self.infty_ratio = EasySpinIntegrand(harmonic)
-        self.width_conversion = torch.tensor(1 / 9)
-        self.additional_factor = 1
-
-    def integrate(self, res_fields: torch.Tensor,
+    def forward(self, res_fields: torch.Tensor,
                   width: torch.Tensor, A_mean: torch.Tensor,
                   area: torch.Tensor, spectral_field: torch.Tensor):
         r"""
@@ -109,7 +115,7 @@ class SpectraIntegratorEasySpinLike(BaseSpectraIntegrator):
 
         """
 
-        spectral_width = spectral_field[1] - spectral_field[0]
+        spectral_width = spectral_field[..., 1] - spectral_field[..., 0]
         A_mean = A_mean * area
 
         width = torch.where(width > self.natural_width, width, width + self.natural_width)
@@ -123,13 +129,18 @@ class SpectraIntegratorEasySpinLike(BaseSpectraIntegrator):
         additional_width_square = ((d13.square() + d23.square() + d12.square()) * self.width_conversion)
 
         width = torch.where(width > 2 * self.natural_width, width, width + 2 * self.natural_width)
+        if width.shape[:-1]:
+            spectral_width = spectral_width.unsqueeze(-1)
+        else:
+            spectral_width = spectral_width
         extended_width = (width.square() * (1 + additional_width_square) + spectral_width.square()).sqrt()
 
         extended_width = torch.where(extended_width < spectral_width, extended_width, extended_width + spectral_width)
 
 
-        B_mean = (B1 + B2 + B3) / self.three
-        c_extended = self.two_sqrt / extended_width
+        B_mean = ((B1 + B2 + B3) / self.three).unsqueeze(-2)
+        c_extended = (self.two_sqrt / extended_width).unsqueeze(-2)
+        A_mean = A_mean.unsqueeze(-2)
 
         def integrand(B_val: torch.Tensor):
             """
@@ -145,15 +156,16 @@ class SpectraIntegratorEasySpinLike(BaseSpectraIntegrator):
 
 
 class AxialSpectraIntegratorEasySpinLike(SpectraIntegratorEasySpinLike):
-    def __init__(self, harmonic: int = 1, natural_width: float = 1e-6, chunk_size=128):
-        super().__init__(harmonic, natural_width, chunk_size)
+    def __init__(self, harmonic: int = 1, natural_width: float = 1e-6, chunk_size=128,
+                 device: torch.device = torch.device("cpu")):
+        super().__init__(harmonic, natural_width, chunk_size, device=device)
         """
         :param harmonic: The harmonic of the spectra. 0 is an absorptions, 1 is derivative
         """
-        self.two = torch.tensor(2)
+        self.register_buffer("two", torch.tensor(2.0, device=device))
 
 
-    def integrate(self, res_fields: torch.Tensor,
+    def forward(self, res_fields: torch.Tensor,
                   width: torch.Tensor, A_mean: torch.Tensor,
                   area: torch.Tensor, spectral_field: torch.Tensor):
         r"""
@@ -200,7 +212,7 @@ class AxialSpectraIntegratorEasySpinLike(SpectraIntegratorEasySpinLike):
 
 
 class SpectraIntegratorEasySpinLikeTimeResolved(SpectraIntegratorEasySpinLike):
-    def integrate(self, res_fields: torch.Tensor,
+    def forward(self, res_fields: torch.Tensor,
                   width: torch.Tensor, A_mean: torch.Tensor,
                   area: torch.Tensor, spectral_field: torch.Tensor):
         r"""
@@ -255,20 +267,17 @@ class SpectraIntegratorEasySpinLikeTimeResolved(SpectraIntegratorEasySpinLike):
         result = torch.cat([integrand(ch.unsqueeze(-1)) for ch in chunks], dim=-1)
         return result
 
+
 class MeanIntegrator(BaseSpectraIntegrator):
-    def __init__(self, harmonic: int = 1, natural_width: float = 1e-4, chunk_size: int = 128):
+    def __init__(self, harmonic: int = 1, natural_width: float = 1e-4, chunk_size: int = 128,
+                 device: torch.device = torch.device("cpu")):
         """
         :param harmonic: The harmonic of the spectra. 0 is an absorptions, 1 is derivative
         """
-        super().__init__(harmonic, natural_width, chunk_size)
-        self.pi_sqrt = torch.tensor(math.sqrt(math.pi))
-        self.two_sqrt = torch.tensor(math.sqrt(2.0))
-
-        self.three = torch.tensor(3)
-        self.nine = torch.tensor(9.0)
+        super().__init__(harmonic, natural_width, chunk_size, device=device)
         self.infty_ratio = EasySpinIntegrand(harmonic)
 
-    def integrate(self, res_fields: torch.Tensor,
+    def forward(self, res_fields: torch.Tensor,
                   width: torch.Tensor, A_mean: torch.Tensor,
                   area: torch.Tensor, spectral_field: torch.Tensor):
         r"""

@@ -10,7 +10,7 @@ import typing as tp
 from . import tr_utils
 
 
-class BaseTimeDependantPopulator(ABC):
+class BaseTimeDependantPopulator(nn.Module, ABC):
     """
     Base Time Dependent Populator. To compute the relaxation the following entities should be defined:
     1) Populator itself. Populator determines the population of initial states and how intensity is determined.
@@ -22,7 +22,8 @@ class BaseTimeDependantPopulator(ABC):
                  context: tp.Any,
                  tr_matrix_generator_cls: tp.Type[tr_utils.BaseMatrixGenerator],
                  solver: tp.Callable = tr_utils.EvolutionVectorSolver.odeint_solver,
-                 init_temp: float = 300):
+                 init_temp: float = 300,
+                 device: torch.device = torch.device("cpu")):
         """
         :param context: context is a dataclass / Dict with any objects that are used to compute relaxation matrix.
         :param tr_matrix_generator_cls: class of Matrix Generator
@@ -38,7 +39,11 @@ class BaseTimeDependantPopulator(ABC):
             It is possible to precompute A and exp(A) in all points.
             In this case the solution is n_i+1 = exp(A_idt) @ ni
         :param init_temp: initial temperature. In default case it is used to find initial population
+
+        :param device: device to compute (cpu / gpu)
         """
+        super().__init__()
+        self.device = device
         self.init_temp = torch.tensor(init_temp)
         self.context = context or None
         self.solver = solver
@@ -173,7 +178,7 @@ class BaseTimeDependantPopulator(ABC):
         tr_matrix_generator = self.tr_matrix_generator_cls(self.context)
         return tr_matrix_generator
 
-    def __call__(self, time: torch.Tensor, res_fields: torch.Tensor,
+    def forward(self, time: torch.Tensor, res_fields: torch.Tensor,
                  lvl_down: torch.Tensor, lvl_up: torch.Tensor,
                  energies: torch.Tensor, vector_down: torch.Tensor,
                  vector_up: torch.Tensor, *args, **kwargs) -> torch.Tensor:

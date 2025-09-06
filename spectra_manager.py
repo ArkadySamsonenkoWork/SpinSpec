@@ -12,12 +12,12 @@ from population.mechanisms import T1Population
 
 import torch
 import torch.fft as fft
+import torch.nn as nn
 
 import constants
 import mesher
 import res_field_algorithm
 import spin_system
-
 
 
 def compute_matrix_element(vector_down, vector_up, G):
@@ -26,31 +26,32 @@ def compute_matrix_element(vector_down, vector_up, G):
     return (vector_down.conj() * tmp).sum(dim=-1)
 
 
-class PostSpectraProcessing:
+class PostSpectraProcessing(nn.Module):
     def __init__(self, *args, **kwargs):
         """
         :param gauss: The gauss parameter. The shape is [batch_size] or []
         :param lorentz: The gauss parameter. The shape is [batch_size] or []
         """
+        super().__init__()
         pass
 
     def _skip_broader(self, gauss, lorentz, magnetic_fields: torch.Tensor, spec: torch.Tensor):
         return spec
 
     def _broading_fabric(self, gauss: torch.Tensor, lorentz: torch.Tensor):
-        if (gauss == 0) and (lorentz == 0):
+        if (gauss.any() == 0) and (lorentz.any() == 0):
             return self._skip_broader
 
-        elif (gauss != 0) and (lorentz == 0):
+        elif (gauss.all() != 0) and (lorentz.any() == 0):
             return self._gauss_broader
 
-        elif (gauss == 0) and (lorentz != 0):
+        elif (gauss.any() == 0) and (lorentz.all() != 0):
             return self._lorentz_broader
 
         else:
             return self._voigt_broader
 
-    def __call__(self, gauss: torch.Tensor, lorentz: torch.Tensor,
+    def forward(self, gauss: torch.Tensor, lorentz: torch.Tensor,
                  magnetic_field: torch.Tensor, spec: torch.Tensor) -> torch.Tensor:
         """
         :param magnetic_field: Tensor of shape [batch, N]
@@ -128,13 +129,16 @@ class PostSpectraProcessing:
         return self._apply_convolution(spec, kernel)
 
 
-class IntegrationProcessorBase(ABC):
+class IntegrationProcessorBase(nn.Module, ABC):
     def __init__(self,
                  mesh: mesher.BaseMesh,
                  spectra_integrator: tp.Optional[BaseSpectraIntegrator] = None,
                  harmonic: int = 1,
-                 post_spectra_processor: PostSpectraProcessing = PostSpectraProcessing()):
-        self.threshold = torch.tensor(1e-4)
+                 post_spectra_processor: PostSpectraProcessing = PostSpectraProcessing(),
+                 device: torch.device = torch.device("cpu")):
+        super().__init__()
+        self.device = device
+        self.register_buffer("threshold", torch.tensor(1e-4, device=device))
         self.spectra_integrator = self._init_spectra_integrator(spectra_integrator, harmonic)
         self.mesh = mesh
         self.post_spectra_processor = post_spectra_processor
@@ -173,7 +177,7 @@ class IntegrationProcessorBase(ABC):
         areas = areas[..., mask]
         return res_fields, width, intensities, areas
 
-    def finalize(self,
+    def forward(self,
                  res_fields: torch.Tensor,
                  intensities: torch.Tensor,
                  width: torch.Tensor,
@@ -187,7 +191,7 @@ class IntegrationProcessorBase(ABC):
             )
         )
         res_fields, width, intensities, areas = self._final_mask(res_fields, width, intensities, areas)
-        spec = self.spectra_integrator.integrate(
+        spec = self.spectra_integrator(
             res_fields, width, intensities, areas, fields
         )
         return self.post_spectra_processor(gauss, lorentz, fields, spec)
@@ -198,12 +202,14 @@ class IntegrationProcessorPowder(IntegrationProcessorBase):
                  mesh: mesher.BaseMeshPowder,
                  spectra_integrator: tp.Optional[BaseSpectraIntegrator] = None,
                  harmonic: int = 1,
-                 post_spectra_processor: PostSpectraProcessing = PostSpectraProcessing()):
-        super().__init__(mesh, spectra_integrator, harmonic, post_spectra_processor)
+                 post_spectra_processor: PostSpectraProcessing = PostSpectraProcessing(),
+                 device: torch.device = torch.device("cpu")
+                 ):
+        super().__init__(mesh, spectra_integrator, harmonic, post_spectra_processor, device=device)
 
     def _init_spectra_integrator(self, spectra_integrator: tp.Optional[BaseSpectraIntegrator], harmonic: int):
         if spectra_integrator is None:
-            return SpectraIntegratorEasySpinLike(harmonic)
+            return SpectraIntegratorEasySpinLike(harmonic, device=self.device)
         else:
             return spectra_integrator
 
@@ -215,7 +221,7 @@ class IntegrationProcessorPowder(IntegrationProcessorBase):
 
     def _process_tensor(self, data_tensor: torch.Tensor):
         _, simplices = self.mesh.post_mesh
-        processed = self.mesh.post_process(data_tensor.transpose(-1, -2))
+        processed = self.mesh(data_tensor.transpose(-1, -2))
         return self.mesh.to_delaunay(processed, simplices)
 
     def _compute_batched_tensors(self, *args):
@@ -252,17 +258,18 @@ class IntegrationProcessorCrystal(IntegrationProcessorBase):
                  mesh: mesher.CrystalMesh,
                  spectra_integrator: tp.Optional[BaseSpectraIntegrator] = None,
                  harmonic: int = 1,
-                 post_spectra_processor: PostSpectraProcessing = PostSpectraProcessing()):
-        super().__init__(mesh, spectra_integrator, harmonic, post_spectra_processor)
+                 post_spectra_processor: PostSpectraProcessing = PostSpectraProcessing(),
+                 device: torch.device = torch.device("cpu")):
+        super().__init__(mesh, spectra_integrator, harmonic, post_spectra_processor, device=device)
 
     def _init_spectra_integrator(self, spectra_integrator: tp.Optional[BaseSpectraIntegrator], harmonic: int):
         if spectra_integrator is None:
-            return MeanIntegrator(harmonic)
+            return MeanIntegrator(harmonic, device=self.device)
         else:
             return spectra_integrator
 
     def _compute_areas(self, expanded_size: torch.Size):
-        areas = torch.ones(expanded_size, dtype=torch.float32)
+        areas = torch.ones(expanded_size, dtype=torch.float32, device=self.device)
         return areas
 
     def _final_mask(self, res_fields: torch.Tensor, width: torch.Tensor,
@@ -301,7 +308,7 @@ class IntegrationProcessorCrystal(IntegrationProcessorBase):
 class IntegrationProcessorTimeResolved(IntegrationProcessorPowder):
     def _init_spectra_integrator(self, spectra_integrator: tp.Optional[BaseSpectraIntegrator], harmonic: int):
         if spectra_integrator is None:
-            return SpectraIntegratorEasySpinLikeTimeResolved(harmonic)
+            return SpectraIntegratorEasySpinLikeTimeResolved(harmonic, device=self.device)
         else:
             return spectra_integrator
 
@@ -311,7 +318,9 @@ class IntegrationProcessorTimeResolved(IntegrationProcessorPowder):
         areas = areas.reshape(1, -1).expand(expanded_size, -1).flatten()
         return areas
 
-    def _transform_data_to_mesh_format(self, res_fields, intensities, width):
+    def _transform_data_to_mesh_format(self, res_fields: torch.Tensor,
+                                       intensities: torch.Tensor,
+                                       width: torch.Tensor):
         """
         :param res_fields: the tensor of resonance fields. The shape is [..., num_resonance fields]
         :param intensities: the tensor of resonance fields. The shape is [time_dim, ..., num_resonance fields]
@@ -322,7 +331,6 @@ class IntegrationProcessorTimeResolved(IntegrationProcessorPowder):
         intensities tensor with the resonance field at each triangle vertices. The shape is [time_dim, ...]
         areas tensor with the resonance field at each triangle vertices. The shape is [...]
         """
-
         batched_matrix = self._compute_batched_tensors(res_fields, width)
         expanded_size = batched_matrix.shape[-3]
         batched_matrix = batched_matrix.flatten(-3, -2)
@@ -336,9 +344,11 @@ class IntegrationProcessorTimeResolved(IntegrationProcessorPowder):
         return res_fields, width, intensities, areas
 
 
-class Broadener:
-    def __init__(self):
-        self._width_conversion = torch.tensor(1 / math.sqrt(2 * math.log(2)))
+class Broadener(nn.Module):
+    def __init__(self, device: torch.device = torch.device("cpu")):
+        super().__init__()
+        self.register_buffer("_width_conversion", torch.tensor(1 / math.sqrt(2 * math.log(2)), device=device))
+        self.device = device
 
     def _compute_element_field_free(self, vector: torch.Tensor,
                           tensor_components_A: torch.Tensor, tensor_components_B: torch.Tensor,
@@ -378,12 +388,14 @@ class Broadener:
                 )
         ).square().sum(dim=-2)
 
-    def __call__(self, sample, vector_down, vector_up, B_trans):
-        target_shape = vector_down.shape[:-1]
-        device = B_trans.device
-        dtype = B_trans.dtype
+    def add_hamiltonian_straine(self, sample: spin_system.MultiOrientedSample, squared_width):
+        hamiltonian_width = sample.build_ham_strain().unsqueeze(-1).square()
+        return (squared_width + hamiltonian_width).sqrt()
 
-        result = torch.zeros(target_shape, dtype=dtype, device=device)
+    def forward(self, sample: spin_system.MultiOrientedSample,
+                 vector_down: torch.Tensor, vector_up: torch.Tensor, B_trans: torch.Tensor):
+        target_shape = vector_down.shape[:-1]
+        result = torch.zeros(target_shape, dtype=B_trans.dtype, device=self.device)
 
         for strained_data in sample.build_field_dep_straine():
             result += self._compute_field_straine_square(strained_data, vector_down, vector_up, B_trans)
@@ -393,20 +405,19 @@ class Broadener:
 
         return self.add_hamiltonian_straine(sample, result) * self._width_conversion  # To convert from p-p into width and half height
 
-    def add_hamiltonian_straine(self, sample: spin_system.MultiOrientedSample, squared_width):
-        hamiltonian_width = sample.build_ham_strain().unsqueeze(-1).square()
-        return (squared_width + hamiltonian_width).sqrt()
 
-
-class BaseIntensityCalculator:
+class BaseIntensityCalculator(nn.Module):
     def __init__(self, spin_system_dim: int | list[int],
                  temperature: tp.Optional[float] = None,
                  populator: tp.Optional[tp.Callable] = None,
-                 tolerancy: float = 1e-12):
-        self.tolerancy = torch.tensor(tolerancy)
+                 tolerancy: float = 1e-12, device: torch.device = torch.device("cpu")):
+        super().__init__()
+        self.register_buffer("tolerancy", torch.tensor(tolerancy, device=device))
+        self.device = device
         self.populator = self._init_populator(populator, temperature)
         self.spin_system_dim = spin_system_dim
         self.temperature = temperature
+
 
     def _init_populator(self, populator: tp.Optional[tp.Callable], temperature: tp.Optional[float]):
         return populator
@@ -419,18 +430,21 @@ class BaseIntensityCalculator:
     def compute_intensity(self, Gx, Gy, Gz, vector_down, vector_up, lvl_down, lvl_up, resonance_energies):
         raise NotImplementedError
 
-    def __call__(self, Gx, Gy, Gz, vector_down, vector_up, lvl_down, lvl_up, resonance_energies, *args, **kwargs):
+    def forward(self, Gx: torch.Tensor, Gy: torch.Tensor, Gz: torch.Tensor,
+                vector_down: torch.Tensor, vector_up: torch.Tensor, lvl_down: torch.Tensor,
+                lvl_up: torch.Tensor, resonance_energies: torch.Tensor, *args, **kwargs):
         return self.compute_intensity(Gx, Gy, Gz, vector_down, vector_up, lvl_down, lvl_up, resonance_energies)
 
 
 class StationaryIntensitiesCalculator(BaseIntensityCalculator):
     def __init__(self, spin_system_dim: int, temperature: tp.Optional[float] = None,
-                 populator: tp.Optional[tp.Callable] = None, tolerancy: float = 1e-14):
-        super().__init__(spin_system_dim, temperature, populator, tolerancy)
+                 populator: tp.Optional[tp.Callable] = None, tolerancy: float = 1e-14,
+                 device: torch.device = torch.device("cpu")):
+        super().__init__(spin_system_dim, temperature, populator, tolerancy, device=device)
 
     def _init_populator(self, populator, temperature):
         if populator is None:
-            return StationaryPopulator(temperature)
+            return StationaryPopulator(temperature, device=self.device)
         else:
             return populator
 
@@ -445,10 +459,13 @@ class StationaryIntensitiesCalculator(BaseIntensityCalculator):
 class TimeResolvedIntensitiesCalculator(BaseIntensityCalculator):
     def __init__(self, spin_system_dim: int, temperature: tp.Optional[float],
                  populator: tp.Optional[BaseTimeDependantPopulator],
-                 tolerancy=1e-14):
-        super().__init__(spin_system_dim, temperature, populator, tolerancy)
+                 tolerancy=1e-14, device: torch.device = torch.device("cpu")
+                 ):
+        super().__init__(spin_system_dim, temperature, populator, tolerancy, device=device)
 
-    def compute_intensity(self,Gx, Gy, Gz, vector_down, vector_up, lvl_down, lvl_up, resonance_energies):
+    def compute_intensity(self, Gx: torch.Tensor, Gy: torch.Tensor, Gz: torch.Tensor,
+                          vector_down: torch.Tensor, vector_up: torch.Tensor,
+                          lvl_down: torch.Tensor, lvl_up: torch.Tensor, resonance_energies: torch.Tensor):
         intensity = (
                 self._compute_magnitization(Gx, Gy, vector_down, vector_up)
         )
@@ -468,14 +485,13 @@ class MultiSampleIntensitiesCalculator(BaseIntensityCalculator):
                  spin_system_dim: int | list[int],
                  temperature: tp.Optional[float],
                  populator: BaseTimeDependantPopulator,
-                 tolerancy=1e-12
+                 tolerancy=1e-12, device: torch.device = torch.device("cpu")
                  ):
-        super().__init__(spin_system_dim, temperature, populator, tolerancy)
+        super().__init__(spin_system_dim, temperature, populator, tolerancy, device=device)
 
     def calculate_population_evolution(self, time: torch.Tensor, intensity_outs, spin_dimensions: list[int]):
         populations = self.populator(time, intensity_outs, spin_dimensions)
         return populations
-
 
 @dataclass
 class ParamSpec:
@@ -496,7 +512,7 @@ class ParamSpec:
             "scalar", "vector", "matrix"), f"Category must be one of 'scalar', 'vector', 'matrix', got {self.category}"
 
 
-class BaseSpectraCreator(ABC):
+class BaseSpectraCreator(nn.Module, ABC):
     """
     Base clas of spectra creators
     """
@@ -511,8 +527,9 @@ class BaseSpectraCreator(ABC):
                  spectra_integrator: tp.Optional[BaseSpectraIntegrator] = None,
                  harmonic: int = 1,
                  post_spectra_processor: PostSpectraProcessing = PostSpectraProcessing(),
-                 temperature: tp.Optional[float] = 293,
-                 recompute_spin_parameters: bool = True
+                 temperature: tp.Optional[tp.Union[float, torch.Tensor]] = 293,
+                 recompute_spin_parameters: bool = True,
+                 device: torch.device = torch.device("cpu")
                  ):
         """
         :param freq: Resonance frequency of experiment
@@ -548,31 +565,29 @@ class BaseSpectraCreator(ABC):
             Recompute spin parameters in __call__ methods. For stationary creator is True, for time resolves is False
 
         """
+        super().__init__()
+        self.device = device
+        self.register_buffer("resonance_freq", torch.tensor(freq, device=device))
+        self.register_buffer("threshold", torch.tensor(1e-2, device=device))
+        self.register_buffer("tolerancy", torch.tensor(1e-10, device=device))
 
-        self.resonance_freq = torch.tensor(freq)
-        self.threshold = torch.tensor(1e-4)
         self.spin_system_dim, self.batch_dims, self.mesh =\
             self._init_sample_parameters(sample, spin_system_dim, batch_dims, mesh)
         self.mesh_size = self.mesh.initial_size
-        self.broader = Broadener()
+        self.broader = Broadener(device=device)
 
         self.res_field = res_field_algorithm.ResField(spin_system_dim=self.spin_system_dim,
                                                       mesh_size=self.mesh_size,
                                                       batch_dims=self.batch_dims,
-                                                      output_full_eigenvector=self._get_output_eigenvector())
+                                                      output_full_eigenvector=self._get_output_eigenvector(),
+                                                      device=self.device)
 
         self.intensity_calculator = self._get_intenisty_calculator(intensity_calculator, temperature, populator)
         self._param_specs = self._get_param_specs()
 
-        self.tolerancy = torch.tensor(1e-10)
-        self._vacuum_g_factor = torch.tensor(2.002)
         self.spectra_processor = self._init_spectra_processor(spectra_integrator,
                                                               harmonic,
                                                               post_spectra_processor)
-        if populator is not None:
-            self.temperature = None
-        else:
-            self.temperature = temperature
         self.recompute_spin_parameters = recompute_spin_parameters
         self._init_cached_parameters()
 
@@ -590,7 +605,6 @@ class BaseSpectraCreator(ABC):
 
         else:
             self._resfield_method = self._recomputed_resfield
-
 
     @abstractmethod
     def _init_spectra_processor(self,
@@ -610,7 +624,7 @@ class BaseSpectraCreator(ABC):
             else:
                 raise TypeError("You should pass sample or spin_system_dim, batch_dims, mesh arguments")
         else:
-            spin_system_dim = sample.base_spin_system.dim
+            spin_system_dim = sample.base_spin_system.spin_system_dim
             batch_dims = sample.config_shape[:-1]
             mesh = sample.mesh
 
@@ -618,7 +632,7 @@ class BaseSpectraCreator(ABC):
 
     def _get_intenisty_calculator(self, intensity_calculator, temperature: float, populator: StationaryPopulator):
         if intensity_calculator is None:
-            return StationaryIntensitiesCalculator(self.spin_system_dim, temperature, populator)
+            return StationaryIntensitiesCalculator(self.spin_system_dim, temperature, populator, device=self.device)
         else:
             return intensity_calculator
 
@@ -663,7 +677,7 @@ class BaseSpectraCreator(ABC):
         return (vectors_u, vectors_v), (valid_lvl_down, valid_lvl_up), res_fields,\
             resonance_energies, full_eigen_vectors
 
-    def __call__(self,
+    def forward(self,
                  sample: spin_system.MultiOrientedSample,
                  fields: torch.Tensor, time: tp.Optional[torch.Tensor] = None, **kwargs):
         """
@@ -673,8 +687,14 @@ class BaseSpectraCreator(ABC):
         :param kwargs:
         :return:
         """
-        B_low  = fields[..., 0].unsqueeze(-1).expand(*self.mesh_size)
-        B_high = fields[..., -1].unsqueeze(-1).expand(*self.mesh_size)
+        #B_low  = fields[..., 0].unsqueeze(-1).expand(*self.mesh_size)
+        #B_high = fields[..., -1].unsqueeze(-1).expand(*self.mesh_size)
+
+        B_low = fields[..., 0]
+        B_high = fields[..., -1]
+        B_low = B_low.unsqueeze(-1).repeat(*([1] * B_low.ndim), *self.mesh_size)
+        B_high = B_high.unsqueeze(-1).repeat(*([1] * B_high.ndim), *self.mesh_size)
+
 
         F, Gx, Gy, Gz = sample.get_hamiltonian_terms()
 
@@ -709,7 +729,7 @@ class BaseSpectraCreator(ABC):
                   gauss: torch.Tensor,
                   lorentz: torch.Tensor,
                   fields: torch.Tensor):
-        return self.spectra_processor.finalize(res_fields, intensities, width, gauss, lorentz, fields)
+        return self.spectra_processor(res_fields, intensities, width, gauss, lorentz, fields)
 
     def _mask_components(self, intensities_mask: torch.Tensor, *extras) -> list[tp.Any]:
         updated_extras = []
@@ -791,8 +811,8 @@ class BaseSpectraCreator(ABC):
         intensities = self.intensity_calculator.compute_intensity(
             Gx, Gy, Gz, vector_down, vector_up, lvl_down, lvl_up, resonance_energies
         )
-
-        intensities_mask = (intensities / intensities.abs().max() > self.threshold).any(dim=-2)
+        lines_dimension = tuple(range(intensities.ndim - 1))
+        intensities_mask = (intensities / intensities.abs().max() > self.threshold).any(dim=lines_dimension)
         intensities = intensities[..., intensities_mask]
 
         extras = self._mask_additional(vector_down,
@@ -832,8 +852,9 @@ class StationarySpectraCreator(BaseSpectraCreator):
                  spectra_integrator: tp.Optional[BaseSpectraIntegrator] = None,
                  harmonic: int = 1,
                  post_spectra_processor: PostSpectraProcessing = PostSpectraProcessing(),
-                 temperature: tp.Optional[float] = 293,
-                 recompute_spin_parameters: bool = True
+                 temperature: tp.Optional[tp.Union[float, torch.Tensor]] = 293,
+                 recompute_spin_parameters: bool = True,
+                 device: torch.device = torch.device("cpu")
                  ):
         """
         :param freq: Resonance frequency of experiment
@@ -875,7 +896,7 @@ class StationarySpectraCreator(BaseSpectraCreator):
         """
         super().__init__(freq, sample, spin_system_dim, batch_dims, mesh, intensity_calculator,
                          populator, spectra_integrator, harmonic, post_spectra_processor,
-                         temperature, recompute_spin_parameters)
+                         temperature, recompute_spin_parameters, device=device)
 
     def _postcompute_batch_data(self, res_fields: torch.Tensor, intensities: torch.Tensor, width: torch.Tensor,
                                 F: torch.Tensor, Gx: torch.Tensor, Gy: torch.Tensor, Gz: torch.Tensor,
@@ -894,6 +915,18 @@ class StationarySpectraCreator(BaseSpectraCreator):
 
         else:
             return IntegrationProcessorPowder(self.mesh, spectra_integrator, harmonic, post_spectra_processor)
+
+    def __call__(self,
+                sample: spin_system.MultiOrientedSample,
+                fields: torch.Tensor, time: tp.Optional[torch.Tensor] = None, **kwargs):
+        """
+        :param sample: MultiOrientedSample object
+        :param fields: The magnetic fields in Tesla units
+        :param time: It is used only for time resolved spectra
+        :param kwargs:
+        :return:
+        """
+        return super().__call__(sample, fields, time)
 
 
 class TruncatedSpectraCreatorTimeResolved(BaseSpectraCreator):
@@ -915,8 +948,9 @@ class TruncatedSpectraCreatorTimeResolved(BaseSpectraCreator):
                  spectra_integrator: tp.Optional[BaseSpectraIntegrator] = None,
                  harmonic: int = 0,
                  post_spectra_processor: PostSpectraProcessing = PostSpectraProcessing(),
-                 temperature: tp.Optional[float] = 293,
-                 recompute_spin_parameters: bool = False
+                 temperature: tp.Optional[tp.Union[float, torch.Tensor]] = 293,
+                 recompute_spin_parameters: bool = False,
+                 device: torch.device = torch.device("cpu")
                  ):
 
         """
@@ -961,7 +995,7 @@ class TruncatedSpectraCreatorTimeResolved(BaseSpectraCreator):
         """
         super().__init__(freq, sample, spin_system_dim, batch_dims, mesh, intensity_calculator, populator,
                          spectra_integrator, harmonic, post_spectra_processor,
-                         temperature, recompute_spin_parameters)
+                         temperature, recompute_spin_parameters, device=device)
 
     def __call__(self, sample: spin_system.MultiOrientedSample, field: torch.Tensor, time: torch.Tensor, **kwargs) ->\
             torch.Tensor:
@@ -1079,7 +1113,7 @@ class CoupledSpectraCreatorTimeResolved(TruncatedSpectraCreatorTimeResolved):
         return args
 
 
-class MultiSampleCreator:
+class MultiSampleCreator(nn.Module):
     def __init__(self,
                  creators: list[CoupledSpectraCreatorTimeResolved],
                  freq: tp.Optional[tp.Union[float, torch.Tensor]] = None,
@@ -1091,6 +1125,7 @@ class MultiSampleCreator:
         """
         creators[i] is already configured for sample i (its spin_system_dim, mesh, …).
         """
+        super().__init__()
         self.resonance_freq = torch.tensor(freq) if freq is not None else creators[0].resonance_freq
         self.spin_system_dim = [creator.spin_system_dim for creator in creators]
         if len(creators) == 0:
@@ -1124,15 +1159,18 @@ class MultiSampleCreator:
             intensities_samples_finile.append(intensities.unsqueeze(0) * population)
         return intensities_samples_finile
 
-    def __call__(self,
+    def forward(self,
                  samples: tp.Sequence[spin_system.MultiOrientedSample],
                  fields: torch.Tensor, time: torch.Tensor
                  ) -> torch.Tensor:
         if len(samples) != len(self.creators):
             raise ValueError(f"Expected {len(self.creators)} samples, got {len(samples)}")
 
-        B_low = fields[..., 0].unsqueeze(-1).expand(*self.mesh_size)
-        B_high = fields[..., -1].unsqueeze(-1).expand(*self.mesh_size)
+        B_low = fields[..., 0]
+        B_high = fields[..., -1]
+
+        B_low = B_low.unsqueeze(-1).repeat(*([1] * B_low.ndim), *self.mesh_size)
+        B_high = B_high.unsqueeze(-1).repeat(*([1] * B_high.ndim), *self.mesh_size)
 
         intensities_samples = []
         widths_samples = []

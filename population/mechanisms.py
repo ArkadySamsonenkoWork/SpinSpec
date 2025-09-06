@@ -53,9 +53,10 @@ class ConstTempGeneralMechanism(tr_utils.TransitionMatrixGenerator):
     It is constant temperature relaxation mechanism. The most simple Relaxation. It is assumed that for all
     [...] batch dimensions, including orientations the probabilities of transitions are the same.
     """
-    def __init__(self, context: BaseSampleContext, temp: torch.Tensor, *args, **kwargs):
-        super().__init__(context, *args, **kwargs)
-        self.free_probs = context.free_probs
+    def __init__(self, context: BaseSampleContext, temp: torch.Tensor,
+                 device: torch.device = torch.device("cpu"), *args, **kwargs):
+        super().__init__(context, device=device, *args, **kwargs)
+        self.free_probs = context.free_probs.to(self.device)
         self.temp = temp
 
     def _base_transition_probs(self, temp: torch.Tensor | None) -> torch.Tensor:
@@ -78,7 +79,7 @@ class BaseTripletMechanismGenerator(tr_utils.TransitionMatrixGenerator):
         self.system_vectors = system_vectors
         self.context = context
         self.basis_coeffs = transform.get_transformation_coeffs(
-            context.zero_field_vectors.unsqueeze(-3),
+            context.zero_field_vectors.to(self.device).unsqueeze(-3),
             system_vectors
         )
 
@@ -215,11 +216,11 @@ class T1Population(time_population.BaseTimeDependantPopulator):
                  tr_matrix_generator_cls: tp.Type[tr_utils.TransitionMatrixGenerator] =
                  ConstTempTripletMechanismGenerator,
                  solver: tp.Callable = tr_utils.EvolutionVectorSolver.odeint_solver,
-                 init_temp: float = 300):
+                 init_temp: float = 300, device: torch.device = torch.device("cpu")):
         """
         :param init_temp: temperature in K
         """
-        super().__init__(context, tr_matrix_generator_cls, solver, init_temp)
+        super().__init__(context, tr_matrix_generator_cls, solver, init_temp, device=device)
 
     def _precompute(self, res_fields, lvl_down, lvl_up, energies, vector_down, vector_up, *args, **kwargs):
         energies = copy.deepcopy(energies)
@@ -257,16 +258,19 @@ class T1Population(time_population.BaseTimeDependantPopulator):
 
 
 class TempDepTrPopulation(time_population.BaseTimeDependantPopulator):
+    """
+    Computes population at the case when the parameters of relaxation depend on temperature dn / dt = K(T) @ n
+    """
     def __init__(self,
                  context: TempDepContext,
                  tr_matrix_generator_cls: tp.Type[tr_utils.TransitionMatrixGenerator] =
                  TempDepTripletMechanismGenerator,
                  solver: tp.Callable = tr_utils.EvolutionVectorSolver.odeint_solver,
-                 init_temp: float = 300):
+                 init_temp: float = 300, device: torch.device = torch.device("cpu")):
         """
         :param init_temp: temperature in K
         """
-        super().__init__(context, tr_matrix_generator_cls, solver, init_temp)
+        super().__init__(context, tr_matrix_generator_cls, solver, init_temp, device=device)
 
     def _init_tr_matrix_generator(self, time, res_fields, lvl_down, lvl_up, vector_down,
                                   vector_up, energies, *args, **kwargs):
@@ -295,11 +299,11 @@ class KineticPopulator(time_population.BaseTimeDependantPopulator):
                  sample_tr_matrix_generators: list[tp.Type[tr_utils.TransitionMatrixGenerator]],
                  tr_matrix_generator_cls: tp.Type[TransitionMatrixGeneratorKinetic] = TransitionMatrixGeneratorKinetic,
                  solver: tp.Callable = tr_utils.EvolutionVectorSolver.odeint_solver,
-                 init_temp: float = 300):
+                 init_temp: float = 300, device: torch.device = torch.device("cpu")):
         """
         :param init_temp: temperature in K
         """
-        super().__init__(context, tr_matrix_generator_cls, solver, init_temp)
+        super().__init__(context, tr_matrix_generator_cls, solver, init_temp, device=device)
         self.sample_tr_matrix_generators_cls = sample_tr_matrix_generators
 
     def _compute_eigendata_in_resonance(self, sample_main, sample_additional):
@@ -382,7 +386,7 @@ class KineticPopulator(time_population.BaseTimeDependantPopulator):
         starts = [0] + list(itertools.accumulate(spin_dimensions[:-1]))
         return [list(range(start, start + size)) for start, size in zip(starts, spin_dimensions)]
 
-    def __call__(self, time: torch.Tensor,
+    def forward(self, time: torch.Tensor,
                  samples: list[sample_kinetic], spin_dimensions: list[int], *args, **kwargs):
 
 

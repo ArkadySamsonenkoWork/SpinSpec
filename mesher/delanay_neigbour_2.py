@@ -10,8 +10,6 @@ from sklearn.neighbors import BallTree
 from sklearn.metrics import pairwise_distances
 from .general_mesh import BaseMesh, BaseMeshPowder
 
-from .torch_tps import ThinPlateSpline
-
 
 class BoundaryHandler:
     """Handles boundary condition logic."""
@@ -30,18 +28,70 @@ class BoundaryHandler:
 
 class ThetaLine:
     def __init__(self, theta: float, points: int, phi_limits: tuple[float, float],
-                 last_point: bool):
+                 last_point: bool, boundaries_cond: str | None):
         self.phi_limits = phi_limits
         self.theta = theta
         self.latent_points = points
         self.last_point = last_point
+        self.boundaries_cond = None  # Sould be rebuild
+        self.visible_points = self._compute_visible_points()
 
     def _compute_visible_points(self):
         if self.last_point:
             return self.latent_points
         return self.latent_points if self.latent_points == 1 else self.latent_points - 1
 
-    def phi_theta(self):
+    def _circular_index(self, lst, idx):
+        return lst[idx % len(lst)]
+
+    def get_boundary(self, boundary, init_indexes, is_start):
+        if boundary == "reflection":
+            return [
+                self._circular_index(init_indexes, 2 if is_start else -3),
+                self._circular_index(init_indexes, 1 if is_start else -2),
+            ]
+        elif boundary == "periodic":
+            return [
+                self._circular_index(init_indexes, -3 if is_start else 1),
+                self._circular_index(init_indexes, -2 if is_start else 2),
+            ]
+        elif boundary is None:
+            return []
+        else:
+            raise ValueError("Invalid phi boundary condition. Must be 'reflection', 'periodic', or None.")
+
+    def interpolating_indexes(self):
+        if self.last_point:
+            init_indexes = list(range(self.latent_points))
+        else:
+            init_indexes = list(range(self.latent_points - 1))
+            init_indexes.append(0)
+
+        prefix = self.get_boundary(self.boundaries_cond, init_indexes, True)
+        suffix = self.get_boundary(self.boundaries_cond, init_indexes, False)
+        return prefix + init_indexes + suffix
+
+    def interpolating_phi_theta(self):
+        if self.latent_points == 1:
+            return 5 * [(0.0, 0.0)] if self.boundaries_cond != None else [(0.0, 0.0)]
+        delta_phi = self.phi_limits[1] - self.phi_limits[0]
+        if self.boundaries_cond is not None:
+            prefix = [
+                (self.phi_limits[0] + point * delta_phi / (self.latent_points - 1), self.theta) for point in [-2, -1]
+            ]
+            suffix = [
+                (self.phi_limits[0] + point * delta_phi / (self.latent_points - 1), self.theta) for point in
+                [self.latent_points, self.latent_points + 1]
+            ]
+        else:
+            prefix = []
+            suffix = []
+
+        return prefix + \
+            [(self.phi_limits[0] + point * delta_phi / (self.latent_points - 1), self.theta) for point in
+             range(self.latent_points)] + suffix
+
+    def init_phi_theta(self):
         if self.latent_points == 1:
             return [(0.0, 0.0)]
         delta_phi = self.phi_limits[1] - self.phi_limits[0]
@@ -52,6 +102,25 @@ class ThetaLine:
             return [(self.phi_limits[0] + point * delta_phi / (self.latent_points - 1), self.theta) for point in
                     range(self.latent_points - 1)]
 
+    def post_phi_theta(self):
+        if self.latent_points == 1:
+            return [(0.0, 0.0)]
+        delta_phi = self.phi_limits[1] - self.phi_limits[0]
+        return [(self.phi_limits[0] + point * delta_phi / (self.latent_points - 1), self.theta) for point in
+                range(self.latent_points)]
+
+    def post_indexes(self):
+        if self.last_point:
+            return list(range(self.latent_points))
+        else:
+            return list(range(self.latent_points - 1)) + [0]
+
+    def triangulated_vertices(self, grid_frequency: int):
+        if self.latent_points == 1:
+            return [(0.0, 0.0)]
+        delta_phi = self.phi_limits[1] - self.phi_limits[0]
+        return [(self.phi_limits[0] + point * delta_phi / (grid_frequency - 1), self.theta)
+                for point in range(self.latent_points)]
 
 
 class RBFInterpolator:
@@ -153,47 +222,45 @@ class Kernels:
         elif kernel == "linear":
             return 1 / (r + 1e-8 * eps)
         elif kernel == "quadratic":
-            return 1 / (np.log(r + 1e-9 * eps) * (r + 1e-8 * eps) ** 2)
-        elif kernel == "inverse_thin_plate":
-            return 1 / ((r + 1e-9 * eps) * np.log(r + 1e-9))
+            return 1 / (r + 1e-8 * eps) ** 2
+        elif kernel == "thin_plate":
+            return 1 / ((r + 1e-8 * eps) * np.log(r + 1e-6))
         else:
             raise ValueError(f"Unknown kernel: {kernel}")
 
 
-class NearestNeighborsInterpolator(nn.Module):
+class NearestNeighborsInterpolator:
     def __init__(self,
-                 init_vertices: list[tuple[float, float]],
+                 interpolating_indexes: list[int],
+                 base_vertices: list[tuple[float, float]],
                  extended_vertices: list[tuple[float, float]],
-                 k: int = 4, device: torch.device = torch.device("cpu")):
+                 k: int):
         """
 
         Initialize the interpolator with the base mesh vertices and extended mesh vertices.
         Uses a BallTree for efficient nearest neighbor search.
         """
-        super().__init__()
         self.k = k
-        self.device = device
 
-        tree = BallTree(self._to_lat_long(init_vertices), metric="haversine")
+        tree = BallTree(self._to_lat_long(base_vertices), metric="haversine")
         distances, indexes = tree.query(self._to_lat_long(extended_vertices), k=self.k)
 
-        clipped = np.clip(distances, a_min=1e-9, a_max=None)
+        clipped = np.clip(distances, a_min=1e-11, a_max=None)
 
 
-        inv_distances = torch.tensor(Kernels().rbf(kernel="linear",
-                                                   r=clipped, epsilon=1), dtype=torch.float32, device=device)
-        weights = inv_distances / inv_distances.sum(dim=-1, keepdim=True)
-        self.register_buffer("weights", weights)
+        inv_distances = torch.tensor(Kernels().rbf(kernel="quadratic", r=clipped, epsilon=1), dtype=torch.float32)
+        self.weights = inv_distances / inv_distances.sum(dim=-1, keepdim=True)
 
-        indexes = torch.as_tensor(indexes, device=device)
-        self.register_buffer("indexes", indexes)
+        self.interp_indexes = torch.as_tensor(interpolating_indexes)
+        self.indexes = torch.as_tensor(indexes)
+        self.extended_size = extended_vertices.shape[0]
 
     def _to_lat_long(self, array: list[tuple[float, float]]):
         array = np.array(array)[:, ::-1]  # theta, phi
         array[:, 0] = np.pi/2 - array[:, 0]
         return array
 
-    def forward(self, f_values: torch.Tensor) -> torch.Tensor:
+    def __call__(self, f_values: torch.Tensor) -> torch.Tensor:
         """
         Interpolate values at extended points using inverse distance weighting.
         :param f_values: Tensor of shape (..., N), where N is the number of base vertices.
@@ -210,11 +277,11 @@ class NearestNeighborsInterpolator(nn.Module):
         return f_extended
         """
 
-        orig_shape = f_values.shape
+        orig_shape = f_values.shape  # (..., orig_size)
         batch_shape = orig_shape[:-1]
         orig_size = orig_shape[-1]
 
-        mapped = self.indexes.long().to(f_values.device)
+        mapped = self.interp_indexes[self.indexes].long().to(f_values.device)
         weights = self.weights.to(f_values.device)
 
         if mapped.ndim == 2:
@@ -228,37 +295,37 @@ class NearestNeighborsInterpolator(nn.Module):
         k = mapped.shape[-1]
         expanded = f_values.unsqueeze(-2).expand(*batch_shape, ext_size, orig_size)
         gathered = torch.take_along_dim(expanded, mapped, dim=-1)
-        return (gathered * weights).sum(dim=-1).transpose(-1, -2)
+        return (gathered * weights).sum(dim=-1)
 
-
-class MeshProcessorBase(nn.Module):
-    def __init__(self, init_grid_frequency, phi_limits, boundaries_cond, device: torch.device = torch.device("cpu")):
-        super().__init__()
+class MeshProcessorBase:
+    def __init__(self, init_grid_frequency, phi_limits, boundaries_cond):
         self.init_grid_frequency = init_grid_frequency
         self.phi_limits = phi_limits
         self.boundaries_cond = boundaries_cond
         self.last_point = boundaries_cond != "periodic"
-        self.device = device
 
-    def _create_theta_lines(self, grid_frequency, last_point: bool):
+    def _create_theta_lines(self, grid_frequency):
         eps = 1e-8
         init_lines = [ThetaLine(
                 theta=0.0,
                 points=1,
                 phi_limits=self.phi_limits,
-                last_point=last_point,
+                last_point=self.last_point,
+                boundaries_cond=self.boundaries_cond
         ),
             ThetaLine(
                 theta=eps,
                 points=2,
                 phi_limits=self.phi_limits,
-                last_point=last_point,
+                last_point=self.last_point,
+                boundaries_cond=self.boundaries_cond
         ),
         ThetaLine(
                 theta=2 * eps,
                 points=3,
                 phi_limits=self.phi_limits,
-                last_point=last_point,
+                last_point=self.last_point,
+                boundaries_cond=self.boundaries_cond
         )
         ]
 
@@ -267,16 +334,35 @@ class MeshProcessorBase(nn.Module):
                 theta=np.arccos(1 - (point - 3)**2 / (grid_frequency - 3)**2),
                 points=point,
                 phi_limits=self.phi_limits,
-                last_point=last_point,
+                last_point=self.last_point,
+                boundaries_cond=self.boundaries_cond
             ) for point in range(4, grid_frequency + 1)
         ]
 
 
-    def _assemble_vertices(self, theta_lines):
+    def _assemble_vertices(self, theta_lines, vertex_method):
         return np.concatenate(
-            [np.array(tl.phi_theta(), dtype=np.float32) for tl in theta_lines],
+            [np.array(getattr(tl, vertex_method)(), dtype=np.float32) for tl in theta_lines],
             axis=0
         )
+
+    def _get_post_indexes(self, theta_lines):
+        indexes = []
+        for tl in theta_lines:
+            indexes.extend(self._get_absolute_post_indexes(tl))
+        return indexes
+
+    def _get_absolute_post_indexes(self, theta_line):
+        return self._get_absolute_indexes(theta_line, "post_indexes")
+
+    def _get_absolute_indexes(self, theta_line, method):
+        visible_points = theta_line.visible_points
+        if self.last_point:
+            shift = (visible_points - 1) * visible_points // 2
+        else:
+            shift = 2 + ((visible_points - 2) * (visible_points + 1)) // 2 if theta_line.latent_points != 1 else 0
+        indexes = getattr(theta_line, method)()
+        return [idx + shift for idx in indexes]
 
     def _create_triangular_dict(self, K: int):
         """Vectorized version using NumPy operations"""
@@ -323,49 +409,78 @@ class InterpolatingMeshProcessor(MeshProcessorBase):
         super().__init__(*args, **kwargs)
         self.interpolate_grid_frequency = interpolate_grid_frequency
 
-        self.base_theta_lines = self._create_theta_lines(self.init_grid_frequency, last_point=True)
-        self.interpolating_theta_lines = self._create_theta_lines(self.interpolate_grid_frequency, last_point=True)
+        self.base_theta_lines = self._create_theta_lines(self.init_grid_frequency)
+        self.interpolate_theta_lines = self._create_theta_lines(self.interpolate_grid_frequency)
 
+        self.post_indexes = torch.tensor(self._get_post_indexes(self.base_theta_lines))
         self.final_vertices, self.simplices = self._get_post_mesh()
 
-        self.init_vertices = self._assemble_vertices(self.base_theta_lines)
+        self.init_vertices = self._assemble_vertices(self.base_theta_lines, "init_phi_theta")
         self.interpolator = self._get_interpolator(self.final_vertices)
 
         self.extended_size = self.final_vertices.shape[0]
 
     def _get_post_mesh(self):
-        extended_vertices = self._assemble_vertices(self.interpolating_theta_lines)
+        extended_vertices = self._assemble_vertices(self.interpolate_theta_lines, "post_phi_theta")
         simplices = self._triangulate(self.interpolate_grid_frequency)
         return extended_vertices, simplices
 
-    def _get_interpolator(self, extended_vertices):
-        return NearestNeighborsInterpolator(init_vertices=self.init_vertices,
-                                            extended_vertices=self.final_vertices, device=self.device)
+    def _get_interpolating_indexes(self, theta_lines):
+        indexes = []
+        for tl in theta_lines:
+            indexes.extend(self._get_absolute_indexes(tl, "interpolating_indexes"))
+        return indexes
 
-    def forward(self, f_values: torch.Tensor):
-        shape = f_values.shape
-        init_vert_dim = shape[-1]
-        f_new = f_values.reshape((-1, init_vert_dim))
-        out = self.interpolator(f_new).transpose(-1, -2)
-        return out.reshape((*shape[:-1], out.shape[-1]))
+    def _get_interpolating_phi_theta(self, theta_lines):
+        phi_theta = [pt for tl in theta_lines for pt in tl.interpolating_phi_theta()]
+        indexes = self._get_interpolating_indexes(theta_lines)
+        return indexes, phi_theta
+
+    def _get_interpolator(self, extended_vertices):
+        indexes, phi_theta = self._get_interpolating_phi_theta(self.base_theta_lines)
+        #indexes, _ = self._get_interpolating_phi_theta(self.base_theta_lines)
+        return NearestNeighborsInterpolator(indexes, phi_theta, extended_vertices, k=5)
+
+    def post_process(self, f_values: torch.Tensor):
+        return self.interpolator(f_values)
 
 
 class BoundaryMeshProcessor(MeshProcessorBase):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self.base_theta_lines = self._create_theta_lines(self.init_grid_frequency, last_point=True)
+        self.base_theta_lines = self._create_theta_lines(self.init_grid_frequency)
+        self.post_indexes = torch.tensor(self._get_post_indexes(self.base_theta_lines))
         self.final_vertices, self.simplices = self._get_post_mesh()
 
-        self.init_vertices = self._assemble_vertices(self.base_theta_lines)
+        self.init_vertices = self._assemble_vertices(self.base_theta_lines, "init_phi_theta")
         self.extended_size = self.final_vertices.shape[0]
 
     def _get_post_mesh(self):
-        vertices = self._assemble_vertices(self.base_theta_lines)
+        vertices = self._assemble_vertices(self.base_theta_lines, "post_phi_theta")
         simplices = self._triangulate(self.init_grid_frequency)
         return vertices, simplices
 
-    def forward(self, f_values: torch.Tensor):
+    def post_process(self, f_values: torch.Tensor):
+        return f_values[..., self.post_indexes]
+
+
+class SkipMeshProcessor(MeshProcessorBase):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.base_theta_lines = self._create_theta_lines(self.init_grid_frequency)
+        self.final_vertices, self.simplices = self._get_post_mesh()
+
+        self.init_vertices = self._assemble_vertices(self.base_theta_lines, "init_phi_theta")
+        self.extended_size = self.final_vertices.shape[0]
+
+    def _get_post_mesh(self):
+        vertices = self._assemble_vertices(self.base_theta_lines, "post_phi_theta")
+        simplices = self._triangulate(self.init_grid_frequency)
+        return vertices, simplices
+
+    def post_process(self, f_values: torch.Tensor):
         return f_values
 
 
@@ -373,21 +488,26 @@ def mesh_processor_factory(init_grid_frequency,
                            interpolate_grid_frequency,
                            interpolate=False,
                            boundaries_cond=None,
-                           phi_limits=(0, 2 * math.pi),
-                           device: torch.device = torch.device("cpu")):
+                           phi_limits=(0, 2 * math.pi)):
 
     if interpolate:
         return InterpolatingMeshProcessor(
             interpolate_grid_frequency,
             init_grid_frequency,
             phi_limits,
-            boundaries_cond, device
+            boundaries_cond
         )
     elif boundaries_cond != "periodic":
         return BoundaryMeshProcessor(
             init_grid_frequency,
             phi_limits,
-            boundaries_cond, device
+            boundaries_cond
+        )
+    else:
+        return SkipMeshProcessor(
+            init_grid_frequency,
+            phi_limits,
+            boundaries_cond
         )
 
 
@@ -401,7 +521,7 @@ class DelaunayMeshNeighbour(BaseMeshPowder):
                  interpolation_grid_frequency: int = 40,
                  boundaries_cond=None,
                  interpolate=False,
-                 dtype=torch.float32, device: torch.device = torch.device("cpu")):
+                 dtype=torch.float32):
         """
         Initialize Delaunay mesh parameters.
 
@@ -411,7 +531,7 @@ class DelaunayMeshNeighbour(BaseMeshPowder):
             initial_grid_frequency: Resolution of initial grid
             interpolation_grid_frequency: Resolution of interpolation grid
         """
-        super().__init__(device=device)
+        super().__init__()
         self.dtype = dtype
         self.eps = eps
 
@@ -420,22 +540,19 @@ class DelaunayMeshNeighbour(BaseMeshPowder):
         self.interpolation_grid_frequency = interpolation_grid_frequency
         self.mesh_processor = mesh_processor_factory(initial_grid_frequency, interpolation_grid_frequency,
                                                      phi_limits=phi_limits, interpolate=interpolate,
-                                                     boundaries_cond=boundaries_cond, device=device)
+                                                     boundaries_cond=boundaries_cond)
 
-        (initial_grid,
-         post_grid,
-         post_simplices) = self.create_initial_cache_data()
+        (self._initial_grid,
+         self._post_grid,
+         self._post_simplices) = self.create_initial_cache_data()
 
-        self.register_buffer("_initial_grid", initial_grid)
-        self.register_buffer("_post_grid", post_grid)
-        self.register_buffer("_post_simplices", post_simplices)
 
     def create_initial_cache_data(self) -> tuple:
         """Create and cache initial mesh data structures."""
         return (
-            torch.as_tensor(self.mesh_processor.init_vertices, dtype=self.dtype, device=self.device),
-            torch.as_tensor(self.mesh_processor.final_vertices, dtype=self.dtype, device=self.device),
-            torch.as_tensor(self.mesh_processor.simplices, device=self.device)
+            torch.as_tensor(self.mesh_processor.init_vertices, dtype=self.dtype),
+            torch.as_tensor(self.mesh_processor.final_vertices, dtype=self.dtype),
+            torch.as_tensor(self.mesh_processor.simplices)
         )
 
     def _triangulate(self, vertices: np.ndarray) -> Delaunay:
@@ -465,7 +582,7 @@ class DelaunayMeshNeighbour(BaseMeshPowder):
         """
         return f_post[..., simplices]
 
-    def forward(self,
+    def post_process(self,
                     f_init: torch.Tensor) -> torch.Tensor:
         """
         Format interpolated values for Delaunay representation.
@@ -476,4 +593,4 @@ class DelaunayMeshNeighbour(BaseMeshPowder):
         Returns:
             torch.Tensor: Values formatted for Delaunay triangulation
         """
-        return self.mesh_processor(f_init)
+        return self.mesh_processor.post_process(f_init)
