@@ -14,8 +14,7 @@ class BaseMesh(nn.Module, ABC):
     @abstractmethod
     def __init__(self, device: torch.device = torch.device("cpu"), *args, **kwargs):
         super().__init__()
-        self.device = device
-        self._rotation_matrices: tp.Optional[torch.Tensor] = None
+        self.register_buffer("_rotation_matrices", None)
 
     @property
     @abstractmethod
@@ -43,7 +42,9 @@ class CrystalMesh(BaseMesh):
         :return: torch.Tensor of shape (..., 3, 3) containing rotation matrices
         """
         super().__init__(device=device)
-        self._rotation_matrices = utils.euler_angles_to_matrix(euler_angles.to(device=device), convention)
+        self.register_buffer("_rotation_matrices",
+                             utils.euler_angles_to_matrix(euler_angles.to(device=device), convention)
+                             )
 
     @property
     def rotation_matrices(self):

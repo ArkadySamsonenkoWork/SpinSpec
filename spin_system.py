@@ -187,6 +187,10 @@ class BaseInteraction(nn.Module, ABC):
         pass
 
     @property
+    def device(self):
+        return self.components.device
+
+    @property
     @abstractmethod
     def strain_correlation(self):
         """
@@ -198,16 +202,13 @@ class BaseInteraction(nn.Module, ABC):
         return len(self.components)
 
     def __repr__(self):
-        # Check if we're dealing with batched tensors
         is_batched = hasattr(self.components, 'shape') and len(self.components.shape) > 1
 
         if is_batched:
             batch_size = self.components.shape[0]
             lines = [f"BATCHED (batch_size={batch_size}) - showing first instance:"]
 
-            # Handle batched components
-            components_dim = self.components.shape[1:]
-            first_components = self.components[0]
+            first_components = self.components.flatten(0, -2)[0]
             if hasattr(first_components, 'tolist'):
                 components_str = [f"{val:.2e}" if abs(val) >= 1e4 else f"{val:.4f}"
                                   for val in first_components.tolist()]
@@ -219,8 +220,7 @@ class BaseInteraction(nn.Module, ABC):
 
             # Handle batched frame
             if self.frame is not None:
-                frame_dim = self.frame.shape[1:]
-                first_frame = self.frame[0]
+                first_frame = self.frame.flatten(0, -2)[0]
                 if hasattr(first_frame, 'tolist'):
                     frame_vals = first_frame.tolist()
                 else:
@@ -234,10 +234,8 @@ class BaseInteraction(nn.Module, ABC):
             else:
                 lines.append("Frame: None")
 
-            # Handle batched strain
             if self.strain is not None:
-                strain_dim = self.strain.shape[1:]
-                first_strain = self.strain[0]
+                first_strain = self.strain.flatten(0, -2)[0]
                 if hasattr(first_strain, 'tolist'):
                     strain_vals = first_strain.tolist()
                     strain_str = [f"{val:.2e}" if abs(val) >= 1e4 else f"{val:.4f}"
@@ -249,7 +247,6 @@ class BaseInteraction(nn.Module, ABC):
                 lines.append("Strain: None")
 
         else:
-            # Handle single (non-batched) tensors
             if hasattr(self.components, 'tolist'):
                 components_str = [f"{val:.2e}" if abs(val) >= 1e4 else f"{val:.4f}"
                                   for val in self.components.tolist()]
@@ -261,14 +258,13 @@ class BaseInteraction(nn.Module, ABC):
                 f"Principal values: [{', '.join(components_str)}]",
             ]
 
-            # Handle single frame
             if self.frame is not None:
                 if hasattr(self.frame, 'tolist'):
                     frame_vals = self.frame.tolist()
                 else:
                     frame_vals = self.frame
 
-                if len(frame_vals) == 3:  # Euler angles
+                if len(frame_vals) == 3:
                     frame_str = f"[α={frame_vals[0]:.3f}, β={frame_vals[1]:.3f}, γ={frame_vals[2]:.3f}] rad"
                     lines.append(f"Frame (Euler angles): {frame_str}")
                 else:
@@ -276,7 +272,6 @@ class BaseInteraction(nn.Module, ABC):
             else:
                 lines.append("Frame: Identity (no rotation)")
 
-            # Handle single strain
             if self.strain is not None:
                 if hasattr(self.strain, 'tolist'):
                     strain_vals = self.strain.tolist()
@@ -317,17 +312,18 @@ class Interaction(BaseInteraction):
             Parameters describing interaction broadening or distribution.
             Default is `None`.
 
+        If the batched paradigm is used then only torch.Tensors with shape [..., 3] are acceptable.
+
         :param device:
 
         :param dtype:
         """
         super().__init__()
-        self.device = device
         self.register_buffer("_components", init_tensor(components, device=device, dtype=dtype))
         self.shape = self._components.shape
         batch_shape = self._components.shape[:-1]
 
-        self._construct_rot_matrix(frame, batch_shape)
+        self._construct_rot_matrix(frame, batch_shape, device)
 
         _strain = init_tensor(strain, device=device, dtype=dtype) if strain is not None else None
         self.register_buffer("_strain", _strain)
@@ -338,22 +334,23 @@ class Interaction(BaseInteraction):
 
         _strain_correlation = torch.eye(3, device=device, dtype=dtype)
         self.register_buffer("_strain_correlation", _strain_correlation)
+        self.to(device)
 
-    def _construct_rot_matrix(self, frame: tp.Optional[torch.tensor], batch_shape):
+    def _construct_rot_matrix(self, frame: tp.Optional[torch.tensor], batch_shape, device: torch.device):
         if frame is None:
-            _frame = torch.zeros((*batch_shape, 3), dtype=torch.float32, device=self.device)  # alpha, beta, gamma
+            _frame = torch.zeros((*batch_shape, 3), dtype=torch.float32, device=device)  # alpha, beta, gamma
             _rot_matrix = self.euler_to_rotmat(_frame).to(self.components.dtype)
 
         else:
             if not isinstance(frame, torch.Tensor):
                 raise TypeError("frame must be a torch.Tensor or None.")
 
-            if frame.shape[-2:] == (3, 3):
-                if frame.shape[:-2] != batch_shape:
-                    raise ValueError(
-                        f"rotation‐matrix batch dims {frame.shape[:-2]} "
-                        f"must match components batch dims {batch_shape}"
-                    )
+            if frame.shape[-2:] == (3, 3) and not batch_shape:
+                #if frame.shape[:-2] != batch_shape:
+                #    raise ValueError(
+                 #       f"rotation‐matrix batch dims {frame.shape[:-2]} "
+                 #       f"must match components batch dims {batch_shape}"
+                 #   )
                 _frame = utils.rotation_matrix_to_euler_angles(frame)
                 _rot_matrix = frame.to(self.components.dtype)
 
@@ -560,7 +557,6 @@ class MultiOrientedInteraction(BaseInteraction):
     def __init__(self, oriented_tensor, strained_tensor, config_shape, strain_correlation: torch.Tensor,
                  device=torch.device("cpu")):
         super().__init__()
-        self.device = device
         self.register_buffer("_oriented_tensor", oriented_tensor)
         self.register_buffer("_strained_tensor", strained_tensor)
         self.register_buffer("_strain_correlation", strain_correlation)
@@ -638,19 +634,39 @@ class SpinSystem(nn.Module):
         """
         super().__init__()
         self.electrons = self._init_electrons(electrons)
-        self.g_tensors = g_tensors
+        self.g_tensors = nn.ModuleList(g_tensors)
         self.nuclei = self._init_nuclei(nuclei) if nuclei else []
 
-        self.electron_nuclei = electron_nuclei if electron_nuclei else []
-        self.electron_electron = electron_electron if electron_electron else []
-        self.nuclei_nuclei = nuclei_nuclei if nuclei_nuclei else []
+        self.electron_nuclei_interactions = nn.ModuleList()
+        self.electron_electron_interactions = nn.ModuleList()
+        self.nuclei_nuclei_interactions = nn.ModuleList()
 
         if len(self.g_tensors) != len(self.electrons):
             raise ValueError("the number of g tensors must be equal to the number of electrons")
 
-        self._operator_cache = {}  # Format: {particle_idx: tensor}
-        self._precompute_all_operators()
-        self.device = device
+        self.en_indices = []
+        self.ee_indices = []
+        self.nn_indices = []
+
+        self._register_interactions(electron_nuclei, self.electron_nuclei_interactions, self.en_indices)
+        self._register_interactions(electron_electron, self.electron_electron_interactions, self.ee_indices)
+        self._register_interactions(nuclei_nuclei, self.nuclei_nuclei_interactions, self.nn_indices)
+
+        self.register_buffer("_operator_cache", self._precompute_all_operators(device=device))
+
+        if device:
+            self.to(device)
+
+    def _register_interactions(self,
+                               interactions: list[tuple[int, int, BaseInteraction]] | None,
+                               module_list: nn.ModuleList,
+                               index_list: list):
+        """Helper to register interactions and store indices"""
+        if interactions:
+            for idx1, idx2, interaction in interactions:
+                module_list.append(interaction)
+                index_list.append((idx1, idx2))
+
 
     def _init_electrons(self, electrons):
         return [particles.Electron(electron) if isinstance(electron, float) else electron for electron in electrons]
@@ -669,20 +685,38 @@ class SpinSystem(nn.Module):
         return math.prod([int(2 * p.spin + 1) for p in itertools.chain(self.electrons, self.nuclei)])
 
     @property
+    def electron_nuclei(self):
+        return [(idx[0], idx[1], inter) for idx, inter in zip(self.en_indices, self.electron_nuclei_interactions)]
+
+    @property
+    def electron_electron(self):
+        return [(idx[0], idx[1], inter) for idx, inter in zip(self.ee_indices, self.electron_electron_interactions)]
+
+    @property
+    def nuclei_nuclei(self):
+        return [(idx[0], idx[1], inter) for idx, inter in zip(self.nn_indices, self.nuclei_nuclei_interactions)]
+
+    @property
     def operator_cache(self):
         return self._operator_cache
 
+    @property
+    def device(self):
+        return self._operator_cache.device
+
     #  Нужно передалать функцию, слишком много циклов. Можно улучшить
-    def _precompute_all_operators(self):
+    def _precompute_all_operators(self, device: torch.device):
         """Precompute spin operators for all particles in the full Hilbert space."""
         particels = self.electrons + self.nuclei
+        operator_cache = []
         for idx, p in enumerate(particels):
             axis_cache = []
             for axis, mat in zip(['x', 'y', 'z'], p.spin_matrices):
                 operator = create_operator(particels, idx, mat)
-                axis_cache.append(operator)
-            self.operator_cache[idx] = torch.stack(axis_cache, dim=-3)   # Сейчас каждый спин даёт матрицу [K, K] и
-                                                                         # расчёт взаимодействией не оптимальный
+                axis_cache.append(operator.to(device))
+            operator_cache.append(torch.stack(axis_cache, dim=-3))   # Сейчас каждый спин даёт матрицу [K, K] и
+                                                                     # расчёт взаимодействией не оптимальный
+        return torch.stack(operator_cache, dim=0)
 
     def update(self,
                g_tensors: list[BaseInteraction] = None,
@@ -715,10 +749,27 @@ class SpinSystem(nn.Module):
             Default is `None`
         """
 
-        self.g_tensors = g_tensors if g_tensors is not None else self.g_tensors
-        self.electron_nuclei = electron_nuclei if electron_nuclei is not None else []
-        self.electron_electron = electron_electron if electron_electron is not None else []
-        self.nuclei_nuclei = nuclei_nuclei if nuclei_nuclei is not None else []
+        if g_tensors is not None:
+            self.g_tensors = nn.ModuleList(g_tensors)
+
+        if electron_nuclei is not None:
+            self.electron_nuclei_interactions = nn.ModuleList()
+            self.en_indices = []
+            self._register_interactions(electron_nuclei, self.electron_nuclei_interactions, self.en_indices)
+
+        # Update electron-electron interactions if provided
+        if electron_electron is not None:
+            self.electron_electron_interactions = nn.ModuleList()
+            self.ee_indices = []
+            self._register_interactions(electron_electron, self.electron_electron_interactions, self.ee_indices)
+
+        # Update nuclei-nuclei interactions if provided
+        if nuclei_nuclei is not None:
+            self.nuclei_nuclei_interactions = nn.ModuleList()
+            self.nn_indices = []
+            self._register_interactions(nuclei_nuclei, self.nuclei_nuclei_interactions, self.nn_indices)
+
+        self.to(self.device)
 
     def __repr__(self):
         hz_to_mhz = 1e-6
@@ -835,7 +886,6 @@ class BaseSample(nn.Module):
         :param kwargs:
         """
         super().__init__()
-        self.device = device
         self.base_spin_system = spin_system
         self.modified_spin_system = copy.deepcopy(spin_system)
         self.register_buffer("_ham_strain", self._init_ham_str(ham_strain))
@@ -843,6 +893,11 @@ class BaseSample(nn.Module):
         self.base_ham_strain = copy.deepcopy(self._ham_strain)
         self.register_buffer("gauss", self._init_gauss_lorentz(gauss))
         self.register_buffer("lorentz", self._init_gauss_lorentz(lorentz))
+        self.to(device)
+
+    @property
+    def device(self):
+        return self.base_spin_system.device
 
     def _init_gauss_lorentz(self, width: tp.Optional[torch.Tensor]):
         if width is None:
@@ -975,9 +1030,8 @@ class BaseSample(nn.Module):
         nuclei_contrib = 0
         for idx, nucleus in enumerate(self.modified_spin_system.nuclei):
             nuclei_contrib += nucleus.spin * nucleus.g_factor.abs()
-
         return (electron_contrib * (constants.BOHR / constants.PLANCK) +
-            nuclei_contrib * (constants.NUCLEAR_MAGNETRON / constants.PLANCK)).squeeze()
+            nuclei_contrib * (constants.NUCLEAR_MAGNETRON / constants.PLANCK)).squeeze(dim=-1)
 
     def get_hamiltonian_terms(self) -> tuple:
         """
@@ -1051,20 +1105,20 @@ class BaseSample(nn.Module):
         is_batched = self.base_spin_system.config_shape
 
         if is_batched:
-            batch_size = self.lorentz.shape[0] if hasattr(self.lorentz, 'shape') else len(self.lorentz)
+            lorentz = self.lorentz.flatten(0, -2)
+            gauss = self.gauss.flatten(0, -2)
+            batch_size = lorentz.shape[0] if hasattr(self.lorentz, 'shape') else len(self.lorentz)
             lines.append(f"BATCHED (batch_size={batch_size}) - showing first instance:")
 
-            # Handle batched lorentz, gauss, ham_str
-            lines.append(f"lorentz: {self.lorentz[0].item():.5f} T")
-            lines.append(f"gauss: {self.gauss[0].item():.5f} T")
+            lines.append(f"lorentz: {lorentz[0].item():.5f} T")
+            lines.append(f"gauss: {gauss[0].item():.5f} T")
 
-            ham_str = self.base_ham_strain[0]
+            ham_str = self.base_ham_strain.flatten(0, -2)[0]
             ham_components = [f"{val:.4e}" if abs(val) >= 1e4 else f"{val:.4f}"
                               for val in ham_str.tolist()]
             ham_dim = self.base_ham_strain.shape[1:]
             lines.append(f"ham_str (dim={ham_dim}): {ham_components} Hz")
         else:
-            # Handle single (non-batched) tensors
             lines.append(f"lorentz: {self.lorentz.item():.5f} T")
             lines.append(f"gauss: {self.gauss.item():.5f} T")
 
@@ -1120,15 +1174,9 @@ class SpinSystemOrientator:
         new_electron_nuclei = new_interactions[num_g:num_g + num_nuc]
         new_electron_electron = new_interactions[num_g + num_nuc:]
 
-        spin_system.g_tensors = [
-            interaction for interaction in new_g_tensors
-        ]
-        spin_system.electron_nuclei = [
-            (x, y, interaction) for (x, y, _), interaction in zip(spin_system.electron_nuclei, new_electron_nuclei)
-        ]
-        spin_system.electron_electron = [
-            (x, y, interaction) for (x, y, _), interaction in zip(spin_system.electron_electron, new_electron_electron)
-        ]
+        spin_system.g_tensors = nn.ModuleList(new_g_tensors)
+        spin_system.electron_nuclei_interactions = nn.ModuleList(new_electron_nuclei)
+        spin_system.electron_electron_interactions = nn.ModuleList(new_electron_electron)
         return spin_system
 
     def transform_spin_system_to_oriented(self, spin_system: SpinSystem, rotation_matrices: torch.Tensor):
@@ -1191,7 +1239,7 @@ class MultiOrientedSample(BaseSample):
         """
 
         super().__init__(spin_system, ham_strain, gauss, lorentz, device=device)
-        self.mesh = self._init_mesh(mesh)
+        self.mesh = self._init_mesh(mesh, device=device)
         rotation_matrices = self.mesh.rotation_matrices
 
         self._ham_strain = self._expand_hamiltonian(
@@ -1200,11 +1248,11 @@ class MultiOrientedSample(BaseSample):
         )
         self.modified_spin_system = SpinSystemOrientator()(spin_system, rotation_matrices)
 
-    def _init_mesh(self, mesh: tp.Optional[BaseMesh]):
+    def _init_mesh(self, mesh: tp.Optional[BaseMesh], device: torch.device):
         if mesh is None:
             mesh = mesher.DelaunayMeshNeighbour(interpolate=True,
                                                 initial_grid_frequency=20,
-                                                interpolation_grid_frequency=40, device=self.device)
+                                                interpolation_grid_frequency=40, device=device)
         return mesh
 
     def _expand_hamiltonian(self, ham_strain: torch.Tensor, orientation_vector: torch.Tensor):

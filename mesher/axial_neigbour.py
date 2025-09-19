@@ -13,7 +13,7 @@ from .general_mesh import BaseMesh, BaseMeshAxial
 
 
 class MeshProcessorAxial:
-    def __init__(self, init_grid_frequency):
+    def __init__(self, init_grid_frequency, device: torch.device = torch.device("cpu")):
         self.init_grid_frequency = init_grid_frequency
 
     def _triangulate(self, grid_frequency):
@@ -21,8 +21,8 @@ class MeshProcessorAxial:
 
 
 class SkipMeshProcessor(MeshProcessorAxial):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, device: torch.device = torch.device("cpu"), *args, **kwargs):
+        super().__init__(device=device, *args, **kwargs)
         self.final_vertices, self.simplices = self._get_post_mesh()
         self.init_vertices = torch.linspace(0.0, torch.pi / 2, self.init_grid_frequency).unsqueeze(-1)
 
@@ -53,7 +53,7 @@ class AxialMeshNeighbour(BaseMeshAxial):
                  eps: float = 1e-7,
                  initial_grid_frequency: int = 20,
                  interpolation_grid_frequency: int = 40,
-                 interpolate=False):
+                 interpolate=False, device: torch.device = torch.device("cpu")):
         """
         Initialize Delaunay mesh parameters.
 
@@ -62,7 +62,7 @@ class AxialMeshNeighbour(BaseMeshAxial):
             initial_grid_frequency: Resolution of initial grid
             interpolation_grid_frequency: Resolution of interpolation grid
         """
-        super().__init__()
+        super().__init__(device=device)
         if interpolate:
             raise NotImplementedError("Interpolation for axial case is not implemented")
         self.eps = eps
@@ -71,16 +71,23 @@ class AxialMeshNeighbour(BaseMeshAxial):
 
         self.mesh_processor = mesh_processor_factory(initial_grid_frequency, interpolation_grid_frequency, interpolate)
 
-        (self._initial_grid,
-         self._post_grid,
-         self._post_simplices) = self.create_initial_cache_data()
+        (
+        initial_grid,
+        post_grid,
+        post_simplices
+        ) = self.create_initial_cache_data(device=device)
 
-    def create_initial_cache_data(self) -> tuple:
+        self.register_buffer("_initial_grid", initial_grid)
+        self.register_buffer("_post_grid", post_grid)
+        self.register_buffer("_post_simplices", post_simplices)
+        self.to(device)
+
+    def create_initial_cache_data(self, device: torch.device) -> tuple:
         """Create and cache initial mesh data structures."""
         return (
-            torch.as_tensor(self.mesh_processor.init_vertices, dtype=torch.float32),
-            torch.as_tensor(self.mesh_processor.final_vertices, dtype=torch.float32),
-            torch.as_tensor(self.mesh_processor.simplices)
+            torch.as_tensor(self.mesh_processor.init_vertices, dtype=torch.float32, device=device),
+            torch.as_tensor(self.mesh_processor.final_vertices, dtype=torch.float32, device=device),
+            torch.as_tensor(self.mesh_processor.simplices, device=device)
         )
 
 

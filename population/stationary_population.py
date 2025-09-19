@@ -14,13 +14,13 @@ class StationaryPopulator(nn.Module):
         """
         super().__init__()
         self.register_buffer("temperature", torch.tensor(temperature, device=device))
-        self.device = device
+        self.to(device)
 
-    def forward(self, energies, lvl_down, lvl_up):
+    def forward(self, energies: torch.Tensor, lvl_down: torch.Tensor, lvl_up: torch.Tensor):
         """
         :param energies: energies in Hz
         :return: population_differences
         """
-        populations = nn.functional.softmax(-constants.unit_converter(energies) / self.temperature, dim=-1)
-        indexes = torch.arange(populations.shape[-2], device=self.device)
+        populations = nn.functional.softmax(-constants.unit_converter(energies, "Hz_to_K") / self.temperature, dim=-1)
+        indexes = torch.arange(populations.shape[-2], device=energies.device)
         return populations[..., indexes, lvl_down] - populations[..., indexes, lvl_up]

@@ -74,12 +74,13 @@ class BaseTripletMechanismGenerator(tr_utils.TransitionMatrixGenerator):
     Let's denote the eigen vectors in magnetic field as V_new, without field V_old.
     Then In the absence of magnetic field the
     """
-    def __init__(self, context: TripletMechanismContext, system_vectors: torch.Tensor, *args, **kwargs):
-        super().__init__(context, *args, **kwargs)
+    def __init__(self, context: TripletMechanismContext, system_vectors: torch.Tensor,
+                 device: torch.device = torch.device("cpu"), *args, **kwargs):
+        super().__init__(context, device=device, *args, **kwargs)
         self.system_vectors = system_vectors
         self.context = context
         self.basis_coeffs = transform.get_transformation_coeffs(
-            context.zero_field_vectors.to(self.device).unsqueeze(-3),
+            context.zero_field_vectors.to(device).unsqueeze(-3),
             system_vectors
         )
 
@@ -94,8 +95,9 @@ class BaseTripletMechanismGenerator(tr_utils.TransitionMatrixGenerator):
 
 
 class ConstTempTripletMechanismGenerator(BaseTripletMechanismGenerator):
-    def __init__(self, context: T1Context | None, temp: torch.Tensor, system_vectors: torch.Tensor, *args, **kwargs):
-        super().__init__(context, system_vectors, *args, **kwargs)
+    def __init__(self, context: T1Context | None, temp: torch.Tensor, system_vectors: torch.Tensor,
+                 device: torch.device = torch.device("cpu"), *args, **kwargs):
+        super().__init__(context, system_vectors, device=device, *args, **kwargs)
         self.temp = temp
 
         self.probs = self._compute_probs(
@@ -113,8 +115,9 @@ class ConstTempTripletMechanismGenerator(BaseTripletMechanismGenerator):
 
 
 class TempDepTripletMechanismGenerator(BaseTripletMechanismGenerator):
-    def __init__(self, context: TempDepContext, system_vectors: torch.Tensor, *args, **kwargs):
-        super().__init__(context, system_vectors, *args, **kwargs)
+    def __init__(self, context: TempDepContext, system_vectors: torch.Tensor,
+                 device: torch.device = torch.device("cpu"), *args, **kwargs):
+        super().__init__(context, system_vectors, device=device, *args, **kwargs)
         self.profile = context.profile
         self.free_probs_transform = context.transform_probs
         self.free_probs = context.free_probs
@@ -136,7 +139,9 @@ class TransitionMatrixGeneratorKinetic(tr_utils.BaseMatrixGenerator):
                  context: KineticContext,
                  temp: torch.Tensor,
                  eigen_vectors_list,
-                 transition_matrix_generators: list[tr_utils.TransitionMatrixGenerator], *args, **kwargs):
+                 transition_matrix_generators: list[tr_utils.TransitionMatrixGenerator],
+                 device: torch.device = torch.device("cpu"), *args, **kwargs):
+        super().__init__(context=context, device=device)
         self.transition_matrix_generators = transition_matrix_generators
         self.num_blocks = len(eigen_vectors_list)
         self.temp = torch.tensor(temp)

@@ -267,3 +267,4 @@ class GenerationCreator(StationarySpectraCreator):
         intensities = intensities.expand(target_shape)
         width = width.expand(target_shape)
         return res_fields, intensities, width, *extras
+

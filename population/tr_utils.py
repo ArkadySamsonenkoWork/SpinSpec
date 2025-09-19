@@ -18,7 +18,6 @@ class BaseMatrixGenerator(ABC):
         """
         super().__init__()
         self.context = context
-        self.device = device
 
     @abstractmethod
     def __call__(self, time: torch.Tensor):
@@ -138,7 +137,7 @@ class EvolutionMatrix:
         :param symmetry_probs: Is the probabilities of transitions are given in symmetric form. Default is True
         """
         self.energy_diff = res_energies.unsqueeze(-2) - res_energies.unsqueeze(-1)
-        self.energy_diff = constants.unit_converter(self.energy_diff)
+        self.energy_diff = constants.unit_converter(self.energy_diff, "Hz_to_K")
         self.config_dim = self.energy_diff.shape[:-2]
         self._probs_matrix = self._prob_matrix_factory(symmetry_probs)
 

@@ -252,7 +252,6 @@ class EasySpinSaverSampleDict:
                         tensors[nuc_idx, start_pos:start_pos + 3] = self._convert_tensor(interaction.components)
                         frames[nuc_idx, start_pos:start_pos + 3] = self._convert_tensor(interaction.frame)
                         strains[nuc_idx, start_pos:start_pos + 3] = strain
-            print(np.array(tensors))
             return {"A": np.array(tensors) * self.hz_to_MHz,
                     # "AStrain": np.array(frames),    I didn't understand the AStrain logic in Easyspin. So I disolved it. It should be one or many or what.!!
                     "AFrame": np.array(strains) * self.hz_to_MHz}
@@ -290,7 +289,6 @@ class EasySpinSaverSampleDict:
             for el_idx_2 in range(el_idx_1, num_electrons):
 
                 if (el_idx_1, el_idx_2) in coupling_dict:
-                    print((el_idx_1, el_idx_2))
                     interaction = coupling_dict[(el_idx_1, el_idx_2)]
 
                     tensor = self._convert_tensor(interaction.components)
@@ -327,7 +325,6 @@ class EasySpinSaverSampleDict:
 
         out_dict = {}
         if zfs_flag:
-            print(np.array(zfs_array))
             out_dict = {"D": np.array(zfs_array) * self.hz_to_MHz, "DFrame": np.array(zfs_frame),
                         "DStrain": np.array(zfz_strain) * self.hz_to_MHz}
 

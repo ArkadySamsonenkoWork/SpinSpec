@@ -3,14 +3,22 @@ from enum import Enum
 import typing as tp
 import sys
 import itertools
+import pathlib
+import pickle
+import tqdm
+import traceback
+import datetime
 from dataclasses import dataclass
 sys.path.append("..")
 
 import torch
+import safetensors
 
 import spin_system
 import particles
 import mesher
+import constants
+from .spectra_generation import GenerationCreator
 
 
 @dataclass
@@ -906,10 +914,10 @@ class SampleGenerator:
             zfs_DE = self.zfs_gen(batch_size)
             D_zfs = zfs_DE[0].to(device).transpose(0, 1)
             E_zfs = zfs_DE[1].to(device).transpose(0, 1)  # [batch_size, num_zfs_pairs]
-            #meta['zfs_D_components'] = D_zfs
-            #meta['zfs_E_components'] = E_zfs
             zfs_components_list = []
+
             for i, (el1, el2) in enumerate(self.zfs_pairs):
+
                 zfs_components = self._convert_DE_to_tensor_components(
                     D_zfs[:, i], E_zfs[:, i]
                 )  # [batch_size, 3]
@@ -925,56 +933,39 @@ class SampleGenerator:
                 pair_idx += 1
 
             if zfs_components_list:
-                meta['zfs_tensor_components'] = torch.stack(zfs_components_list, dim=1).contiguous()
+                meta['zfs_components'] = torch.stack(zfs_components_list, dim=1).contiguous()
         else:
-            #meta['zfs_D_components'] = torch.empty(batch_size, device=device).contiguous()
-            #meta['zfs_E_components'] = torch.empty(batch_size, device=device).contiguous()
-            meta['zfs_tensor_components'] = torch.empty(batch_size, 0, 3, device=device).contiguous()
+            meta['zfs_components'] = torch.empty(batch_size, 0, 3, device=device).contiguous()
 
+        dipolar_components_list = []
         if len(self.exchange_dipolar_pairs) > 0:
             J_values = self.exchange_coupling_gen(batch_size).to(device)
-            #meta['exchange_coupling_values'] = J_values
 
             dipolar_DE = self.dipolar_coupling_gen(batch_size)
             D_dipolar = dipolar_DE[0].to(device).transpose(0, 1)
             E_dipolar = dipolar_DE[1].to(device).transpose(0, 1)
 
-            #meta['dipolar_D_components'] = D_dipolar
-            #meta['dipolar_E_components'] = E_dipolar
-
-            dipolar_components_list = []
-            total_components_list = []
-
             for i, (el1, el2) in enumerate(self.exchange_dipolar_pairs):
                 dipolar_components = self._convert_DE_to_tensor_components(
                     D_dipolar[:, i], E_dipolar[:, i]
                 )
+                dipolar_components_list = []
+                dipolar_components += J_values[:, i].unsqueeze(-1)
                 dipolar_components_list.append(dipolar_components)
 
-                total_components = dipolar_components.clone()
-                total_components += J_values[:, i].unsqueeze(-1)
-                total_components_list.append(total_components)
-
                 interaction = spin_system.Interaction(
-                    components=total_components,
+                    components=dipolar_components,
                     frame=orientations[:, pair_idx, :],
                     device=device,
-                    dtype=total_components.dtype
+                    dtype=dipolar_components.dtype
                 )
                 interactions.append((el1, el2, interaction))
                 pair_idx += 1
 
             if dipolar_components_list:
-                #meta['dipolar_tensor_components'] = torch.stack(dipolar_components_list,
-                #                                                dim=1).contiguous()
-                meta['total_electron_electron_components'] = torch.stack(total_components_list,
-                                                                         dim=1).contiguous()
+                meta['dipolar_components'] = torch.stack(dipolar_components_list, dim=1).contiguous()
         else:
-            #meta['exchange_coupling_values'] = torch.empty(batch_size, device=device).contiguous()
-            #meta['dipolar_D_components'] = torch.empty(batch_size, device=device).contiguous()
-            #meta['dipolar_E_components'] = torch.empty(batch_size, device=device).contiguous()
-            #meta['dipolar_tensor_components'] = torch.empty(batch_size, 3, device=device).contiguous()
-            meta['total_electron_electron_components'] = torch.empty(batch_size, 0, 3, device=device).contiguous()
+            meta['dipolar_components'] = torch.empty(batch_size, 0, 3, device=device).contiguous()
 
         return interactions, meta
 
@@ -984,7 +975,6 @@ class SampleGenerator:
         """
         meta = {}
 
-        # G-tensors
         g_tensors, g_components, g_orientations = self._assemble_g_tensors(batch_size, device)
         meta['g_tensor_components'] = g_components.contiguous()
         meta['g_tensor_orientations'] = g_orientations.contiguous()
@@ -1020,7 +1010,7 @@ class SampleGenerator:
         return spin_sys, meta
 
     def __call__(self, batch_size: int, device: torch.device = torch.device("cpu")) -> tuple[
-        object, torch.Tensor, dict]:
+        spin_system.MultiOrientedSample, torch.Tensor, dict[str, tp.Any]]:
         """Generate a batch of spin systems with parameters and meta information
         Returns: (multi_oriented_sample, temperatures, meta_dict)
         """
@@ -1032,9 +1022,7 @@ class SampleGenerator:
         hamiltonian_strain = hamiltonian_strain.transpose(-2, -1).to(device)
         temperatures = self.temperature_gen(1)[:, 0].to(device)
 
-
         system_inf["data"]['hamiltonian_strain'] = hamiltonian_strain[:, None, None, :].contiguous()
-
         system_inf["data"]['temperatures'] = temperatures[None, :, None, None].contiguous()
 
         system_inf["meta"] = {}
@@ -1056,3 +1044,199 @@ class SampleGenerator:
         return multi_oriented_sample, temperatures, system_inf
 
 
+class DataFullGenerator:
+    def __init__(self,
+                 path: str,
+                 struct_generator: RandomStructureGenerator,
+                 mesh: mesher.DelaunayMeshNeighbour,
+
+                 freq_generator: MultiDimensionalTensorGenerator,
+                 temperature_generator: MultiDimensionalTensorGenerator,
+                 hamiltonian_strain_generator: MultiDimensionalTensorGenerator,
+
+                 g_tensor_components_generator: MultiDimensionalTensorGenerator,
+                 g_tensor_orientation_generator: MultiDimensionalTensorGenerator,
+
+                 hyperfine_coupling_generator: dict[str, MultiDimensionalTensorGenerator],
+                 hyperfine_orientation_generator: MultiDimensionalTensorGenerator,
+
+                 exchange_coupling_generator: MultiDimensionalTensorGenerator,
+                 dipolar_coupling_generator: MultiDimensionalTensorGenerator,
+                 zero_field_splitting_generator: MultiDimensionalTensorGenerator,
+                 electron_electron_orientation_generator: MultiDimensionalTensorGenerator,
+
+                 nuclear_coupling_generator: tp.Optional[MultiDimensionalTensorGenerator] = None,
+                 nuclear_orientation_generator: tp.Optional[MultiDimensionalTensorGenerator] = None,
+
+                 num_temperature_points: int = 4,
+                 num_hamiltonian_strains: int = 3,
+                 fields_base_range: tuple[float, float] = (
+                 (constants.PLANCK / (1.9 * constants.BOHR)) / 4, (constants.PLANCK / (2.4 * constants.BOHR)) * 4)
+                 ):
+        self.base_path = pathlib.Path(path)
+        self.struct_generator = struct_generator
+        self.temperature_gen = temperature_generator
+        self.hamiltonian_strain_gen = hamiltonian_strain_generator
+
+        self.g_components_gen = g_tensor_components_generator
+        self.g_orientation_gen = g_tensor_orientation_generator
+
+        self.hyperfine_coupling_gen = hyperfine_coupling_generator
+        self.hyperfine_orientation_gen = hyperfine_orientation_generator
+
+        self.exchange_coupling_gen = exchange_coupling_generator
+        self.dipolar_coupling_gen = dipolar_coupling_generator
+        self.zfs_gen = zero_field_splitting_generator
+        self.electron_electron_orientation_gen = electron_electron_orientation_generator
+
+        self.nuclear_coupling_gen = nuclear_coupling_generator
+        self.nuclear_orientation_gen = nuclear_orientation_generator
+        self.num_temp_points = num_temperature_points
+        self.num_ham_strains = num_hamiltonian_strains
+
+        self.mesh = mesh
+        self.freq_generator = freq_generator
+        self.fields_base_range = torch.tensor([fields_base_range[0], fields_base_range[1]])
+
+    def _ensure_dir(self, p: tp.Union[str, pathlib.Path]):
+        p = pathlib.Path(p)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    def _save_pickle(self, obj, target_path: pathlib.Path, filename: str):
+        with open(target_path / filename, "wb") as f:
+            pickle.dump(obj, f)
+
+    def _save_structure_files(self, struct_obj, target_path: pathlib.Path):
+        """
+        Try to save easily serializable representation (json) and a pickle backup for the structure.
+        """
+        self._save_pickle(struct_obj, target_path, "structure.pkl")
+
+    def _first_level_generation(self, structure_index: int, batch_size: int) -> tuple[
+        SampleGenerator, pathlib.Path, SpinSystemStructure]:
+        """
+        Generates a structure via struct_generator(), creates a folder for it and returns
+        a configured SampleGenerator for that structure.
+        """
+        struct = self.struct_generator()
+        struct_folder = self.base_path / f"structure_{structure_index:04d}"
+        self._ensure_dir(struct_folder)
+
+        self._save_structure_files(struct, struct_folder)
+
+        sample_gen = SampleGenerator(
+            mesh=self.mesh,
+            structure=struct,
+            temperature_generator=self.temperature_gen,
+            hamiltonian_strain_generator=self.hamiltonian_strain_gen,
+            g_tensor_components_generator=self.g_components_gen,
+            g_tensor_orientation_generator=self.g_orientation_gen,
+            hyperfine_coupling_generator=self.hyperfine_coupling_gen,
+            hyperfine_orientation_generator=self.hyperfine_orientation_gen,
+            exchange_coupling_generator=self.exchange_coupling_gen,
+            dipolar_coupling_generator=self.dipolar_coupling_gen,
+            zero_field_splitting_generator=self.zfs_gen,
+            electron_electron_orientation_generator=self.electron_electron_orientation_gen,
+            nuclear_coupling_generator=self.nuclear_coupling_gen,
+            nuclear_orientation_generator=self.nuclear_orientation_gen,
+            num_temperature_points=self.num_temp_points,
+            num_hamiltonian_strains=self.num_ham_strains,
+        )
+
+        gen_summary = {
+            "num_temperature_points": self.num_temp_points,
+            "num_hamiltonian_strains": self.num_ham_strains,
+            "batch_size": batch_size,
+            "intital_mesh_size": self.mesh.initial_grid_frequency,
+            "interpolate_mesh_size": self.mesh.interpolation_grid_frequency,
+        }
+        with open(struct_folder / "generator_summary.pkl", "wb") as f:
+            pickle.dump(gen_summary, f)
+
+        return sample_gen, struct_folder, struct
+
+    def _get_freq_field(self, batch_size: int):
+        freq = self.freq_generator(1)[0, 0]
+        fields = (self.fields_base_range * freq).expand(batch_size, 2)
+        return freq, fields
+
+    @torch.inference_mode()
+    def generate(self,
+                 struct_iterations: int,
+                 mean_iterations: int,
+                 vary_iterations: int,
+                 batch_size: int,
+                 device: torch.device = torch.device("cpu")) -> None:
+        """
+        Run the three-level generation and save outputs.
+
+        - struct_iterations: how many different structures (top level)
+        - mean_iterations: how many times to update (mid level) per structure
+        - vary_iterations: how many distinct generated samples (low level) per mean iteration
+
+        Files layout:
+        base_path/
+            structure_0000/
+                structure.pkl
+                structure_summary.pkl
+                generator_summary.pkl
+                mean_0000/
+                    sample_0000/
+                        generation_data.safetensors
+                        sample_meta.pkl
+                    ...
+                mean_0001/
+                    ...
+        """
+        self.fields_base_range.to(device=device)
+        for s_idx in range(struct_iterations):
+            print(f"structure_iteration {s_idx} / {struct_iterations}")
+            sample_gen, struct_folder, struct_obj = self._first_level_generation(s_idx, batch_size)
+            for m_idx in range(mean_iterations):
+                print(f"mean_iteration {m_idx} / {mean_iterations}")
+                mean_folder = struct_folder / f"mean_{m_idx:04d}"
+                self._ensure_dir(mean_folder)
+
+                # Update generators for this mean iteration
+                sample_gen.update(device=device)
+                self.freq_generator.update(1, device=device)
+
+                for v_idx in tqdm.tqdm(range(vary_iterations)):
+                    sample_folder = mean_folder / f"sample_{v_idx:04d}"
+                    self._ensure_dir(sample_folder)
+
+                    try:
+                        multi_oriented_sample, temperatures, system_meta = sample_gen(batch_size=batch_size,
+                                                                                      device=device)
+
+                        freq, fields = self._get_freq_field(batch_size=batch_size)
+                        creator = GenerationCreator(freq=freq, sample=multi_oriented_sample,
+                                                    temperature=temperatures, device=device)
+                        out, (min_pos_batch, max_pos_batch) = creator(fields=fields, sample=multi_oriented_sample)
+
+                        save = system_meta["data"]
+                        save["fields"] = fields
+                        save["out"] = out
+                        save["freq"] = freq
+                        save["min_field_pos"] = min_pos_batch
+                        save["max_field_pos"] = max_pos_batch
+                        safetensors.torch.save_file(save, sample_folder / "generation_data.safetensors")
+
+                        with open(sample_folder / "sample_meta.pkl", "wb") as f:
+                            pickle.dump(system_meta["meta"], f)
+
+                    except Exception as error:
+                        # Log error and break to continue with new structure
+                        error_msg = f"Error at structure {s_idx}, mean {m_idx}, vary {v_idx}: {str(error)}\n"
+                        error_msg += f"Traceback: {traceback.format_exc()}\n"
+                        error_msg += f"Timestamp: {datetime.datetime.now()}\n\n"
+                        error_file = mean_folder / f"generation_errors_{s_idx}_{m_idx}_{v_idx}.log"
+                        with open(error_file, "a") as f:
+                            f.write(error_msg)
+                        print(f"Error logged, continuing with new mean values...")
+                        break
+                else:
+                    continue
+            else:
+                continue

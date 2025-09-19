@@ -65,8 +65,8 @@ class EighEigenSolver(BaseEigenSolver):
     """
     Default eigen solver based on torch.linalg.eigh.
     """
-    def forward(self, F: torch.Tensor, G: torch.Tensor, B: torch.Tensor):
-        return torch.linalg.eigh(F + G * B)
+    def forward(self, Hamiltonian: torch.Tensor):
+        return torch.linalg.eigh(Hamiltonian)
 
     def compute_eigenvalues(self, F: torch.Tensor, G: torch.Tensor, B: torch.Tensor):
         return torch.linalg.eigvalsh(F + G * B)
@@ -100,7 +100,7 @@ def has_rapid_variation(res_low: torch.Tensor, res_high: torch.Tensor,
     :param B_high: It is maxima magnetic field of the interval. The shape is [..., 1, 1]
     :return: mask with the shape [...]. If the value is True, the segment could be bisected further.
     """
-    threshold = (deriv_max * (B_high - B_low).squeeze()).unsqueeze(-1)
+    threshold = (deriv_max * (B_high - B_low).squeeze(dim=(-2, -1))).unsqueeze(-1)
     mask = (((res_low + res_high) / 2).abs() <= threshold).any(dim=(-1))
     return mask
 
@@ -508,8 +508,7 @@ class BaseResonanceIntervalSolver(nn.Module, ABC):
         final_batches = []
         (eig_values_low, eig_values_high), (eig_vectors_low, eig_vectors_high), (B_low, B_high), row_indexes = batch
         B_mid = (B_low + B_high) / 2
-
-        eig_values_mid, eig_vectors_mid = torch.linalg.eigh(F.index_select(0, row_indexes) + Gz.index_select(0, row_indexes) * B_mid)
+        eig_values_mid, eig_vectors_mid = self.eigen_finder(F.index_select(0, row_indexes) + Gz.index_select(0, row_indexes) * B_mid)
 
         # It is only one    single
         # point where gradient should be calculated
@@ -612,14 +611,14 @@ class BaseResonanceIntervalSolver(nn.Module, ABC):
         a_tol = resonance_frequency * self.r_tol
         B_low = B_low[..., None, None]
         B_high = B_high[..., None, None]
+
         Hamiltonians = torch.stack((F + Gz * B_low, F + Gz * B_high), dim=-3)
-        eig_values, eig_vectors = torch.linalg.eigh(Hamiltonians)
+        eig_values, eig_vectors = self.eigen_finder(Hamiltonians)
         eig_values_low, eig_values_high = eig_values[..., 0, :], eig_values[..., 1, :]
         eig_vectors_low, eig_vectors_high = eig_vectors[..., 0, :, :], eig_vectors[..., 1, :, :]
 
         iterations = 0
 
-        # True means that continue divide
         active_mask = self.check_resonance(eig_values_low, eig_values_high,
                                            B_low, B_high, resonance_frequency, baseline_sign, derivative_max
                                            )
@@ -912,7 +911,7 @@ class BaseResonanceLocator(nn.Module):
 
         delta_B = B_high - B_low
         K = eig_low.shape[-1]
-        lvl_down, lvl_up = torch.triu_indices(K, K, offset=1)
+        lvl_down, lvl_up = torch.triu_indices(K, K, offset=1, device=B_low.device)
 
         deriv_low = deriv_low.unsqueeze(-2)
         deriv_high = deriv_high.unsqueeze(-2)
@@ -1196,9 +1195,7 @@ class BaseResonanceLocator(nn.Module):
                                                                   eig_values_low, eig_values_high,
                                                                   delta_B * deriv_low, delta_B * deriv_high
                                                                   )
-
             Bres = B_low.squeeze(dim=-1) + step_B * delta_B.squeeze(dim=-1)
-
 
             row_idx = pattern_local_indices.view(-1, 1)
             col_idx = pattern_true_indices.view(1, -1)
@@ -1209,7 +1206,6 @@ class BaseResonanceLocator(nn.Module):
             resonance_energies_new = resonance_energies[tuple(idx)]
             step_B_new = step_B[tuple(idx)]
             Bres = Bres[tuple(idx)]
-
 
             eig_vectors_low_new = eig_vectors_low[pattern_local_indices]
             eig_vectors_high_new = eig_vectors_high[pattern_local_indices]
@@ -1479,15 +1475,16 @@ class ResField(nn.Module):
         if baselign_sign.all():
             locator = self.general_locator
             interval_solver = self.general_solver
-            args = (baselign_sign, system.calculate_derivative_max())
+            args = (baselign_sign.flatten(0, -1), system.calculate_derivative_max().flatten(0, -1))
         elif baselign_sign.any():
             locator = self.general_locator
             interval_solver = self.general_solver
-            args = (baselign_sign.flatten(0, -2), system.calculate_derivative_max().flatten(0, -2))
+            args = (baselign_sign.flatten(0, -1), system.calculate_derivative_max().flatten(0, -1))
         else:
             locator = self.zerofree_locator
             interval_solver = self.zerofree_solver
             args = (None, None)
+
         return interval_solver, locator, args
 
     @staticmethod
@@ -1691,6 +1688,7 @@ class ResField(nn.Module):
         - vector_full_system | None. The eigen vectors for all energy levels
         """
         interval_solver, locator, args = self._solver_fabric(sample, F, resonance_frequency)
+
         batches = interval_solver(
             F.flatten(0, -3), Gz.flatten(0, -3), B_low.flatten(0, -1), B_high.flatten(0, -1),
             resonance_frequency, *args)

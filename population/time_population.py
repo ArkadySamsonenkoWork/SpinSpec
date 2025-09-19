@@ -43,11 +43,11 @@ class BaseTimeDependantPopulator(nn.Module, ABC):
         :param device: device to compute (cpu / gpu)
         """
         super().__init__()
-        self.device = device
         self.init_temp = torch.tensor(init_temp)
         self.context = context or None
         self.solver = solver
         self.tr_matrix_generator_cls = tr_matrix_generator_cls
+        self.to(device)
 
     @abstractmethod
     def _initial_populations(
@@ -72,7 +72,7 @@ class BaseTimeDependantPopulator(nn.Module, ABC):
         :param kwargs:
         :return: initial populations at t=0.
         """
-        return nn.functional.softmax(-constants.unit_converter(energies) / self.init_temp, dim=-1)
+        return nn.functional.softmax(-constants.unit_converter(energies, "Hz_to_K") / self.init_temp, dim=-1)
 
     def _precompute(self, res_fields, lvl_down, lvl_up, energies, vector_down, vector_up, *args, **kwargs):
         energies = copy.deepcopy(energies)

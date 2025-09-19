@@ -47,10 +47,50 @@ _CONVERTERS = {
 }
 
 
-def unit_converter(values: torch.Tensor | np.ndarray | float, conversion: str = "Hz_to_K"):
+def unit_converter(values: torch.Tensor | np.ndarray | float, conversion: str):
     """
     Convert `values` (scalar or torch.Tensor on CPU or GPU)
     according to the given conversion key.
+
+
+    :param values:  torch.Tensor, np.ndarray, or float
+        The numerical value(s) to be converted. Can be a scalar, numpy array,
+        or PyTorch tensor (CPU or GPU).
+
+    :param conversion: str
+        The conversion type specified as "from_to" format. Supported conversions:
+
+        Energy ↔ Frequency:
+        - "Hz_to_J": frequency (Hz) → energy (Joules)
+        - "J_to_Hz": energy (Joules) → frequency (Hz)
+
+        Energy ↔ Temperature:
+        - "J_to_K": energy (Joules) → temperature (Kelvin)
+        - "K_to_J": temperature (Kelvin) → energy (Joules)
+
+        Frequency ↔ Temperature:
+        - "Hz_to_K": frequency (Hz) → temperature (Kelvin)
+        - "K_to_Hz": temperature (Kelvin) → frequency (Hz)
+
+        Energy/Frequency ↔ Magnetic Field:
+        - "Hz_to_T_e": frequency (Hz) → magnetic field (Tesla) for electrons
+        - "T_to_Hz_e": magnetic field (Tesla) → frequency (Hz) for electrons
+        - "Hz_to_T_n": frequency (Hz) → magnetic field (Tesla) for nuclei
+        - "T_to_Hz_n": magnetic field (Tesla) → frequency (Hz) for nuclei
+
+        Energy Units:
+        - "J_to_eV": energy (Joules) → energy (electron volts)
+        - "eV_to_J": energy (electron volts) → energy (Joules)
+
+        Wavenumber Conversions:
+        - "cm-1_to_Hz": wavenumber (cm⁻¹) → frequency (Hz)
+        - "Hz_to_cm-1": frequency (Hz) → wavenumber (cm⁻¹)
+        - "cm-1_to_K": wavenumber (cm⁻¹) → temperature (Kelvin)
+        - "K_to_cm-1": temperature (Kelvin) → wavenumber (cm⁻¹)
+        - "cm-1_to_T_e": wavenumber (cm⁻¹) → magnetic field (Tesla) for electrons
+        - "T_to_cm-1_e": magnetic field (Tesla) → wavenumber (cm⁻¹) for electrons
+        - "cm-1_to_T_n": wavenumber (cm⁻¹) → magnetic field (Tesla) for nuclei
+        - "T_to_cm-1_n": magnetic field (Tesla) → wavenumber (cm⁻¹) for nuclei
     """
     try:
         fn = _CONVERTERS[conversion]
