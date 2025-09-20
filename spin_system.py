@@ -1242,7 +1242,7 @@ class MultiOrientedSample(BaseSample):
         self.mesh = self._init_mesh(mesh, device=device)
         rotation_matrices = self.mesh.rotation_matrices
 
-        self._ham_strain = self._expand_hamiltonian(
+        self._ham_strain = self._expand_hamiltonian_strain(
             self.base_ham_strain,
             self.orientation_vector(rotation_matrices)
         )
@@ -1255,8 +1255,13 @@ class MultiOrientedSample(BaseSample):
                                                 interpolation_grid_frequency=40, device=device)
         return mesh
 
-    def _expand_hamiltonian(self, ham_strain: torch.Tensor, orientation_vector: torch.Tensor):
-        return torch.einsum("...i, ri -> ...r", ham_strain**2, orientation_vector**2).sqrt()
+    def _expand_hamiltonian_strain(self, ham_strain: torch.Tensor, orientation_vector: torch.Tensor):
+        ham_shape = ham_strain.shape[:-1]
+        orient_shape = orientation_vector.shape[:-1]
+        ham_expanded = ham_strain.view(*ham_shape, *([1] * len(orient_shape)), ham_strain.shape[-1])
+        orient_expanded = orientation_vector.view(*([1] * len(ham_shape)), *orient_shape, orientation_vector.shape[-1])
+        result = ((ham_expanded ** 2) * (orient_expanded ** 2)).sum(dim=-1).sqrt()
+        return result
 
     def orientation_vector(self, rotation_matrices: torch.Tensor):
         return rotation_matrices[..., -1, :]
@@ -1323,7 +1328,7 @@ class MultiOrientedSample(BaseSample):
 
         if ham_strain is not None:
             self.base_ham_strain = self._init_ham_str(ham_strain)
-            self._ham_strain = self._expand_hamiltonian(
+            self._ham_strain = self._expand_hamiltonian_strain(
                 self.base_ham_strain,
                 self.orientation_vector(rotation_matrices)
             )

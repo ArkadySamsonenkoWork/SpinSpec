@@ -7,23 +7,21 @@ import constants
 
 def apply_expanded_rotations(R: torch.Tensor, T: torch.Tensor):
     """
-    Rotate tensor T with respect to rotation matrices R using T' = R T R^T.
-
-    Parameters:
-      R (torch.Tensor): Rotation matrices of shape [r, 3, 3].
-      T (torch.Tensor): Tensor to rotate, with shape [..., 3, 3].
-
-    Returns:
-      torch.Tensor: Rotated tensors of shape [..., r, 3, 3].
+    Rotate tensor T with respect to rotation matrices R according formula T' = RTR'
+    :param R: the rotation matrices. The shape is [*rotation_dims, 3, 3]
+    :param T: tensor that must be rotated. The shape is [... 3, 3]
+    :return: The rotated tensors with the shape [..., *rotation_dims, 3, 3]
     """
-    T = T.unsqueeze(-3)
 
-    R_exp = R.unsqueeze(0)
-    RT = torch.matmul(R_exp, T)
-    R_T = R_exp.transpose(-2, -1)
-    rotated_T = torch.matmul(RT, R_T)
 
-    return rotated_T
+    R_batch_shape = R.shape[:-2]
+    T_batch_shape = T.shape[:-2]
+
+    R_expanded = R.view(*([1] * len(T_batch_shape)), *R_batch_shape, 3, 3)
+    T_expanded = T.view(*T_batch_shape, *([1] * len(R_batch_shape)), 3, 3)
+    RT = torch.matmul(R_expanded, T_expanded)
+
+    return torch.matmul(RT, R_expanded.transpose(-1, -2))
 
 
 def apply_single_rotation(R: torch.Tensor, T: torch.Tensor):
@@ -43,28 +41,14 @@ def apply_single_rotation(R: torch.Tensor, T: torch.Tensor):
     return rotated_T
 
 
-def __apply_expanded_rotations(R: torch.Tensor, T: torch.Tensor):
+def _apply_expanded_rotations(R: torch.Tensor, T: torch.Tensor):
     """
     Rotate tensor T with respect to rotation matrices R according formula T' = RTR'
-    :param R: the rotation matrices. The shape is [rotation_dim, 3, 3]
+    :param R: the rotation matrices. The shape is [*rotation_dims, 3, 3]
     :param T: tensor that must be rotated. The shape is [... 3, 3]
-    :return: The rotated tensors with the shape [..., rotation_dim, 3, 3]
+    :return: The rotated tensors with the shape [..., *rotation_dims, 3, 3]
     """
-    return torch.einsum('rij, ...jk, rlk -> ...ril', R, T, R)
 
-
-def __apply_single_rotation(R: torch.Tensor, T: torch.Tensor):
-    """
-    Rotate tensor T with respect to rotation matrices R according formula T' = RTR'
-
-    Applies a single rotation matrix (or a batch of rotation matrices) to a tensor
-    using the transformation T' = R T R^T.
-
-    :param R: the rotation matrices. The shape is [..., 3, 3]
-    :param T: tensor that must be rotated. The shape is [... 3, 3]
-    :return: The rotated tensors with the shape [..., 3, 3]
-    """
-    return torch.einsum('...ij, ...jk, ...lk -> ...il', R, T, R)
 
 
 def calculate_deriv_max(g_tensors_el: torch.Tensor, g_factors_nuc: torch.Tensor,
