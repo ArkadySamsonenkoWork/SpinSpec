@@ -8,7 +8,6 @@ from spectral_integration import BaseSpectraIntegrator,\
     SpectraIntegratorEasySpinLike,\
     SpectraIntegratorEasySpinLikeTimeResolved, MeanIntegrator
 from population import BaseTimeDependantPopulator, StationaryPopulator
-from population.mechanisms import T1Population
 
 import torch
 import torch.fft as fft
@@ -17,6 +16,7 @@ import torch.nn as nn
 import constants
 import mesher
 import res_field_algorithm
+import res_freq_algorithm
 import spin_system
 
 
@@ -135,17 +135,19 @@ class IntegrationProcessorBase(nn.Module, ABC):
                  spectra_integrator: tp.Optional[BaseSpectraIntegrator] = None,
                  harmonic: int = 1,
                  post_spectra_processor: PostSpectraProcessing = PostSpectraProcessing(),
+                 chunk_size: int = 128,
                  device: torch.device = torch.device("cpu")):
         super().__init__()
         self.register_buffer("threshold", torch.tensor(1e-4, device=device))
-        self.spectra_integrator = self._init_spectra_integrator(spectra_integrator, harmonic, device=device)
+        self.spectra_integrator = self._init_spectra_integrator(spectra_integrator, harmonic,
+                                                                chunk_size=chunk_size, device=device)
         self.mesh = mesh
         self.post_spectra_processor = post_spectra_processor
         self.to(device)
 
     @abstractmethod
     def _init_spectra_integrator(self, spectra_integrator: tp.Optional[BaseSpectraIntegrator], harmonic: int,
-                                 device: torch.device):
+                                 chunk_size: int, device: torch.device):
         pass
 
     @abstractmethod
@@ -204,14 +206,17 @@ class IntegrationProcessorPowder(IntegrationProcessorBase):
                  spectra_integrator: tp.Optional[BaseSpectraIntegrator] = None,
                  harmonic: int = 1,
                  post_spectra_processor: PostSpectraProcessing = PostSpectraProcessing(),
+                 chunk_size: int = 128,
                  device: torch.device = torch.device("cpu")
                  ):
-        super().__init__(mesh, spectra_integrator, harmonic, post_spectra_processor, device=device)
+        super().__init__(mesh, spectra_integrator, harmonic, post_spectra_processor,
+                         chunk_size=chunk_size, device=device
+                         )
 
     def _init_spectra_integrator(self, spectra_integrator: tp.Optional[BaseSpectraIntegrator],
-                                 harmonic: int, device: torch.device):
+                                 harmonic: int, chunk_size: int, device: torch.device):
         if spectra_integrator is None:
-            return SpectraIntegratorEasySpinLike(harmonic, device=device)
+            return SpectraIntegratorEasySpinLike(harmonic, chunk_size=chunk_size, device=device)
         else:
             return spectra_integrator
 
@@ -261,13 +266,15 @@ class IntegrationProcessorCrystal(IntegrationProcessorBase):
                  spectra_integrator: tp.Optional[BaseSpectraIntegrator] = None,
                  harmonic: int = 1,
                  post_spectra_processor: PostSpectraProcessing = PostSpectraProcessing(),
+                 chunk_size: int = 128,
                  device: torch.device = torch.device("cpu")):
-        super().__init__(mesh, spectra_integrator, harmonic, post_spectra_processor, device=device)
+        super().__init__(mesh, spectra_integrator, harmonic, post_spectra_processor,
+                         chunk_size=chunk_size, device=device)
 
     def _init_spectra_integrator(self, spectra_integrator: tp.Optional[BaseSpectraIntegrator], harmonic: int,
-                                 device: torch.device):
+                                 chunk_size: int, device: torch.device):
         if spectra_integrator is None:
-            return MeanIntegrator(harmonic, device=device)
+            return MeanIntegrator(harmonic, chunk_size=chunk_size, device=device)
         else:
             return spectra_integrator
 
@@ -310,9 +317,9 @@ class IntegrationProcessorCrystal(IntegrationProcessorBase):
 
 class IntegrationProcessorTimeResolved(IntegrationProcessorPowder):
     def _init_spectra_integrator(self, spectra_integrator: tp.Optional[BaseSpectraIntegrator], harmonic: int,
-                                 device: torch.device):
+                                 chunk_size: int, device: torch.device):
         if spectra_integrator is None:
-            return SpectraIntegratorEasySpinLikeTimeResolved(harmonic, device=device)
+            return SpectraIntegratorEasySpinLikeTimeResolved(harmonic, chunk_size=chunk_size, device=device)
         else:
             return spectra_integrator
 
@@ -426,7 +433,7 @@ class BaseIntensityCalculator(nn.Module):
                         device: torch.device):
         return populator
 
-    def _compute_magnitization(self, Gx, Gy, vector_down, vector_up):
+    def _compute_magnitization_part(self, Gx, Gy, vector_down, vector_up):
         magnitization = compute_matrix_element(vector_down, vector_up, Gx).square().abs() + \
                         compute_matrix_element(vector_down, vector_up, Gy).square().abs()
         return magnitization * (constants.PLANCK / constants.BOHR) ** 2
@@ -455,7 +462,7 @@ class StationaryIntensitiesCalculator(BaseIntensityCalculator):
     def compute_intensity(self, Gx, Gy, Gz, vector_down, vector_up, lvl_down, lvl_up, resonance_energies):
         """Base method to compute intensity (to be overridden)."""
         intensity = self.populator(resonance_energies, lvl_down, lvl_up) * (
-                self._compute_magnitization(Gx, Gy, vector_down, vector_up)
+                self._compute_magnitization_part(Gx, Gy, vector_down, vector_up)
         )
         return intensity
 
@@ -471,7 +478,7 @@ class TimeResolvedIntensitiesCalculator(BaseIntensityCalculator):
                           vector_down: torch.Tensor, vector_up: torch.Tensor,
                           lvl_down: torch.Tensor, lvl_up: torch.Tensor, resonance_energies: torch.Tensor):
         intensity = (
-                self._compute_magnitization(Gx, Gy, vector_down, vector_up)
+                self._compute_magnitization_part(Gx, Gy, vector_down, vector_up)
         )
         return intensity
 
@@ -521,7 +528,7 @@ class BaseSpectraCreator(nn.Module, ABC):
     Base clas of spectra creators
     """
     def __init__(self,
-                 freq: tp.Union[float, torch.Tensor],
+                 resonance_parameter: tp.Union[float, torch.Tensor],
                  sample: tp.Optional[spin_system.MultiOrientedSample] = None,
                  spin_system_dim: tp.Optional[int] = None,
                  batch_dims: tp.Optional[float] = None,
@@ -533,10 +540,11 @@ class BaseSpectraCreator(nn.Module, ABC):
                  post_spectra_processor: PostSpectraProcessing = PostSpectraProcessing(),
                  temperature: tp.Optional[tp.Union[float, torch.Tensor]] = 293,
                  recompute_spin_parameters: bool = True,
+                 integration_chunk_size: int = 128,
                  device: torch.device = torch.device("cpu")
                  ):
         """
-        :param freq: Resonance frequency of experiment
+        :param resonance_parameter: Resonance parameter of experiment: frequency or field
 
         :param sample: MultiOrientedSample.
             It is just an example of spin system to extract meta information (spin_system_dim, batch_dims, mesh)
@@ -568,9 +576,14 @@ class BaseSpectraCreator(nn.Module, ABC):
         :param recompute_spin_parameters:
             Recompute spin parameters in __call__ methods. For stationary creator is True, for time resolves is False
 
+        :param integration_chunk_size:
+            Chunk Size of integration process. Current implementation of powder integration is iterative.
+            For whole set of resonance lines chunk size of spectral freq/field is computed.
+            Increasing the size increases the integration speed, but also increases the required memory allocation.
+
         """
         super().__init__()
-        self.register_buffer("resonance_freq", torch.tensor(freq, device=device))
+        self.register_buffer("resonance_parameter", torch.tensor(resonance_parameter, device=device))
         self.register_buffer("threshold", torch.tensor(1e-2, device=device))
         self.register_buffer("tolerancy", torch.tensor(1e-10, device=device))
 
@@ -579,11 +592,7 @@ class BaseSpectraCreator(nn.Module, ABC):
         self.mesh_size = self.mesh.initial_size
         self.broader = Broadener(device=device)
 
-        self.res_field = res_field_algorithm.ResField(spin_system_dim=self.spin_system_dim,
-                                                      mesh_size=self.mesh_size,
-                                                      batch_dims=self.batch_dims,
-                                                      output_full_eigenvector=self._get_output_eigenvector(),
-                                                      device=device)
+        self.res_algorithm = self._init_res_algorithm(device=device)
 
         self.intensity_calculator = self._get_intenisty_calculator(intensity_calculator,
                                                                    temperature, populator, device=device)
@@ -591,7 +600,9 @@ class BaseSpectraCreator(nn.Module, ABC):
 
         self.spectra_processor = self._init_spectra_processor(spectra_integrator,
                                                               harmonic,
-                                                              post_spectra_processor, device=device)
+                                                              post_spectra_processor,
+                                                              chunk_size=integration_chunk_size,
+                                                              device=device)
         self.recompute_spin_parameters = recompute_spin_parameters
         self._init_cached_parameters()
         self.to(device)
@@ -611,11 +622,21 @@ class BaseSpectraCreator(nn.Module, ABC):
         else:
             self._resfield_method = self._recomputed_resfield
 
+    def _init_res_algorithm(self, device):
+        return res_field_algorithm.ResField(
+            spin_system_dim=self.spin_system_dim,
+            mesh_size=self.mesh_size,
+            batch_dims=self.batch_dims,
+            output_full_eigenvector=self._get_output_eigenvector(),
+            device=device
+        )
+
     @abstractmethod
     def _init_spectra_processor(self,
                                 spectra_integrator: tp.Optional[BaseSpectraIntegrator],
                                 harmonic: int,
                                 post_spectra_processor: PostSpectraProcessing,
+                                chunk_size: int,
                                 device: torch.device) -> IntegrationProcessorBase:
         pass
 
@@ -679,7 +700,7 @@ class BaseSpectraCreator(nn.Module, ABC):
                                 B_low: torch.Tensor, B_high: torch.Tensor,
                                 F: torch.Tensor, Gz: torch.Tensor):
         (vectors_u, vectors_v), (valid_lvl_down, valid_lvl_up), res_fields, resonance_energies, full_eigen_vectors =\
-                self.res_field(sample, self.resonance_freq, B_low, B_high, F, Gz)
+                self.res_algorithm(sample, self.resonance_parameter, B_low, B_high, F, Gz)
 
         return (vectors_u, vectors_v), (valid_lvl_down, valid_lvl_up), res_fields,\
             resonance_energies, full_eigen_vectors
@@ -810,7 +831,6 @@ class BaseSpectraCreator(nn.Module, ABC):
          - Width of transition lines
          - extras parameters computed in _compute_additional
         """
-
         intensities = self.intensity_calculator.compute_intensity(
             Gx, Gy, Gz, vector_down, vector_up, lvl_down, lvl_up, resonance_energies
         )
@@ -857,6 +877,7 @@ class StationarySpectraCreator(BaseSpectraCreator):
                  post_spectra_processor: PostSpectraProcessing = PostSpectraProcessing(),
                  temperature: tp.Optional[tp.Union[float, torch.Tensor]] = 293,
                  recompute_spin_parameters: bool = True,
+                 integration_chunk_size: int = 128,
                  device: torch.device = torch.device("cpu")
                  ):
         """
@@ -896,10 +917,16 @@ class StationarySpectraCreator(BaseSpectraCreator):
         :param recompute_spin_parameters:
             Recompute spin parameters in __call__ methods. For stationary creator is True.
 
+        :param integration_chunk_size:
+            Chunk Size of integration process. Current implementation of powder integration is iterative.
+            For whole set of resonance lines chunk size of spectral freq/field is computed.
+            Increasing the size increases the integration speed, but also increases the required memory allocation.
         """
         super().__init__(freq, sample, spin_system_dim, batch_dims, mesh, intensity_calculator,
                          populator, spectra_integrator, harmonic, post_spectra_processor,
-                         temperature, recompute_spin_parameters, device=device)
+                         temperature, recompute_spin_parameters,
+                         integration_chunk_size=integration_chunk_size,
+                         device=device)
 
     def _postcompute_batch_data(self, res_fields: torch.Tensor, intensities: torch.Tensor, width: torch.Tensor,
                                 F: torch.Tensor, Gx: torch.Tensor, Gy: torch.Tensor, Gz: torch.Tensor,
@@ -910,18 +937,19 @@ class StationarySpectraCreator(BaseSpectraCreator):
                                 spectra_integrator: tp.Optional[BaseSpectraIntegrator],
                                 harmonic: int,
                                 post_spectra_processor: PostSpectraProcessing,
+                                chunk_size: int,
                                 device: torch.device) -> IntegrationProcessorBase:
         if self.mesh.name == "PowderMesh":
             return IntegrationProcessorPowder(self.mesh, spectra_integrator, harmonic, post_spectra_processor,
-                                              device=device)
+                                              chunk_size=chunk_size, device=device)
 
         elif self.mesh.name == "CrystalMesh":
             return IntegrationProcessorCrystal(self.mesh, spectra_integrator, harmonic, post_spectra_processor,
-                                               device=device)
+                                               chunk_size=chunk_size, device=device)
 
         else:
             return IntegrationProcessorPowder(self.mesh, spectra_integrator, harmonic, post_spectra_processor,
-                                              device=device)
+                                              chunk_size=chunk_size, device=device)
 
     def __call__(self,
                 sample: spin_system.MultiOrientedSample,
@@ -1061,13 +1089,14 @@ class TruncatedSpectraCreatorTimeResolved(BaseSpectraCreator):
                                 spectra_integrator: tp.Optional[BaseSpectraIntegrator],
                                 harmonic: int,
                                 post_spectra_processor: PostSpectraProcessing,
+                                chunk_size: int,
                                 device: torch.device) -> IntegrationProcessorBase:
         if self.mesh.name == "PowderMesh":
             return IntegrationProcessorTimeResolved(self.mesh, spectra_integrator, harmonic, post_spectra_processor,
-                                                    device=device)
+                                                    chunk_size=chunk_size, device=device)
         else:
             return IntegrationProcessorTimeResolved(self.mesh, spectra_integrator, harmonic, post_spectra_processor,
-                                                    device=device)
+                                                    chunk_size=chunk_size, device=device)
 
     def _init_recompute_spin_flag(self) -> bool:
         """
@@ -1136,7 +1165,7 @@ class MultiSampleCreator(nn.Module):
         creators[i] is already configured for sample i (its spin_system_dim, mesh, …).
         """
         super().__init__()
-        self.resonance_freq = torch.tensor(freq) if freq is not None else creators[0].resonance_freq
+        self.resonance_parameter = torch.tensor(freq) if freq is not None else creators[0].resonance_parameter
         self.spin_system_dim = [creator.spin_system_dim for creator in creators]
         if len(creators) == 0:
             raise ValueError("Need at least one creator")
@@ -1223,4 +1252,162 @@ class MultiSampleCreator(nn.Module):
             spectras.append(spectra)
         return torch.stack(spectras, dim=0)
 
+
+class StationarySpectraCreatorFreq(StationarySpectraCreator):
+    """
+    Spectra Creator to compute CW spectra. As default it computes powder spectra.
+    """
+    def __init__(self,
+                 field: tp.Union[float, torch.Tensor],
+                 sample: tp.Optional[spin_system.MultiOrientedSample] = None,
+                 spin_system_dim: tp.Optional[int] = None,
+                 batch_dims: tp.Optional[float] = None,
+                 mesh: tp.Optional[mesher.BaseMesh] = None,
+                 intensity_calculator: tp.Optional[BaseIntensityCalculator] = None,
+                 populator: tp.Optional[StationaryPopulator] = None,
+                 spectra_integrator: tp.Optional[BaseSpectraIntegrator] = None,
+                 harmonic: int = 1,
+                 post_spectra_processor: PostSpectraProcessing = PostSpectraProcessing(),
+                 temperature: tp.Optional[tp.Union[float, torch.Tensor]] = 293,
+                 recompute_spin_parameters: bool = True,
+                 device: torch.device = torch.device("cpu")
+                 ):
+        """
+        :param field: Resonance field of experiment
+
+        :param sample: MultiOrientedSample.
+            It is just an example of spin system to extract meta information (spin_system_dim, batch_dims, mesh)
+            If it is None, then spin_system_dim, batch_dims, mesh should be given
+
+        :param spin_system_dim: The size of spin system. Default is None
+        :param batch_dims: The number of batch dimensions. Default is None
+        :param mesh: Mesh object. Default is None
+            If (mesh, batch_dims, spin_system_dim) are None then sample object should be given
+
+        :param intensity_calculator:
+            Class that is used to compute intensity of spectra via temperature/ time/ hamiltonian parameters.
+            Default is None
+            If it is None then it will be initialized as StationaryIntensitiesCalculator
+
+        :param populator:
+            Class that is used to compute part intensity due to population of levels. Default is None
+            If intensity_calculator is None or StationaryIntensitiesCalculator
+            then it will be initialized as StationaryPopulation
+            In this case the population is given as Boltzmann population
+
+        :param spectra_integrator:
+            Class to integrate the resonance lines to get the spectrum.
+
+        :param harmonic: Harmonic of spectra: 1 is derivative, 0 is absorbance. Default is 1.
+
+        :param post_spectra_processor:
+            Class to post process resulted resonance data (fields, intensities, width):
+            integration, mesh mapping and so on. Default post_spectra_processor is powder spectra processor
+
+        :param temperature: The temperature of an experiment. If populator is not None it takes from it
+
+        :param recompute_spin_parameters:
+            Recompute spin parameters in __call__ methods. For stationary creator is True.
+
+        """
+        super().__init__(field, sample, spin_system_dim, batch_dims, mesh, intensity_calculator,
+                         populator, spectra_integrator, harmonic, post_spectra_processor,
+                         temperature, recompute_spin_parameters, device=device)
+
+    def _init_res_algorithm(self, device):
+        return res_freq_algorithm.ResFreq(
+            spin_system_dim=self.spin_system_dim,
+            mesh_size=self.mesh_size,
+            batch_dims=self.batch_dims,
+            output_full_eigenvector=self._get_output_eigenvector(),
+            device=device
+        )
+
+    def __call__(self,
+                sample: spin_system.MultiOrientedSample,
+                freq: torch.Tensor, time: tp.Optional[torch.Tensor] = None, **kwargs):
+        """
+        :param sample: MultiOrientedSample object
+        :param freq: The frequency in Hz units
+        :param time: It is used only for time resolved spectra
+        :param kwargs:
+        :return:
+        """
+        return super().__call__(sample, freq, time)
+
+    def compute_parameters(self, sample: spin_system.MultiOrientedSample,
+                           F: torch.Tensor,
+                           Gx: torch.Tensor,
+                           Gy: torch.Tensor,
+                           Gz: torch.Tensor,
+                           vector_down: torch.Tensor, vector_up: torch.Tensor,
+                           lvl_down: torch.Tensor, lvl_up: torch.Tensor,
+                           res_freq: torch.Tensor,
+                           resonance_energies: torch.Tensor,
+                           full_system_vectors: tp.Optional[torch.Tensor]) ->\
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[tp.Any]]:
+        """
+        :param sample: The sample which transitions must be found
+        :param F: Magnetic free part of spin Hamiltonian H = F + B * G
+        :param Gx: x-part of Hamiltonian Zeeman Term
+        :param Gy: y-part of Hamiltonian Zeeman Term
+        :param Gz: z-part of Hamiltonian Zeeman Term
+
+        :param vector_down:
+            Eigenvectors of the lower energy states. The shape is [...., M, N],
+            where M is number of transitions, N is number of levels
+
+        :param vector_up:
+            Eigenvectors of the upper energy states.The shape is [...., M, N],
+            where M is number of transitions, N is number of levels
+
+        :param lvl_down:
+            Energy levels of lower states from which transitions occur.
+            Shape: [time, ..., N], where time is the time dimension and
+            N is the number of energy levels.
+
+        :param lvl_up:
+            Energy levels of upper states to which transitions occur.
+            Shape: [time, ..., N], where time is the time dimension and
+            N is the number of energy levels.
+
+        :param resonance_energies:
+            Energies of spin states. The shape is [..., N]
+
+        :param res_freq: Resonance frequencies. The shape os [..., N]
+
+        :param full_system_vectors: Eigen vector of each level of a spin system. The shape os [..., N, N]
+
+        :return: tuple of the next data
+         - Resonance fields
+         - Intensities of transitions
+         - Width of transition lines
+         - extras parameters computed in _compute_additional
+        """
+
+        intensities = self.intensity_calculator.compute_intensity(
+            Gx, Gy, Gz, vector_down, vector_up, lvl_down, lvl_up, resonance_energies
+        )
+        lines_dimension = tuple(range(intensities.ndim - 1))
+        intensities_mask = (intensities / intensities.abs().max() > self.threshold).any(dim=lines_dimension)
+        intensities = intensities[..., intensities_mask]
+
+        extras = self._mask_additional(vector_down,
+            vector_up, lvl_down, lvl_up, resonance_energies,
+            full_system_vectors)
+
+        extras = self._mask_components(intensities_mask, *extras)
+
+        res_fields = res_freq[..., intensities_mask]
+        vector_u = vector_down[..., intensities_mask, :]
+        vector_v = vector_up[..., intensities_mask, :]
+
+        intensities = intensities / intensities.abs().max()
+        width = self.broader(sample, vector_u, vector_v, res_fields)
+
+        extras = self._compute_additional(
+            sample, F, Gx, Gy, Gz, *extras
+        )
+
+        return res_fields, intensities, width, *extras
 

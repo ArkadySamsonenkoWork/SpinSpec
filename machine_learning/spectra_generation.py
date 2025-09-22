@@ -49,12 +49,14 @@ class GenerationIntegrationProcessorPowder(IntegrationProcessorPowder):
                  spectra_integrator: tp.Optional[BaseSpectraIntegrator] = None,
                  harmonic: int = 1,
                  post_spectra_processor: PostSpectraProcessing = PostSpectraProcessing(),
+                 chunk_size: int = 128,
                  device: torch.device = torch.device("cpu"),
                  num_points: int = 4_000,
                  spectral_width_part: float = 0.5,
                  min_spectral_width: float = 0.01,
                  ):
-        super().__init__(mesh, spectra_integrator, harmonic, post_spectra_processor, device=device)
+        super().__init__(mesh, spectra_integrator, harmonic, post_spectra_processor,
+                         chunk_size=chunk_size, device=device)
         self.register_buffer("num_points", torch.tensor(num_points, device=device))
         self.register_buffer("spectral_width_part", torch.tensor(spectral_width_part, device=device))
         self.register_buffer("min_spectral_width", torch.tensor(min_spectral_width, device=device))
@@ -72,7 +74,7 @@ class GenerationIntegrationProcessorPowder(IntegrationProcessorPowder):
         min_pos_batch = min_pos_batch * (1.0 - self.spectral_width_part * nature_spectra_width)
         max_pos_batch = max_pos_batch * (1.0 + self.spectral_width_part * nature_spectra_width)
 
-        steps = torch.linspace(0, 1, self.num_points)
+        steps = torch.linspace(0, 1, self.num_points, device=res_fields.device)
         fields = steps * (max_pos_batch - min_pos_batch).unsqueeze(-1) + min_pos_batch.unsqueeze(-1)
         return fields, min_pos_batch, max_pos_batch
 
@@ -115,6 +117,7 @@ class GenerationCreator(StationarySpectraCreator):
                  post_spectra_processor: PostSpectraProcessing = PostSpectraProcessing(),
                  temperature: tp.Optional[tp.Union[float, torch.Tensor]] = torch.tensor([293]),
                  recompute_spin_parameters: bool = True,
+                 integration_chunk_size: int = 128,
                  device: torch.device = torch.device("cpu")
                  ):
         """
@@ -165,22 +168,26 @@ class GenerationCreator(StationarySpectraCreator):
                          post_spectra_processor=post_spectra_processor,
                          temperature=temperature,
                          recompute_spin_parameters=recompute_spin_parameters,
+                         integration_chunk_size=integration_chunk_size,
                          device=device)
         self.broader = GenerationBroadener(device=device)
 
     def _init_spectra_processor(self,
                                 spectra_integrator: tp.Optional[BaseSpectraIntegrator],
                                 harmonic: int,
-                                post_spectra_processor: PostSpectraProcessing, device: torch.device) ->\
+                                post_spectra_processor: PostSpectraProcessing,
+                                chunk_size: int, device: torch.device) ->\
             IntegrationProcessorPowder:
         if self.mesh.name == "PowderMesh":
-            return GenerationIntegrationProcessorPowder(self.mesh, spectra_integrator, harmonic, post_spectra_processor)
+            return GenerationIntegrationProcessorPowder(self.mesh, spectra_integrator, harmonic,
+                                                        post_spectra_processor, chunk_size=chunk_size, device=device)
 
         elif self.mesh.name == "CrystalMesh":
             raise NotImplementedError
 
         else:
-            return GenerationIntegrationProcessorPowder(self.mesh, spectra_integrator, harmonic, post_spectra_processor)
+            return GenerationIntegrationProcessorPowder(self.mesh, spectra_integrator, harmonic,
+                                                        post_spectra_processor, chunk_size=chunk_size, device=device)
 
     def compute_parameters(self, sample: spin_system.MultiOrientedSample,
                            F: torch.Tensor,

@@ -36,8 +36,6 @@ class ViewIndexator(nn.Module):
         return (reordered[:n_1] for reordered in reordered_array)
 
 
-
-
 class BaseEigenSolver(nn.Module, ABC):
     @abstractmethod
     def forward(self, F: torch.Tensor, G: torch.Tensor, B: torch.Tensor):
@@ -126,7 +124,6 @@ def has_rapid_variation(res_low: torch.Tensor, res_high: torch.Tensor,
 # 14) Изменить способо обработки случая and. Сейчас там формируется два отдельных батча.
 # 15) triu_indices - можно посчитать только один раз и потом не пересчитывать
 # Можно ввести ещё одну размерность.
-
 
 class BaseResonanceIntervalSolver(nn.Module, ABC):
     """
@@ -742,7 +739,7 @@ class ZeroFreeResonanceIntervalSolver(BaseResonanceIntervalSolver):
 
 
 class BaseResonanceLocator(nn.Module):
-    def __init__(self, max_iterations=50, tolerance=1e-12, accuracy=1e-4, output_full_eigenvector=False,
+    def __init__(self, max_iterations=50, tolerance=1e-12, accuracy=1e-5, output_full_eigenvector=False,
                  device: torch.device = torch.device("cpu")):
         super().__init__()
         self.device = device
@@ -1663,7 +1660,6 @@ class ResField(nn.Module):
 
         return (vectors_u, vectors_v), (valid_lvl_down, valid_lvl_up),\
             res_fields, resonance_energies, full_eigen_vectors
-
 
     def forward(self, sample: spin_system.BaseSample,
                  resonance_frequency: torch.Tensor,

@@ -839,8 +839,8 @@ class SampleGenerator:
         """Generic method to create tensor interactions with components and orientations
         Returns: (interactions, components_tensor, orientations_tensor)
         """
-        components = components_gen(batch_size).transpose(-3, -1).to(device)
-        orientations = orientation_gen(batch_size).transpose(-3, -1).to(device)
+        components = components_gen(batch_size).transpose(-3, -1)
+        orientations = orientation_gen(batch_size).transpose(-3, -1)
 
         interactions = []
         num_entities = components.shape[1]
@@ -903,7 +903,7 @@ class SampleGenerator:
         meta = {}
 
         if len(self.electron_electron_pairs) > 0:
-            orientations = self.electron_electron_orientation_gen(batch_size).transpose(-3, -1).to(device)
+            orientations = self.electron_electron_orientation_gen(batch_size).transpose(-3, -1)
             meta['electron_electron_orientations'] = orientations  # [batch_size, num_pairs, 3]
         else:
             meta['electron_electron_orientations'] = torch.empty(batch_size, 0, 3, device=device)
@@ -912,8 +912,8 @@ class SampleGenerator:
 
         if len(self.zfs_pairs) > 0:
             zfs_DE = self.zfs_gen(batch_size)
-            D_zfs = zfs_DE[0].to(device).transpose(0, 1)
-            E_zfs = zfs_DE[1].to(device).transpose(0, 1)  # [batch_size, num_zfs_pairs]
+            D_zfs = zfs_DE[0].transpose(0, 1)
+            E_zfs = zfs_DE[1].transpose(0, 1)  # [batch_size, num_zfs_pairs]
             zfs_components_list = []
 
             for i, (el1, el2) in enumerate(self.zfs_pairs):
@@ -939,11 +939,11 @@ class SampleGenerator:
 
         dipolar_components_list = []
         if len(self.exchange_dipolar_pairs) > 0:
-            J_values = self.exchange_coupling_gen(batch_size).to(device)
+            J_values = self.exchange_coupling_gen(batch_size).transpose(0, 1)
 
             dipolar_DE = self.dipolar_coupling_gen(batch_size)
-            D_dipolar = dipolar_DE[0].to(device).transpose(0, 1)
-            E_dipolar = dipolar_DE[1].to(device).transpose(0, 1)
+            D_dipolar = dipolar_DE[0].transpose(0, 1)
+            E_dipolar = dipolar_DE[1].transpose(0, 1)
 
             for i, (el1, el2) in enumerate(self.exchange_dipolar_pairs):
                 dipolar_components = self._convert_DE_to_tensor_components(
@@ -988,13 +988,13 @@ class SampleGenerator:
         meta.update(ee_meta)
 
         if self.nuclear_coupling_gen is not None and len(self.nucleus_nucleus_pairs) > 0:
-            nuclear_components = self.nuclear_coupling_gen(batch_size).transpose(-3, -1).to(device)
+            nuclear_components = self.nuclear_coupling_gen(batch_size).transpose(-3, -1)
             meta['nuclear_coupling_components'] = nuclear_components.contiguous()
         else:
             meta['nuclear_coupling_components'] = torch.empty(batch_size, 0, 3, device=device).contiguous()
 
         if self.nuclear_orientation_gen is not None and len(self.nucleus_nucleus_pairs) > 0:
-            nuclear_orientations = self.nuclear_orientation_gen(batch_size).transpose(-3, -1).to(device)
+            nuclear_orientations = self.nuclear_orientation_gen(batch_size).transpose(-3, -1)
             meta['nuclear_coupling_orientations'] = nuclear_orientations.contiguous()
         else:
             meta['nuclear_coupling_orientations'] = torch.empty(batch_size, 0, 3, device=device).contiguous()
@@ -1019,8 +1019,8 @@ class SampleGenerator:
         system_inf["data"] = system_data
 
         hamiltonian_strain = self.hamiltonian_strain_gen(1)[:, :, 0]
-        hamiltonian_strain = hamiltonian_strain.transpose(-2, -1).to(device)
-        temperatures = self.temperature_gen(1)[:, 0].to(device)
+        hamiltonian_strain = hamiltonian_strain.transpose(-2, -1)
+        temperatures = self.temperature_gen(1)[:, 0]
 
         system_inf["data"]['hamiltonian_strain'] = hamiltonian_strain[:, None, None, :].contiguous()
         system_inf["data"]['temperatures'] = temperatures[None, :, None, None].contiguous()
@@ -1071,7 +1071,8 @@ class DataFullGenerator:
                  num_temperature_points: int = 4,
                  num_hamiltonian_strains: int = 3,
                  fields_base_range: tuple[float, float] = (
-                 (constants.PLANCK / (1.9 * constants.BOHR)) / 4, (constants.PLANCK / (2.4 * constants.BOHR)) * 4)
+                 (constants.PLANCK / (1.9 * constants.BOHR)) / 4, (constants.PLANCK / (2.4 * constants.BOHR)) * 4),
+                 device: torch.device = torch.device("cpu")
                  ):
         self.base_path = pathlib.Path(path)
         self.struct_generator = struct_generator
@@ -1096,7 +1097,7 @@ class DataFullGenerator:
 
         self.mesh = mesh
         self.freq_generator = freq_generator
-        self.fields_base_range = torch.tensor([fields_base_range[0], fields_base_range[1]])
+        self.fields_base_range = torch.tensor([fields_base_range[0], fields_base_range[1]], device=device)
 
     def _ensure_dir(self, p: tp.Union[str, pathlib.Path]):
         p = pathlib.Path(p)
@@ -1193,8 +1194,13 @@ class DataFullGenerator:
         for s_idx in range(struct_iterations):
             print(f"structure_iteration {s_idx} / {struct_iterations}")
             sample_gen, struct_folder, struct_obj = self._first_level_generation(s_idx, batch_size)
+            print(f"generation_structure {struct_obj}")
             for m_idx in range(mean_iterations):
                 print(f"mean_iteration {m_idx} / {mean_iterations}")
+                now = datetime.datetime.now()
+                dt_string = now.strftime("%d/%m/%Y %H:%M:%S")
+                print("start_process_time", dt_string)
+
                 mean_folder = struct_folder / f"mean_{m_idx:04d}"
                 self._ensure_dir(mean_folder)
 
@@ -1227,7 +1233,6 @@ class DataFullGenerator:
                             pickle.dump(system_meta["meta"], f)
 
                     except Exception as error:
-                        # Log error and break to continue with new structure
                         error_msg = f"Error at structure {s_idx}, mean {m_idx}, vary {v_idx}: {str(error)}\n"
                         error_msg += f"Traceback: {traceback.format_exc()}\n"
                         error_msg += f"Timestamp: {datetime.datetime.now()}\n\n"
