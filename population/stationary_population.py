@@ -16,7 +16,7 @@ class StationaryPopulator(nn.Module):
         self.register_buffer("temperature", torch.tensor(temperature, device=device))
         self.to(device)
 
-    def forward(self, energies: torch.Tensor, lvl_down: torch.Tensor, lvl_up: torch.Tensor):
+    def forward(self, energies: torch.Tensor, lvl_down: torch.Tensor, lvl_up: torch.Tensor, *args, **kwargs):
         """
         :param energies: energies in Hz
         :return: population_differences

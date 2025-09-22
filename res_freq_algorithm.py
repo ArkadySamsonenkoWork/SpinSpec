@@ -6,7 +6,7 @@ import spin_system
 ### The energy computation is not effective due to the usage of common interface for population computation
 ### It should be rebuild without expand operation
 class Locator(nn.Module):
-    def __init__(self, output_full_eigenvector: bool, spin_dim: int, device: torch.device):
+    def __init__(self, output_full_eigenvector: bool, spin_dim: int, device: torch.device, dtype: torch.dtype):
         super().__init__()
         self.output_full_eigenvector = output_full_eigenvector
         self._triu_indices = torch.triu_indices(spin_dim, spin_dim, offset=1, device=device)
@@ -60,7 +60,8 @@ class ResFreq(nn.Module):
                  mesh_size: torch.Size,
                  batch_dims: torch.Size | tuple,
                  output_full_eigenvector: bool = False,
-                 device: torch.device = torch.device("cpu")):
+                 device: torch.device = torch.device("cpu"),
+                 dtype: torch.dtype = torch.float32):
         """
         :param eigen_finder: The eigen solver that should find eigen values and eigen vectors
         """
@@ -69,7 +70,7 @@ class ResFreq(nn.Module):
         self.output_full_eigenvector = output_full_eigenvector
         self.mesh_size = mesh_size
         self.batch_dims = batch_dims
-        self.locator = Locator(output_full_eigenvector, spin_system_dim, device)
+        self.locator = Locator(output_full_eigenvector, spin_system_dim, device, dtype=dtype)
         self.device = device
 
     def forward(self, sample: spin_system.BaseSample,

@@ -56,20 +56,20 @@ class EasySpinIntegrand(BaseIntegrand):
 
 class BaseSpectraIntegrator(nn.Module):
     def __init__(self, harmonic: int = 1, natural_width: float = 1e-6, chunk_size=128,
-                 device: torch.device = torch.device("cpu")
+                 device: torch.device = torch.device("cpu"), dtype: torch.dtype = torch.float32
                  ):
         super().__init__()
         self.harmonic = harmonic
 
-        self.register_buffer("natural_width", torch.tensor(natural_width, device=device))
+        self.register_buffer("natural_width", torch.tensor(natural_width, device=device, dtype=dtype))
         self.chunk_size = chunk_size
         self.infty_ratio = EasySpinIntegrand(harmonic, device=device)
 
-        self.register_buffer("pi_sqrt", torch.tensor(math.sqrt(math.pi), device=device))
-        self.register_buffer("two_sqrt", torch.tensor(math.sqrt(2.0), device=device))
-        self.register_buffer("three", torch.tensor(3.0, device=device))
-        self.register_buffer("width_conversion", torch.tensor(1/9, device=device))
-        self.register_buffer("additional_factor", torch.tensor(1.0, device=device))
+        self.register_buffer("pi_sqrt", torch.tensor(math.sqrt(math.pi), device=device, dtype=dtype))
+        self.register_buffer("two_sqrt", torch.tensor(math.sqrt(2.0), device=device, dtype=dtype))
+        self.register_buffer("three", torch.tensor(3.0, device=device, dtype=dtype))
+        self.register_buffer("width_conversion", torch.tensor(1/9, device=device, dtype=dtype))
+        self.register_buffer("additional_factor", torch.tensor(1.0, device=device, dtype=dtype))
 
     @abstractmethod
     def forward(self, res_fields: torch.Tensor,
@@ -88,11 +88,11 @@ class BaseSpectraIntegrator(nn.Module):
 
 class SpectraIntegratorEasySpinLike(BaseSpectraIntegrator):
     def __init__(self, harmonic: int = 1, natural_width: float = 1e-5, chunk_size=128,
-                 device: torch.device = torch.device("cpu")):
+                 device: torch.device = torch.device("cpu"), dtype: torch.dtype = torch.float32):
         """
         :param harmonic: The harmonic of the spectra. 0 is an absorptions, 1 is derivative
         """
-        super().__init__(harmonic, natural_width, chunk_size, device=device)
+        super().__init__(harmonic, natural_width, chunk_size, device=device, dtype=dtype)
 
     def forward(self, res_fields: torch.Tensor,
                   width: torch.Tensor, A_mean: torch.Tensor,

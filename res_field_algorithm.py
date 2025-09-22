@@ -131,10 +131,11 @@ class BaseResonanceIntervalSolver(nn.Module, ABC):
     """
     def __init__(self, spin_dim: int,
                  eigen_finder: tp.Optional[BaseEigenSolver] = EighEigenSolver(), r_tol: float = 1e-5,
-        max_iterations: float = 20, device: torch.device = torch.device("cpu")):
+                 max_iterations: float = 20,
+                 device: torch.device = torch.device("cpu"), dtype: torch.dtype = torch.float32):
         super().__init__()
         self.eigen_finder = eigen_finder
-        self.r_tol = torch.tensor(r_tol)
+        self.r_tol = torch.tensor(r_tol, dtype=dtype, device=device)
         self.max_iterations = torch.tensor(max_iterations)
         self.spin_dim = spin_dim
         self._triu_indices = torch.triu_indices(spin_dim, spin_dim, offset=1, device=device)
@@ -740,12 +741,12 @@ class ZeroFreeResonanceIntervalSolver(BaseResonanceIntervalSolver):
 
 class BaseResonanceLocator(nn.Module):
     def __init__(self, max_iterations=50, tolerance=1e-12, accuracy=1e-5, output_full_eigenvector=False,
-                 device: torch.device = torch.device("cpu")):
+                 device: torch.device = torch.device("cpu"), dtype: torch.dtype = torch.float32):
         super().__init__()
         self.device = device
         self.max_iterations_newton = torch.tensor(max_iterations, device=device)
-        self.tolerance_newton = torch.tensor(tolerance, device=device)
-        self.accuracy_newton = torch.tensor(accuracy, device=device)
+        self.tolerance_newton = torch.tensor(tolerance, device=device, dtype=dtype)
+        self.accuracy_newton = torch.tensor(accuracy, device=device, dtype=dtype)
         self.output_full_eigenvector = output_full_eigenvector
 
     def _compute_cubic_polinomial_coeffs(self,
@@ -1441,7 +1442,8 @@ class ResField(nn.Module):
                  mesh_size: torch.Size,
                  batch_dims: torch.Size | tuple,
                  eigen_finder: BaseEigenSolver = EighEigenSolver(), output_full_eigenvector: bool = False,
-                 device: torch.device = torch.device("cpu")):
+                 device: torch.device = torch.device("cpu"),
+                 dtype: torch.dtype = torch.float32):
         """
         :param eigen_finder: The eigen solver that should find eigen values and eigen vectors
         """
@@ -1449,13 +1451,13 @@ class ResField(nn.Module):
         self.register_buffer('spin_system_dim', torch.tensor(spin_system_dim))
         self.output_full_eigenvector = output_full_eigenvector
         self.general_solver = GeneralResonanceIntervalSolver(self.spin_system_dim, eigen_finder=eigen_finder,
-                                                             device=device)
+                                                             device=device, dtype=dtype)
         self.general_locator = GeneralResonanceLocator(output_full_eigenvector=self.output_full_eigenvector,
-                                                       device=device)
+                                                       device=device, dtype=dtype)
         self.zerofree_solver = ZeroFreeResonanceIntervalSolver(self.spin_system_dim, eigen_finder=eigen_finder,
-                                                               device=device)
+                                                               device=device, dtype=dtype)
         self.zerofree_locator = BaseResonanceLocator(output_full_eigenvector=self.output_full_eigenvector,
-                                                     device=device)
+                                                     device=device, dtype=dtype)
         self.mesh_size = mesh_size
         self.batch_dims = batch_dims
         self.device = device
@@ -1468,15 +1470,16 @@ class ResField(nn.Module):
         :param resonance_frequency: The frequency of resonance
         :return:
         """
-        baselign_sign = self._compute_zero_field_resonance(F, resonance_frequency)
+        baselign_sign = self._compute_zero_field_resonance(F / resonance_frequency,
+                                                           resonance_frequency / resonance_frequency)
         if baselign_sign.all():
             locator = self.general_locator
             interval_solver = self.general_solver
-            args = (baselign_sign.flatten(0, -1), system.calculate_derivative_max().flatten(0, -1))
+            args = (baselign_sign.flatten(0, -1), system.calculate_derivative_max().flatten(0, -1) / resonance_frequency)
         elif baselign_sign.any():
             locator = self.general_locator
             interval_solver = self.general_solver
-            args = (baselign_sign.flatten(0, -1), system.calculate_derivative_max().flatten(0, -1))
+            args = (baselign_sign.flatten(0, -1), system.calculate_derivative_max().flatten(0, -1) / resonance_frequency)
         else:
             locator = self.zerofree_locator
             interval_solver = self.zerofree_solver
@@ -1588,7 +1591,7 @@ class ResField(nn.Module):
                                     tuple[torch.Tensor, torch.Tensor],
                                     tuple[torch.Tensor, torch.Tensor],
                                     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None,
-                               ]]) -> tuple[
+                               ]], resonance_frequency: torch.Tensor) -> tuple[
         tuple[torch.Tensor, torch.Tensor],
         tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor | None
     ]:
@@ -1659,7 +1662,7 @@ class ResField(nn.Module):
                                                          self.spin_system_dim, self.spin_system_dim)
 
         return (vectors_u, vectors_v), (valid_lvl_down, valid_lvl_up),\
-            res_fields, resonance_energies, full_eigen_vectors
+            res_fields, resonance_energies * resonance_frequency, full_eigen_vectors
 
     def forward(self, sample: spin_system.BaseSample,
                  resonance_frequency: torch.Tensor,
@@ -1686,10 +1689,12 @@ class ResField(nn.Module):
         interval_solver, locator, args = self._solver_fabric(sample, F, resonance_frequency)
 
         batches = interval_solver(
-            F.flatten(0, -3), Gz.flatten(0, -3), B_low.flatten(0, -1), B_high.flatten(0, -1),
-            resonance_frequency, *args)
-        batches = locator(batches, resonance_frequency, *args)
-        out = self._combine_resonance_data(device=Gz.device, batches=batches)
+            F.flatten(0, -3) / resonance_frequency,
+            Gz.flatten(0, -3) / resonance_frequency, B_low.flatten(0, -1),
+            B_high.flatten(0, -1), resonance_frequency / resonance_frequency, *args)
+
+        batches = locator(batches, resonance_frequency / resonance_frequency, *args)
+        out = self._combine_resonance_data(device=Gz.device, batches=batches, resonance_frequency=resonance_frequency)
         return out
 
 

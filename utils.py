@@ -50,7 +50,6 @@ def _apply_expanded_rotations(R: torch.Tensor, T: torch.Tensor):
     """
 
 
-
 def calculate_deriv_max(g_tensors_el: torch.Tensor, g_factors_nuc: torch.Tensor,
                         el_numbers: torch.Tensor, nuc_numbers: torch.Tensor) -> torch.Tensor:
     """
@@ -75,24 +74,18 @@ def rotation_matrix_to_euler_angles(R: torch.Tensor, convention: str = "zyz"):
     r21, r22, r23 = R[..., 1, 0], R[..., 1, 1], R[..., 1, 2]
     r31, r32, r33 = R[..., 2, 0], R[..., 2, 1], R[..., 2, 2]
 
-    # Calculate beta (middle rotation around Y-axis)
     beta = torch.acos(torch.clamp(r33, -1.0, 1.0))
-
-    # Check for singularities
     sin_beta = torch.sin(beta)
 
-    if torch.abs(sin_beta) > 1e-6:  # Non-singular case
-        # Calculate alpha (first rotation around Z-axis)
+    if torch.abs(sin_beta) > 1e-6:
         alpha = torch.atan2(r23, r13)
 
-        # Calculate gamma (last rotation around Z-axis)
         gamma = torch.atan2(r32, -r31)
     else:
-        # Singular case: beta ≈ 0 or π
-        if torch.abs(beta) < 1e-6:  # beta ≈ 0
+        if torch.abs(beta) < 1e-6:
             alpha = torch.atan2(r12, r11)
             gamma = torch.tensor(0.0, dtype=R.dtype, device=R.device)
-        else:  # beta ≈ π
+        else:
             alpha = torch.atan2(-r12, r11)
             gamma = torch.tensor(0.0, dtype=R.dtype, device=R.device)
     return torch.tensor([alpha, beta, gamma])

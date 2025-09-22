@@ -1072,7 +1072,8 @@ class DataFullGenerator:
                  num_hamiltonian_strains: int = 3,
                  fields_base_range: tuple[float, float] = (
                  (constants.PLANCK / (1.9 * constants.BOHR)) / 4, (constants.PLANCK / (2.4 * constants.BOHR)) * 4),
-                 device: torch.device = torch.device("cpu")
+                 device: torch.device = torch.device("cpu"),
+                 dtype: torch.dtype = torch.float32
                  ):
         self.base_path = pathlib.Path(path)
         self.struct_generator = struct_generator
@@ -1097,7 +1098,7 @@ class DataFullGenerator:
 
         self.mesh = mesh
         self.freq_generator = freq_generator
-        self.fields_base_range = torch.tensor([fields_base_range[0], fields_base_range[1]], device=device)
+        self.fields_base_range = torch.tensor([fields_base_range[0], fields_base_range[1]], device=device, dtype=dtype)
 
     def _ensure_dir(self, p: tp.Union[str, pathlib.Path]):
         p = pathlib.Path(p)

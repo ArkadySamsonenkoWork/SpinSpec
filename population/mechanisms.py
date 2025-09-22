@@ -53,10 +53,10 @@ class ConstTempGeneralMechanism(tr_utils.TransitionMatrixGenerator):
     It is constant temperature relaxation mechanism. The most simple Relaxation. It is assumed that for all
     [...] batch dimensions, including orientations the probabilities of transitions are the same.
     """
-    def __init__(self, context: BaseSampleContext, temp: torch.Tensor,
+    def __init__(self, context: BaseSampleContext, temp: torch.Tensor, system_vector: tp.Optional[torch.Tensor] = None,
                  device: torch.device = torch.device("cpu"), *args, **kwargs):
         super().__init__(context, device=device, *args, **kwargs)
-        self.free_probs = context.free_probs.to(self.device)
+        self.free_probs = context.free_probs.to(device)
         self.temp = temp
 
     def _base_transition_probs(self, temp: torch.Tensor | None) -> torch.Tensor:
@@ -66,7 +66,6 @@ class ConstTempGeneralMechanism(tr_utils.TransitionMatrixGenerator):
     def _temperature(self, time: torch.Tensor) -> torch.Tensor | None:
         """Return temperature(s) at times t"""
         return self.temp
-
 
 class BaseTripletMechanismGenerator(tr_utils.TransitionMatrixGenerator):
     """
@@ -207,7 +206,6 @@ class TransitionMatrixGeneratorKinetic(tr_utils.BaseMatrixGenerator):
         base_blocks = torch.block_diag(*base_blocks)
         induced_blocks = torch.block_diag(*induced_blocks) if induced_has_non_none else None
         outgoing_blocks = torch.cat(outgoing_blocks, dim=-1) if outgoing_has_non_none else None
-
         return temp, base_blocks, induced_blocks, outgoing_blocks, self._kynetic_transitions(time)
 
 
@@ -243,7 +241,7 @@ class T1Population(time_population.BaseTimeDependantPopulator):
                              lvl_down: torch.Tensor,
                              lvl_up: torch.Tensor,
                              *args, **kwargs):
-        populations = nn.functional.softmax(-constants.unit_converter(energies) / self.init_temp, dim=-1)
+        populations = nn.functional.softmax(-constants.unit_converter(energies, "Hz_to_K") / self.init_temp, dim=-1)
         new_populations = copy.deepcopy(populations)
         indexes = torch.arange(energies.shape[-2], device=energies.device)
         new_populations[..., indexes, lvl_down] = populations[..., indexes, lvl_up]
@@ -262,7 +260,7 @@ class T1Population(time_population.BaseTimeDependantPopulator):
         return tr_matrix_generator
 
 
-class TempDepTrPopulation(time_population.BaseTimeDependantPopulator):
+class TempDepTrPopulator(time_population.BaseTimeDependantPopulator):
     """
     Computes population at the case when the parameters of relaxation depend on temperature dn / dt = K(T) @ n
     """
@@ -287,7 +285,7 @@ class TempDepTrPopulation(time_population.BaseTimeDependantPopulator):
             *args, **kwargs
     ):
 
-        return nn.functional.softmax(-constants.unit_converter(energies) / self.init_temp, dim=-1)
+        return nn.functional.softmax(-constants.unit_converter(energies, "Hz_to_K") / self.init_temp, dim=-1)
 
     def _post_compute(self, time_intensities: torch.Tensor, *args, **kwargs):
         """
@@ -323,7 +321,7 @@ class KineticPopulator(time_population.BaseTimeDependantPopulator):
         conc_seq = self.context.concentrations
         populations = [
             conc * nn.functional.softmax(
-                -constants.unit_converter(energies) / self.init_temp, dim=-1
+                -constants.unit_converter(energies, "Hz_to_K") / self.init_temp, dim=-1
             ) for energies, conc in zip(energies_seq, conc_seq)
         ]
         return torch.cat(populations, dim=-1)
@@ -337,7 +335,8 @@ class KineticPopulator(time_population.BaseTimeDependantPopulator):
         for idx, (eigen_vector, context) in enumerate(zip(eigen_vectors_seq, contexts)):
             tr_matrix_generators.append(self.sample_tr_matrix_generators_cls[idx](context,
                                                                                   self.init_temp,
-                                                                                  eigen_vector))
+                                                                                  eigen_vector,
+                                                                                  eigen_vector.device))
         tr_matrix_generator = self.tr_matrix_generator_cls(self.context,
                                                            self.init_temp,
                                                            eigen_vectors_seq,

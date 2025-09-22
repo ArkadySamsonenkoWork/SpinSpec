@@ -51,15 +51,16 @@ class GenerationIntegrationProcessorPowder(IntegrationProcessorPowder):
                  post_spectra_processor: PostSpectraProcessing = PostSpectraProcessing(),
                  chunk_size: int = 128,
                  device: torch.device = torch.device("cpu"),
+                 dtype: torch.dtype = torch.float32,
                  num_points: int = 4_000,
                  spectral_width_part: float = 0.5,
                  min_spectral_width: float = 0.01,
                  ):
         super().__init__(mesh, spectra_integrator, harmonic, post_spectra_processor,
-                         chunk_size=chunk_size, device=device)
+                         chunk_size=chunk_size, device=device, dtype=dtype)
         self.register_buffer("num_points", torch.tensor(num_points, device=device))
-        self.register_buffer("spectral_width_part", torch.tensor(spectral_width_part, device=device))
-        self.register_buffer("min_spectral_width", torch.tensor(min_spectral_width, device=device))
+        self.register_buffer("spectral_width_part", torch.tensor(spectral_width_part, device=device, dtype=dtype))
+        self.register_buffer("min_spectral_width", torch.tensor(min_spectral_width, device=device, dtype=dtype))
 
         self.to(device)
 
@@ -74,7 +75,7 @@ class GenerationIntegrationProcessorPowder(IntegrationProcessorPowder):
         min_pos_batch = min_pos_batch * (1.0 - self.spectral_width_part * nature_spectra_width)
         max_pos_batch = max_pos_batch * (1.0 + self.spectral_width_part * nature_spectra_width)
 
-        steps = torch.linspace(0, 1, self.num_points, device=res_fields.device)
+        steps = torch.linspace(0, 1, self.num_points, device=res_fields.device, dtype=res_fields.dtype)
         fields = steps * (max_pos_batch - min_pos_batch).unsqueeze(-1) + min_pos_batch.unsqueeze(-1)
         return fields, min_pos_batch, max_pos_batch
 
@@ -176,18 +177,20 @@ class GenerationCreator(StationarySpectraCreator):
                                 spectra_integrator: tp.Optional[BaseSpectraIntegrator],
                                 harmonic: int,
                                 post_spectra_processor: PostSpectraProcessing,
-                                chunk_size: int, device: torch.device) ->\
+                                chunk_size: int, device: torch.device, dtype: torch.dtype) ->\
             IntegrationProcessorPowder:
         if self.mesh.name == "PowderMesh":
             return GenerationIntegrationProcessorPowder(self.mesh, spectra_integrator, harmonic,
-                                                        post_spectra_processor, chunk_size=chunk_size, device=device)
+                                                        post_spectra_processor, chunk_size=chunk_size, device=device,
+                                                        dtype=dtype)
 
         elif self.mesh.name == "CrystalMesh":
             raise NotImplementedError
 
         else:
             return GenerationIntegrationProcessorPowder(self.mesh, spectra_integrator, harmonic,
-                                                        post_spectra_processor, chunk_size=chunk_size, device=device)
+                                                        post_spectra_processor, chunk_size=chunk_size, device=device,
+                                                        dtype=dtype)
 
     def compute_parameters(self, sample: spin_system.MultiOrientedSample,
                            F: torch.Tensor,

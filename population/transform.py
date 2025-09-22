@@ -124,9 +124,9 @@ def transform_rates_matrix(initial_rates: torch.Tensor, coeffs: torch.Tensor) ->
     return coeffs @ initial_rates @ coeffs.transpose(-1, -2)
 
 
-def transform_rates_vector(initial_rates: torch.Tensor, coeffs: torch.Tensor) -> torch.Tensor:
+def transform_vector(initial_rates: torch.Tensor, coeffs: torch.Tensor) -> torch.Tensor:
     """
-    Transform rates given in vector form to new basis set.
+    Transform values given in vector form to new basis set. It can be out rates or initial populations
     K (b_new_1) = |⟨b_new_1|b_old_1⟩|² * K (b_old_1)
     :param initial_rates: Transition rates matrix. Shape [..., K].
     :param coeffs: Transformation coefficients (see get_transformation_coeffs). Shape [..., K, K]
