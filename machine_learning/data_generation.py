@@ -10,6 +10,8 @@ import traceback
 import datetime
 from dataclasses import dataclass
 sys.path.append("..")
+from func_timeout import func_timeout, FunctionTimedOut
+
 
 import torch
 import safetensors
@@ -36,6 +38,12 @@ class SpinSystemStructure:
 
     bound_map: dict[int, int]
     spin_system_dim: int
+
+class TimeException(Exception):
+    pass
+
+def timeout_handler():
+    raise TimeException("Time was up")
 
 
 class RandomStructureGenerator:
@@ -1064,7 +1072,7 @@ class DataFullGenerator:
                  dipolar_coupling_generator: MultiDimensionalTensorGenerator,
                  zero_field_splitting_generator: MultiDimensionalTensorGenerator,
                  electron_electron_orientation_generator: MultiDimensionalTensorGenerator,
-
+                 alarm_time: int = 60,
                  nuclear_coupling_generator: tp.Optional[MultiDimensionalTensorGenerator] = None,
                  nuclear_orientation_generator: tp.Optional[MultiDimensionalTensorGenerator] = None,
 
@@ -1097,6 +1105,7 @@ class DataFullGenerator:
         self.num_ham_strains = num_hamiltonian_strains
 
         self.mesh = mesh
+        self.alarm_time = alarm_time
         self.freq_generator = freq_generator
         self.fields_base_range = torch.tensor([fields_base_range[0], fields_base_range[1]], device=device, dtype=dtype)
 
@@ -1213,14 +1222,22 @@ class DataFullGenerator:
                     sample_folder = mean_folder / f"sample_{v_idx:04d}"
                     self._ensure_dir(sample_folder)
 
-                    try:
-                        multi_oriented_sample, temperatures, system_meta = sample_gen(batch_size=batch_size,
-                                                                                      device=device)
+                    def heavy_block():
+                        multi_oriented_sample, temperatures, system_meta = sample_gen(
+                            batch_size=batch_size, device=device
+                        )
 
                         freq, fields = self._get_freq_field(batch_size=batch_size)
-                        creator = GenerationCreator(freq=freq, sample=multi_oriented_sample,
-                                                    temperature=temperatures, device=device)
-                        out, (min_pos_batch, max_pos_batch) = creator(fields=fields, sample=multi_oriented_sample)
+                        creator = GenerationCreator(
+                            freq=freq,
+                            sample=multi_oriented_sample,
+                            temperature=temperatures,
+                            integration_chunk_size=8,
+                            device=device,
+                        )
+                        out, (min_pos_batch, max_pos_batch) = creator(
+                            fields=fields, sample=multi_oriented_sample
+                        )
 
                         save = system_meta["data"]
                         save["fields"] = fields
@@ -1232,6 +1249,21 @@ class DataFullGenerator:
 
                         with open(sample_folder / "sample_meta.pkl", "wb") as f:
                             pickle.dump(system_meta["meta"], f)
+
+                    try:
+                        func_timeout(self.alarm_time, heavy_block)
+
+                    except FunctionTimedOut:
+                        error_msg = (
+                            f"Timeout at structure {s_idx}, mean {m_idx}, vary {v_idx} (>{self.alarm_time}s)\n"
+                        )
+                        error_msg += f"Timestamp: {datetime.datetime.now()}\n\n"
+                        error_file = mean_folder / f"generation_timeout_{s_idx}_{m_idx}_{v_idx}.log"
+                        with open(error_file, "a") as f:
+                            f.write(error_msg)
+                        print(
+                            f"Timeout logged for structure {s_idx}, mean {m_idx}, vary {v_idx}. Continuing with next vary...")
+                        break
 
                     except Exception as error:
                         error_msg = f"Error at structure {s_idx}, mean {m_idx}, vary {v_idx}: {str(error)}\n"
