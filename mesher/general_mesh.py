@@ -12,7 +12,7 @@ import utils
 
 class BaseMesh(nn.Module, ABC):
     @abstractmethod
-    def __init__(self, device: torch.device = torch.device("cpu"), *args, **kwargs):
+    def __init__(self, device: torch.device = torch.device("cpu"), dtype: torch.dtype = torch.float32, *args, **kwargs):
         super().__init__()
         self.register_buffer("_rotation_matrices", None)
 
@@ -34,7 +34,8 @@ class BaseMesh(nn.Module, ABC):
 
 class CrystalMesh(BaseMesh):
     def __init__(self, euler_angles: torch.Tensor,
-                 device: torch.device = torch.device("cpu"), convention: str = "zyz"):
+                 device: torch.device = torch.device("cpu"), dtype: torch.dtype = torch.float32,
+                 convention: str = "zyz"):
         """
         :param euler_angles: torch.Tensor of shape (..., 3) containing Euler angles in radians
         :param convention: str, rotation convention (default 'xyz')
@@ -43,7 +44,7 @@ class CrystalMesh(BaseMesh):
         """
         super().__init__(device=device)
         self.register_buffer("_rotation_matrices",
-                             utils.euler_angles_to_matrix(euler_angles.to(device=device), convention)
+                             utils.euler_angles_to_matrix(euler_angles.to(device=device, dtype=dtype), convention)
                              )
 
     @property
@@ -61,8 +62,8 @@ class CrystalMesh(BaseMesh):
 
 class BaseMeshPowder(BaseMesh):
     @abstractmethod
-    def __init__(self, device: torch.device = torch.device("cpu"), *args, **kwargs):
-        super().__init__(device=device)
+    def __init__(self, device: torch.device = torch.device("cpu"), dtype: torch.dtype = torch.float32, *args, **kwargs):
+        super().__init__(device=device, dtype=dtype)
         self._rotation_matrices: tp.Optional[torch.Tensor] = None
 
     @property
@@ -185,7 +186,6 @@ class BaseMeshPowder(BaseMesh):
         mesh, triplots = self.post_mesh
         phi, theta = mesh[..., 0], mesh[..., 1]
         plt.triplot(phi.numpy(), theta.numpy(), triplots)
-
 
 
 

@@ -85,7 +85,8 @@ class GenerationIntegrationProcessorPowder(IntegrationProcessorPowder):
                  width: torch.Tensor,
                  gauss: torch.Tensor,
                  lorentz: torch.Tensor,
-                 fields: torch.Tensor):
+                 fields: torch.Tensor
+                ):
 
         res_fields, width, intensities, areas = (
             self._transform_data_to_mesh_format(
@@ -119,7 +120,8 @@ class GenerationCreator(StationarySpectraCreator):
                  temperature: tp.Optional[tp.Union[float, torch.Tensor]] = torch.tensor([293]),
                  recompute_spin_parameters: bool = True,
                  integration_chunk_size: int = 128,
-                 device: torch.device = torch.device("cpu")
+                 device: torch.device = torch.device("cpu"),
+                 dtype: torch.dtype = torch.float32
                  ):
         """
         :param freq: Resonance frequency of experiment
@@ -170,8 +172,10 @@ class GenerationCreator(StationarySpectraCreator):
                          temperature=temperature,
                          recompute_spin_parameters=recompute_spin_parameters,
                          integration_chunk_size=integration_chunk_size,
-                         device=device)
+                         device=device,
+                         dtype=dtype)
         self.broader = GenerationBroadener(device=device)
+
 
     def _init_spectra_processor(self,
                                 spectra_integrator: tp.Optional[BaseSpectraIntegrator],
@@ -242,7 +246,7 @@ class GenerationCreator(StationarySpectraCreator):
          - extras parameters computed in _compute_additional
         """
         intensities = self.intensity_calculator.compute_intensity(
-            Gx, Gy, Gz, vector_down, vector_up, lvl_down, lvl_up, resonance_energies
+            Gx, Gy, Gz, vector_down, vector_up, lvl_down, lvl_up, resonance_energies, res_fields, full_system_vectors
         )
 
         lines_dimension = tuple(range(intensities.ndim - 1))

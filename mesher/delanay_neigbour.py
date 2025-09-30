@@ -410,7 +410,7 @@ class DelaunayMeshNeighbour(BaseMeshPowder):
             initial_grid_frequency: Resolution of initial grid
             interpolation_grid_frequency: Resolution of interpolation grid
         """
-        super().__init__(device=device)
+        super().__init__(device=device, dtype=dtype)
         self.dtype = dtype
         self.eps = eps
 
@@ -481,3 +481,29 @@ class DelaunayMeshNeighbour(BaseMeshPowder):
             torch.Tensor: Values formatted for Delaunay triangulation
         """
         return self.mesh_processor(f_init)
+
+
+class DelaunayMeshNeighbourFullSphere(DelaunayMeshNeighbour):
+    def __init__(self,
+                 eps: float = 1e-7,
+                 phi_limits: tuple[float, float] = (0, 2 * math.pi),
+                 initial_grid_frequency: int = 20,
+                 interpolation_grid_frequency: int = 40,
+                 boundaries_cond=None,
+                 interpolate=False,
+                 dtype=torch.float32, device: torch.device = torch.device("cpu")):
+        super().__init__(eps, phi_limits, initial_grid_frequency,
+                         interpolation_grid_frequency, boundaries_cond, interpolate, dtype, device
+                         )
+        _second_unit = self._initial_grid.clone()
+
+        _second_unit[:, 1] = torch.pi - _second_unit[:, 1]
+        self._initial_grid = torch.cat((self._initial_grid, _second_unit), dim=-2)
+
+        _second_unit = self._post_grid.clone()
+        _second_unit[:, 1] = torch.pi - _second_unit[:, 1]
+        self._post_grid = torch.cat((self._post_grid, _second_unit), dim=-2)
+
+        second_simpl = self._post_simplices.clone()
+        second_simpl = second_simpl + _second_unit.shape[-2]
+        self._post_simplices = torch.cat((self._post_simplices, second_simpl), dim=-2)

@@ -414,7 +414,10 @@ class FileParser:
             "source": sources,
             "spins": spins,
             "types": types,
-            "node_data": node_data,
+            "hamiltonian_strain": hamiltonian_strain,
+            "lorentz": lorentz,
+            "gauss": gauss,
+            "temperatures": temperatures,
             "fields": fields,
             "spec": spec,
             "freq": freq

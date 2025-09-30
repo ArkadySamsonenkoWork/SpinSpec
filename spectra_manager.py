@@ -20,11 +20,10 @@ import res_freq_algorithm
 import spin_system
 
 
-def compute_matrix_element(vector_down, vector_up, G):
-    tmp = torch.matmul(G, vector_up.transpose(-2, -1))  # (..., i, b)
-    tmp = tmp.transpose(-2, -1)  # (..., b, i)
-    return (vector_down.conj() * tmp).sum(dim=-1)
 
+def compute_matrix_element(vector_down: torch.Tensor, vector_up: torch.Tensor, G: torch.Tensor):
+    tmp = torch.matmul(G.unsqueeze(-3), vector_down.unsqueeze(-1))
+    return (vector_up.conj() * tmp.squeeze(-1)).sum(dim=-1)
 
 class PostSpectraProcessing(nn.Module):
     def __init__(self, *args, **kwargs):
@@ -439,18 +438,21 @@ class BaseIntensityCalculator(nn.Module):
                         device: torch.device):
         return populator
 
-    def _compute_magnitization_part(self, Gx, Gy, vector_down, vector_up):
+    def _compute_magnitization_part(self, Gx, Gy, Gz, vector_down, vector_up):
         magnitization = compute_matrix_element(vector_down, vector_up, Gx).square().abs() + \
                         compute_matrix_element(vector_down, vector_up, Gy).square().abs()
         return magnitization * (constants.PLANCK / constants.BOHR) ** 2
 
-    def compute_intensity(self, Gx, Gy, Gz, vector_down, vector_up, lvl_down, lvl_up, resonance_energies, *args, **kwargs):
+    def compute_intensity(self, Gx, Gy, Gz, vector_down, vector_up, lvl_down, lvl_up, resonance_energies,
+                          resonance_manifold, full_system_vectors, *args, **kwargs):
         raise NotImplementedError
 
     def forward(self, Gx: torch.Tensor, Gy: torch.Tensor, Gz: torch.Tensor,
                 vector_down: torch.Tensor, vector_up: torch.Tensor, lvl_down: torch.Tensor,
-                lvl_up: torch.Tensor, resonance_energies: torch.Tensor, *args, **kwargs):
-        return self.compute_intensity(Gx, Gy, Gz, vector_down, vector_up, lvl_down, lvl_up, resonance_energies)
+                lvl_up: torch.Tensor, resonance_energies: torch.Tensor, resonance_manifold,
+                full_system_vectors: tp.Optional[torch.Tensor], *args, **kwargs):
+        return self.compute_intensity(Gx, Gy, Gz, vector_down, vector_up, lvl_down, lvl_up, resonance_energies,
+                                      resonance_manifold, full_system_vectors)
 
 
 class StationaryIntensitiesCalculator(BaseIntensityCalculator):
@@ -465,10 +467,11 @@ class StationaryIntensitiesCalculator(BaseIntensityCalculator):
         else:
             return populator
 
-    def compute_intensity(self, Gx, Gy, Gz, vector_down, vector_up, lvl_down, lvl_up, resonance_energies, *args, **kwargs):
+    def compute_intensity(self, Gx, Gy, Gz, vector_down, vector_up, lvl_down, lvl_up, resonance_energies,
+                          resonance_manifold, full_system_vectors: tp.Optional[torch.Tensor], *args, **kwargs):
         """Base method to compute intensity (to be overridden)."""
         intensity = self.populator(resonance_energies, lvl_down, lvl_up, *args, **kwargs) * (
-                self._compute_magnitization_part(Gx, Gy, vector_down, vector_up)
+                self._compute_magnitization_part(Gx, Gy, Gz, vector_down, vector_up)
         )
         return intensity
 
@@ -482,9 +485,26 @@ class TimeResolvedIntensitiesCalculator(BaseIntensityCalculator):
 
     def compute_intensity(self, Gx: torch.Tensor, Gy: torch.Tensor, Gz: torch.Tensor,
                           vector_down: torch.Tensor, vector_up: torch.Tensor,
-                          lvl_down: torch.Tensor, lvl_up: torch.Tensor, resonance_energies: torch.Tensor, *args, **kwargs):
+                          lvl_down: torch.Tensor, lvl_up: torch.Tensor, resonance_energies: torch.Tensor,
+                          resonance_manifold: torch.Tensor, full_system_vectors: tp.Optional[torch.Tensor],
+                          *args, **kwargs):
+        """
+        :param Gx:
+        :param Gy:
+        :param Gz:
+        :param vector_down:
+        :param vector_up:
+        :param lvl_down:
+        :param lvl_up:
+        :param resonance_energies:
+        :param resonance_manifold: Resonance Values of magnetic field or resonance frequency
+        :param full_system_vectors:
+        :param args:
+        :param kwargs:
+        :return:
+        """
         intensity = (
-                self._compute_magnitization_part(Gx, Gy, vector_down, vector_up)
+                self._compute_magnitization_part(Gx, Gy, Gz, vector_down, vector_up)
         )
         return intensity
 
@@ -594,7 +614,7 @@ class BaseSpectraCreator(nn.Module, ABC):
 
         """
         super().__init__()
-        self.register_buffer("resonance_parameter", torch.tensor(resonance_parameter, device=device))
+        self.register_buffer("resonance_parameter", torch.tensor(resonance_parameter, device=device, dtype=dtype))
         self.register_buffer("threshold", torch.tensor(1e-2, device=device, dtype=dtype))
         self.register_buffer("tolerancy", torch.tensor(1e-10, device=device, dtype=dtype))
 
@@ -845,7 +865,7 @@ class BaseSpectraCreator(nn.Module, ABC):
          - extras parameters computed in _compute_additional
         """
         intensities = self.intensity_calculator.compute_intensity(
-            Gx, Gy, Gz, vector_down, vector_up, lvl_down, lvl_up, resonance_energies, full_system_vectors
+            Gx, Gy, Gz, vector_down, vector_up, lvl_down, lvl_up, resonance_energies, res_fields, full_system_vectors
         )
         lines_dimension = tuple(range(intensities.ndim - 1))
         intensities_mask = (intensities / intensities.abs().max() > self.threshold).any(dim=lines_dimension)
@@ -1000,7 +1020,8 @@ class TruncatedSpectraCreatorTimeResolved(BaseSpectraCreator):
                  post_spectra_processor: PostSpectraProcessing = PostSpectraProcessing(),
                  temperature: tp.Optional[tp.Union[float, torch.Tensor]] = 293,
                  recompute_spin_parameters: bool = False,
-                 device: torch.device = torch.device("cpu")
+                 device: torch.device = torch.device("cpu"),
+                 dtype: torch.dtype = torch.float32,
                  ):
 
         """
@@ -1045,7 +1066,7 @@ class TruncatedSpectraCreatorTimeResolved(BaseSpectraCreator):
         """
         super().__init__(freq, sample, spin_system_dim, batch_dims, mesh, intensity_calculator, populator,
                          spectra_integrator, harmonic, post_spectra_processor,
-                         temperature, recompute_spin_parameters, device=device)
+                         temperature, recompute_spin_parameters, device=device, dtype=dtype)
 
     def __call__(self, sample: spin_system.MultiOrientedSample, field: torch.Tensor, time: torch.Tensor, **kwargs) ->\
             torch.Tensor:
@@ -1409,7 +1430,7 @@ class StationarySpectraCreatorFreq(StationarySpectraCreator):
         """
 
         intensities = self.intensity_calculator.compute_intensity(
-            Gx, Gy, Gz, vector_down, vector_up, lvl_down, lvl_up, resonance_energies
+            Gx, Gy, Gz, vector_down, vector_up, lvl_down, lvl_up, resonance_energies, res_freq, full_system_vectors
         )
         lines_dimension = tuple(range(intensities.ndim - 1))
         intensities_mask = (intensities / intensities.abs().max() > self.threshold).any(dim=lines_dimension)
@@ -1425,7 +1446,7 @@ class StationarySpectraCreatorFreq(StationarySpectraCreator):
         vector_u = vector_down[..., intensities_mask, :]
         vector_v = vector_up[..., intensities_mask, :]
 
-        intensities = intensities / intensities.abs().max()
+        #intensities = intensities / intensities.abs().max()
         width = self.broader(sample, vector_u, vector_v, res_fields)
 
         extras = self._compute_additional(

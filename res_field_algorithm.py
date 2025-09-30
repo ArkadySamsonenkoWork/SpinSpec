@@ -366,7 +366,6 @@ class BaseResonanceIntervalSolver(nn.Module, ABC):
             eig_vectors_high = eig_vectors_high.index_select(dim=0, index=idx_xor)
 
 
-
         torch.where(mask_left.unsqueeze(-1).unsqueeze(-1), B_low, B_mid, out=B_low)
         torch.where(mask_left.unsqueeze(-1).unsqueeze(-1), B_mid, B_high, out=B_high)
 
@@ -506,22 +505,22 @@ class BaseResonanceIntervalSolver(nn.Module, ABC):
         final_batches = []
         (eig_values_low, eig_values_high), (eig_vectors_low, eig_vectors_high), (B_low, B_high), row_indexes = batch
         B_mid = (B_low + B_high) / 2
-        eig_values_mid, eig_vectors_mid = self.eigen_finder(F.index_select(0, row_indexes) + Gz.index_select(0, row_indexes) * B_mid)
-
+        eig_values_mid, eig_vectors_mid = self.eigen_finder(
+            F.index_select(0, row_indexes) + Gz.index_select(0, row_indexes) * B_mid
+        )
         # It is only one    single
         # point where gradient should be calculated
-
         error, (derivatives_low, derivatives_high) = \
             self.compute_error(eig_values_low, eig_values_mid, eig_values_high,
                                eig_vectors_low, eig_vectors_high,
                                B_low, B_high, Gz, row_indexes
                                )
         converged_mask = (error <= a_tol).any(dim=-1)
+
         active_mask = ~converged_mask
 
         converged_idx = converged_mask.nonzero(as_tuple=True)[0]
         active_idx = active_mask.nonzero(as_tuple=True)[0]
-
         if converged_mask.any():
             row_indexes_conv = row_indexes.clone()[converged_idx]
             # indexes_conv[indexes_conv == True] = converged_mask
@@ -1585,7 +1584,9 @@ class ResField(nn.Module):
                 occurences.append((bi, row_indexes, col_idx))
         return cached_batches, occurences
 
-    def _combine_resonance_data(self, device: torch.device,
+    def _combine_resonance_data(self,
+                                dtype: torch.dtype,
+                                device: torch.device,
                                 batches: list[
                                tuple[
                                     tuple[torch.Tensor, torch.Tensor],
@@ -1617,21 +1618,26 @@ class ResField(nn.Module):
         batches, occurrences = self._first_pass(batches)
         occurrences, max_columns = self._assign_global_indexes(occurrences)
 
-        vectors_u = torch.zeros((total_batch_size, max_columns, self.spin_system_dim), dtype=torch.complex64,
+        if dtype is torch.float32:
+            complex_dtype = torch.complex64
+        else:
+            complex_dtype = torch.complex128
+
+        vectors_u = torch.zeros((total_batch_size, max_columns, self.spin_system_dim), dtype=complex_dtype,
                                 device=device)
-        vectors_v = torch.zeros((total_batch_size, max_columns, self.spin_system_dim), dtype=torch.complex64,
+        vectors_v = torch.zeros((total_batch_size, max_columns, self.spin_system_dim), dtype=complex_dtype,
                                 device=device)
-        resonance_energies = torch.zeros((total_batch_size, max_columns, self.spin_system_dim), dtype=torch.float32,
+        resonance_energies = torch.zeros((total_batch_size, max_columns, self.spin_system_dim), dtype=dtype,
                                          device=device)
 
         valid_lvl_down = torch.zeros(max_columns, dtype=torch.long, device=device)
         valid_lvl_up = torch.zeros(max_columns, dtype=torch.long, device=device)
-        res_fields = torch.zeros((total_batch_size, max_columns), dtype=torch.float32, device=device)
+        res_fields = torch.zeros((total_batch_size, max_columns), dtype=dtype, device=device)
 
         if self.output_full_eigenvector:
             full_eigen_vectors = torch.zeros((total_batch_size, max_columns,
                                               self.spin_system_dim, self.spin_system_dim),
-                                             dtype=torch.complex64, device=device)
+                                              dtype=complex_dtype, device=device)
         else:
             full_eigen_vectors = None
 
@@ -1694,7 +1700,8 @@ class ResField(nn.Module):
             B_high.flatten(0, -1), resonance_frequency / resonance_frequency, *args)
 
         batches = locator(batches, resonance_frequency / resonance_frequency, *args)
-        out = self._combine_resonance_data(device=Gz.device, batches=batches, resonance_frequency=resonance_frequency)
+        out = self._combine_resonance_data(dtype=resonance_frequency.dtype,
+                                           device=Gz.device, batches=batches, resonance_frequency=resonance_frequency)
         return out
 
 

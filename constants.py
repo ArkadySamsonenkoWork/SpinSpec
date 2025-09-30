@@ -59,7 +59,6 @@ def unit_converter(values: torch.Tensor | np.ndarray | float, conversion: str):
 
     :param conversion: str
         The conversion type specified as "from_to" format. Supported conversions:
-
         Energy ↔ Frequency:
         - "Hz_to_J": frequency (Hz) → energy (Joules)
         - "J_to_Hz": energy (Joules) → frequency (Hz)

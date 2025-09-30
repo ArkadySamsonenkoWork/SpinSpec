@@ -57,9 +57,9 @@ class FilmLayer(nn.Module):
 
 class SpectraEncoder(nn.Module):
     def __init__(self, input_size: int, output_dim: int,
-                 hidden_dims: list = [32, 64, 128, 256],
-                 num_blocks_per_layer: list = [2, 2, 2, 2],
-                 meta_embed_dim: int = 3,
+                 hidden_dims: list[int] = [32, 64, 128, 256],
+                 num_blocks_per_layer: list[int] = [2, 2, 2, 2],
+                 meta_embed_dim: int = 4,
                  ):
         super().__init__()
 
@@ -68,7 +68,7 @@ class SpectraEncoder(nn.Module):
         in_channels = hidden_dims[0]
 
         self.init_compress = nn.Sequential(
-            nn.Conv1d(1, in_channels, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.Conv1d(2, in_channels, kernel_size=7, stride=2, groups=2, padding=3, bias=False),
             nn.BatchNorm1d(in_channels),
             nn.ReLU(inplace=True),
             nn.MaxPool1d(kernel_size=3, stride=2, padding=1),
@@ -100,15 +100,16 @@ class SpectraEncoder(nn.Module):
 
         return nn.Sequential(*layers)
 
-    def forward(self, spec: torch.Tensor, meta_embed: torch.Tensor):
+    def forward(self, spec: torch.Tensor, res_embed: torch.Tensor):
         """
-        :param spec: torch.Tensor with shape [batch_shape, input_size]
+        :param spec: torch.Tensor with shape [batch_shape, 2, input_size]
+        x and y data, where y is spectra points, x are g-factors points. Data is given when g is increasing
+        :param res_embed: torch.Tensor with shape [batch_shape, meta_embed_dim]
         """
-        x = spec.reshape(-1, self.input_size).unsqueeze(1)
-        x = self.init_compress(x)
+        x = self.init_compress(spec)
         for layer, film_layer in zip(self.layers, self.film_layers):
             x = layer(x)
-            x = film_layer(x, meta_embed)
+            x = film_layer(x, res_embed)
 
         x = self.global_avg_pool(x)
         x = x.squeeze(-1)

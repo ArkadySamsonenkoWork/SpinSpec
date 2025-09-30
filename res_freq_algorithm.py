@@ -28,7 +28,6 @@ class Locator(nn.Module):
                 ):
         H = F + Gz * resonance_field
         eigen_values, eigen_vectors = torch.linalg.eigh(H)
-
         valid_mask, i_indices, j_indices, transition_freq = self._get_resonance_indexes(
             eigen_values, freq_low, freq_high
         )

@@ -498,7 +498,7 @@ class MultiDimensionalTensorGenerator:
         sum_prob = sum(probabilities)
         return [prob / sum_prob for prob in probabilities]
 
-    def _generate_uncorrelated(self, active_levels: list[UncorrelatedLevel], device: torch.device):
+    def _generate_uncorrelated(self, active_levels: list[UncorrelatedLevel], device: torch.device, dtype: torch.dtype):
         """Generate independent x, y, z parameters"""
         dists = []
 
@@ -517,14 +517,14 @@ class MultiDimensionalTensorGenerator:
                 upper_bounds.append(a2)
 
             dist = torch.distributions.Uniform(
-                torch.tensor(lower_bounds, device=device),
-                torch.tensor(upper_bounds, device=device)
+                torch.tensor(lower_bounds, device=device, dtype=dtype),
+                torch.tensor(upper_bounds, device=device, dtype=dtype)
             )
             dists.append(dist)
 
         return dists
 
-    def _generate_isotropic(self, active_levels: list[IsotropicLevel], device: torch.device):
+    def _generate_isotropic(self, active_levels: list[IsotropicLevel], device: torch.device, dtype: torch.dtype):
         """Generate isotropic base + xyz variations"""
         dists = []
 
@@ -541,8 +541,8 @@ class MultiDimensionalTensorGenerator:
             iso_upper_bounds.append(a2)
 
         iso_dist = torch.distributions.Uniform(
-            torch.tensor(iso_lower_bounds, device=device),
-            torch.tensor(iso_upper_bounds, device=device)
+            torch.tensor(iso_lower_bounds, device=device, dtype=dtype),
+            torch.tensor(iso_upper_bounds, device=device, dtype=dtype)
         )
 
         if self.output_dims == 1:
@@ -561,14 +561,14 @@ class MultiDimensionalTensorGenerator:
                 var_lower_bounds.append(a1)
                 var_upper_bounds.append(a2)
             var_dist = torch.distributions.Uniform(
-                torch.tensor(var_lower_bounds, device=device),
-                torch.tensor(var_upper_bounds, device=device)
+                torch.tensor(var_lower_bounds, device=device, dtype=dtype),
+                torch.tensor(var_upper_bounds, device=device, dtype=dtype)
             )
             dists.append(var_dist)
 
         return [iso_dist] + dists
 
-    def _generate_axial(self, active_levels: list[AxialLevel], device: torch.device):
+    def _generate_axial(self, active_levels: list[AxialLevel], device: torch.device, dtype: torch.dtype):
         """Generate parallel and perpendicular components"""
         dists = []
 
@@ -586,8 +586,8 @@ class MultiDimensionalTensorGenerator:
             par_upper_bounds.append(a2)
 
         par_dist = torch.distributions.Uniform(
-            torch.tensor(par_lower_bounds, device=device),
-            torch.tensor(par_upper_bounds, device=device)
+            torch.tensor(par_lower_bounds, device=device, dtype=dtype),
+            torch.tensor(par_upper_bounds, device=device, dtype=dtype)
         )
         dists.append(par_dist)
 
@@ -605,14 +605,14 @@ class MultiDimensionalTensorGenerator:
                 perp_upper_bounds.append(a2)
 
             perp_dist = torch.distributions.Uniform(
-                torch.tensor(perp_lower_bounds, device=device),
-                torch.tensor(perp_upper_bounds, device=device)
+                torch.tensor(perp_lower_bounds, device=device, dtype=dtype),
+                torch.tensor(perp_upper_bounds, device=device, dtype=dtype)
             )
             dists.append(perp_dist)
 
         return dists
 
-    def _generate_de(self, active_levels: list[DELevel], device: torch.device):
+    def _generate_de(self, active_levels: list[DELevel], device: torch.device, dtype: torch.dtype):
         """Generate D and E components"""
         dists = []
 
@@ -630,8 +630,8 @@ class MultiDimensionalTensorGenerator:
             D_upper_bounds.append(a2)
 
         D_dist = torch.distributions.Uniform(
-            torch.tensor(D_lower_bounds, device=device),
-            torch.tensor(D_upper_bounds, device=device)
+            torch.tensor(D_lower_bounds, device=device, dtype=dtype),
+            torch.tensor(D_upper_bounds, device=device, dtype=dtype)
         )
         dists.append(D_dist)
 
@@ -648,25 +648,25 @@ class MultiDimensionalTensorGenerator:
             attitude_upper_bounds.append(a2)
 
         E_dist = torch.distributions.Uniform(
-            torch.tensor(attitude_lower_bounds, device=device),
-            torch.tensor(attitude_upper_bounds, device=device)
+            torch.tensor(attitude_lower_bounds, device=device, dtype=dtype),
+            torch.tensor(attitude_upper_bounds, device=device, dtype=dtype)
         )
         dists.append(E_dist)
 
         return dists
 
-    def update(self, num_examples: int, device: torch.device = torch.device("cpu")):
+    def update(self, num_examples: int, device: torch.device = torch.device("cpu"), dtype: torch.dtype = torch.float32):
         """Update the generator with new random levels"""
         active_levels = self.rng.choices(self.levels, weights=self.probabilities, k=num_examples)
 
         if self.mode == GenerationMode.UNCORRELATED:
-            self.uniform_dists = self._generate_uncorrelated(active_levels, device)
+            self.uniform_dists = self._generate_uncorrelated(active_levels, device, dtype)
         elif self.mode == GenerationMode.ISOTROPIC:
-            self.uniform_dists = self._generate_isotropic(active_levels, device)
+            self.uniform_dists = self._generate_isotropic(active_levels, device, dtype)
         elif self.mode == GenerationMode.AXIAL:
-            self.uniform_dists = self._generate_axial(active_levels, device)
+            self.uniform_dists = self._generate_axial(active_levels, device, dtype)
         elif self.mode == GenerationMode.DE:
-            self.uniform_dists = self._generate_de(active_levels, device)
+            self.uniform_dists = self._generate_de(active_levels, device, dtype)
 
         return self
 
@@ -805,44 +805,43 @@ class SampleGenerator:
 
         return zfs_pairs, exchange_dipolar_pairs
 
-    def update(self, device: torch.device = torch.device("cpu")):
+    def update(self, device: torch.device = torch.device("cpu"), dtype: torch.dtype = torch.float32):
         """Update all generators with appropriate batch sizes"""
-        self.temperature_gen.update(self.num_temp_points, device)
-        self.hamiltonian_strain_gen.update(self.num_ham_strains, device)
+        self.temperature_gen.update(self.num_temp_points, device, dtype)
+        self.hamiltonian_strain_gen.update(self.num_ham_strains, device, dtype)
 
-        self.g_components_gen.update(self.num_electrons, device)
-        self.g_orientation_gen.update(self.num_electrons, device)
+        self.g_components_gen.update(self.num_electrons, device, dtype)
+        self.g_orientation_gen.update(self.num_electrons, device, dtype)
 
         num_hyperfine_pairs = len(self.electron_nucleus_pairs)
         for nucleus_type, generator in self.hyperfine_coupling_gen.items():
-            generator.update(num_hyperfine_pairs, device)
-        self.hyperfine_orientation_gen.update(num_hyperfine_pairs, device)
+            generator.update(num_hyperfine_pairs, device, dtype)
+        self.hyperfine_orientation_gen.update(num_hyperfine_pairs, device, dtype)
 
         num_exchange_dipolar = len(self.exchange_dipolar_pairs)
         num_zfs = len(self.zfs_pairs)
 
         if num_exchange_dipolar > 0:
-            self.exchange_coupling_gen.update(num_exchange_dipolar, device)
-            self.dipolar_coupling_gen.update(num_exchange_dipolar, device)
+            self.exchange_coupling_gen.update(num_exchange_dipolar, device, dtype)
+            self.dipolar_coupling_gen.update(num_exchange_dipolar, device, dtype)
 
         if num_zfs > 0:
-            self.zfs_gen.update(num_zfs, device)
+            self.zfs_gen.update(num_zfs, device, dtype)
         total_ee_pairs = len(self.electron_electron_pairs)
         if total_ee_pairs > 0:
-            self.electron_electron_orientation_gen.update(total_ee_pairs, device)
+            self.electron_electron_orientation_gen.update(total_ee_pairs, device, dtype)
         if self.nuclear_coupling_gen is not None:
             num_nuclear_pairs = len(self.nucleus_nucleus_pairs)
-            self.nuclear_coupling_gen.update(num_nuclear_pairs, device)
+            self.nuclear_coupling_gen.update(num_nuclear_pairs, device, dtype)
 
         if self.nuclear_orientation_gen is not None:
             num_nuclear_pairs = len(self.nucleus_nucleus_pairs)
-            self.nuclear_orientation_gen.update(num_nuclear_pairs, device)
+            self.nuclear_orientation_gen.update(num_nuclear_pairs, device, dtype)
 
     def _create_tensor_interactions(self,
                                     components_gen: MultiDimensionalTensorGenerator,
                                     orientation_gen: MultiDimensionalTensorGenerator,
-                                    batch_size: int,
-                                    device: torch.device) -> \
+                                    batch_size: int) -> \
             tuple[list[spin_system.Interaction], torch.Tensor, torch.Tensor]:
         """Generic method to create tensor interactions with components and orientations
         Returns: (interactions, components_tensor, orientations_tensor)
@@ -857,13 +856,13 @@ class SampleGenerator:
             interaction = spin_system.Interaction(
                 components=components[:, i, :],  # [batch_size, 3]
                 frame=orientations[:, i, :],  # [batch_size, 3]
-                device=device,
+                device=components.device,
                 dtype=components.dtype
             )
             interactions.append(interaction)
         return interactions, components, orientations
 
-    def _assemble_g_tensors(self, batch_size: int, device: torch.device) ->\
+    def _assemble_g_tensors(self, batch_size: int) ->\
             tuple[list[spin_system.Interaction], torch.Tensor, torch.Tensor]:
         """Assemble G-tensor interactions for each electron
         Returns: (interactions, g_components, g_orientations)
@@ -872,10 +871,9 @@ class SampleGenerator:
             self.g_components_gen,
             self.g_orientation_gen,
             batch_size,
-            device
         )
 
-    def _assemble_hyperfine_interactions(self, batch_size: int, device: torch.device) ->\
+    def _assemble_hyperfine_interactions(self, batch_size: int) ->\
             tuple[list[tuple[int, int, spin_system.Interaction]], torch.Tensor, torch.Tensor]:
         """Assemble hyperfine interactions for electron-nucleus pairs
         Returns: (interactions, hyperfine_components, hyperfine_orientations)
@@ -887,7 +885,6 @@ class SampleGenerator:
             coupling_gen,
             self.hyperfine_orientation_gen,
             batch_size,
-            device
         )
         interaction_list = [(el_idx, nuc_idx, interaction) for (el_idx, nuc_idx), interaction in
                             zip(self.electron_nucleus_pairs, interactions)]
@@ -903,7 +900,7 @@ class SampleGenerator:
 
         return torch.stack([Dxx, Dyy, Dzz], dim=-1)
 
-    def _assemble_electron_electron_interactions(self, batch_size: int, device: torch.device) -> tuple[list, dict]:
+    def _assemble_electron_electron_interactions(self, batch_size: int) -> tuple[list, dict]:
         """Assemble all electron-electron interactions (ZFS + exchange + dipolar)
         Returns: (interactions, meta_dict)
         """
@@ -912,9 +909,10 @@ class SampleGenerator:
 
         if len(self.electron_electron_pairs) > 0:
             orientations = self.electron_electron_orientation_gen(batch_size).transpose(-3, -1)
-            meta['electron_electron_orientations'] = orientations  # [batch_size, num_pairs, 3]
+            meta['electron_electron_orientations'] = orientations.contiguous().to(torch.float32)  # [batch_size, num_pairs, 3]
         else:
-            meta['electron_electron_orientations'] = torch.empty(batch_size, 0, 3, device=device)
+            meta['electron_electron_orientations'] =\
+                torch.empty(batch_size, 0, 3).contiguous()
 
         pair_idx = 0
 
@@ -934,16 +932,16 @@ class SampleGenerator:
                 interaction = spin_system.Interaction(
                     components=zfs_components,
                     frame=orientations[:, pair_idx, :],
-                    device=device,
+                    device=zfs_components.device,
                     dtype=zfs_components.dtype
                 )
                 interactions.append((el1, el2, interaction))
                 pair_idx += 1
 
             if zfs_components_list:
-                meta['zfs_components'] = torch.stack(zfs_components_list, dim=1).contiguous()
+                meta['zfs_components'] = torch.stack(zfs_components_list, dim=1).contiguous().to(torch.float32)
         else:
-            meta['zfs_components'] = torch.empty(batch_size, 0, 3, device=device).contiguous()
+            meta['zfs_components'] = torch.empty(batch_size, 0, 3).contiguous()
 
         dipolar_components_list = []
         if len(self.exchange_dipolar_pairs) > 0:
@@ -964,74 +962,76 @@ class SampleGenerator:
                 interaction = spin_system.Interaction(
                     components=dipolar_components,
                     frame=orientations[:, pair_idx, :],
-                    device=device,
+                    device=dipolar_components.device,
                     dtype=dipolar_components.dtype
                 )
                 interactions.append((el1, el2, interaction))
                 pair_idx += 1
 
             if dipolar_components_list:
-                meta['dipolar_components'] = torch.stack(dipolar_components_list, dim=1).contiguous()
+                meta['dipolar_components'] = torch.stack(dipolar_components_list, dim=1).contiguous().to(torch.float32)
         else:
-            meta['dipolar_components'] = torch.empty(batch_size, 0, 3, device=device).contiguous()
+            meta['dipolar_components'] = torch.empty(batch_size, 0, 3).contiguous()
 
         return interactions, meta
 
-    def _assemble_spin_system(self, batch_size: int, device: torch.device) -> tuple[spin_system.SpinSystem, dict]:
+    def _assemble_spin_system(self, batch_size: int, device: torch.device, dtype: torch.dtype) ->\
+            tuple[spin_system.SpinSystem, dict]:
         """Assemble the complete spin system and return meta information
         Returns: (spin_system, meta_dict)
         """
         meta = {}
 
-        g_tensors, g_components, g_orientations = self._assemble_g_tensors(batch_size, device)
-        meta['g_tensor_components'] = g_components.contiguous()
-        meta['g_tensor_orientations'] = g_orientations.contiguous()
+        g_tensors, g_components, g_orientations = self._assemble_g_tensors(batch_size)
+        meta['g_tensor_components'] = g_components.contiguous().to(torch.float32)
+        meta['g_tensor_orientations'] = g_orientations.contiguous().to(torch.float32)
 
-        hyperfine_interactions, hf_components, hf_orientations = self._assemble_hyperfine_interactions(batch_size,
-                                                                                                       device)
-        meta['hyperfine_coupling_components'] = hf_components.contiguous()
-        meta['hyperfine_coupling_orientations'] = hf_orientations.contiguous()
+        hyperfine_interactions, hf_components, hf_orientations = self._assemble_hyperfine_interactions(batch_size)
+        meta['hyperfine_coupling_components'] = hf_components.contiguous().to(torch.float32)
+        meta['hyperfine_coupling_orientations'] = hf_orientations.contiguous().to(torch.float32)
 
-        electron_electron_interactions, ee_meta = self._assemble_electron_electron_interactions(batch_size, device)
+        electron_electron_interactions, ee_meta = self._assemble_electron_electron_interactions(batch_size)
         meta.update(ee_meta)
 
         if self.nuclear_coupling_gen is not None and len(self.nucleus_nucleus_pairs) > 0:
             nuclear_components = self.nuclear_coupling_gen(batch_size).transpose(-3, -1)
-            meta['nuclear_coupling_components'] = nuclear_components.contiguous()
+            meta['nuclear_coupling_components'] = nuclear_components.contiguous().to(torch.float32)
         else:
-            meta['nuclear_coupling_components'] = torch.empty(batch_size, 0, 3, device=device).contiguous()
+            meta['nuclear_coupling_components'] = torch.empty(batch_size, 0, 3).contiguous()
 
         if self.nuclear_orientation_gen is not None and len(self.nucleus_nucleus_pairs) > 0:
             nuclear_orientations = self.nuclear_orientation_gen(batch_size).transpose(-3, -1)
-            meta['nuclear_coupling_orientations'] = nuclear_orientations.contiguous()
+            meta['nuclear_coupling_orientations'] = nuclear_orientations.contiguous().to(torch.float32)
         else:
-            meta['nuclear_coupling_orientations'] = torch.empty(batch_size, 0, 3, device=device).contiguous()
+            meta['nuclear_coupling_orientations'] = torch.empty(batch_size, 0, 3).contiguous()
         spin_sys = spin_system.SpinSystem(
             electrons=self.electron_spins,
             g_tensors=g_tensors,
             nuclei=self.nucleus_labels,
             electron_nuclei=hyperfine_interactions,
             electron_electron=electron_electron_interactions,
-            device=device
+            device=device,
+            dtype=dtype
         )
 
         return spin_sys, meta
 
-    def __call__(self, batch_size: int, device: torch.device = torch.device("cpu")) -> tuple[
+    def __call__(self, batch_size: int, device: torch.device = torch.device("cpu"), dtype: torch.dtype = torch.float32) \
+            -> tuple[
         spin_system.MultiOrientedSample, torch.Tensor, dict[str, tp.Any]]:
         """Generate a batch of spin systems with parameters and meta information
         Returns: (multi_oriented_sample, temperatures, meta_dict)
         """
         system_inf = {}
-        base_spin_system, system_data = self._assemble_spin_system(batch_size, device)
+        base_spin_system, system_data = self._assemble_spin_system(batch_size, device, dtype)
         system_inf["data"] = system_data
 
         hamiltonian_strain = self.hamiltonian_strain_gen(1)[:, :, 0]
         hamiltonian_strain = hamiltonian_strain.transpose(-2, -1)
         temperatures = self.temperature_gen(1)[:, 0]
 
-        system_inf["data"]['hamiltonian_strain'] = hamiltonian_strain[:, None, None, :].contiguous()
-        system_inf["data"]['temperatures'] = temperatures[None, :, None, None].contiguous()
+        system_inf["data"]['hamiltonian_strain'] = hamiltonian_strain[:, None, None, :].contiguous().to(torch.float32)
+        system_inf["data"]['temperatures'] = temperatures[None, :, None, None].contiguous().to(torch.float32)
 
         system_inf["meta"] = {}
         system_inf["meta"]['electron_nucleus_pairs'] = self.electron_nucleus_pairs
@@ -1046,7 +1046,8 @@ class SampleGenerator:
             spin_system=base_spin_system,
             ham_strain=hamiltonian_strain,
             mesh=self.mesh,
-            device=device
+            device=device,
+            dtype=dtype
         )
 
         return multi_oriented_sample, temperatures, system_inf
@@ -1178,7 +1179,8 @@ class DataFullGenerator:
                  mean_iterations: int,
                  vary_iterations: int,
                  batch_size: int,
-                 device: torch.device = torch.device("cpu")) -> None:
+                 device: torch.device = torch.device("cpu"),
+                 dtype: torch.dtype = torch.float32) -> None:
         """
         Run the three-level generation and save outputs.
 
@@ -1215,8 +1217,8 @@ class DataFullGenerator:
                 self._ensure_dir(mean_folder)
 
                 # Update generators for this mean iteration
-                sample_gen.update(device=device)
-                self.freq_generator.update(1, device=device)
+                sample_gen.update(device=device, dtype=dtype)
+                self.freq_generator.update(1, device=device, dtype=dtype)
 
                 for v_idx in tqdm.tqdm(range(vary_iterations)):
                     sample_folder = mean_folder / f"sample_{v_idx:04d}"
@@ -1224,7 +1226,7 @@ class DataFullGenerator:
 
                     def heavy_block():
                         multi_oriented_sample, temperatures, system_meta = sample_gen(
-                            batch_size=batch_size, device=device
+                            batch_size=batch_size, device=device, dtype=dtype
                         )
 
                         freq, fields = self._get_freq_field(batch_size=batch_size)
@@ -1234,17 +1236,17 @@ class DataFullGenerator:
                             temperature=temperatures,
                             integration_chunk_size=8,
                             device=device,
+                            dtype=dtype
                         )
                         out, (min_pos_batch, max_pos_batch) = creator(
                             fields=fields, sample=multi_oriented_sample
                         )
 
                         save = system_meta["data"]
-                        save["fields"] = fields
-                        save["out"] = out
-                        save["freq"] = freq
-                        save["min_field_pos"] = min_pos_batch
-                        save["max_field_pos"] = max_pos_batch
+                        save["out"] = out.to(torch.float32)
+                        save["freq"] = freq.to(torch.float32)
+                        save["min_field_pos"] = min_pos_batch.to(torch.float32)
+                        save["max_field_pos"] = max_pos_batch.to(torch.float32)
                         safetensors.torch.save_file(save, sample_folder / "generation_data.safetensors")
 
                         with open(sample_folder / "sample_meta.pkl", "wb") as f:
