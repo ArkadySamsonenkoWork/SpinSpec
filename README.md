@@ -1,8 +1,22 @@
 # SpinSpec
 A toolkit for researchers to simulate, analyze, and explore EPR systems efficiently.
 
-What's inside.
+🚀 Overview
+This project provides a complete toolkit for:
+Quantum Spin System Modeling: Multi-particle spin systems with electrons and nuclei
+EPR Spectroscopy Simulation: Continuous-wave and time-resolved EPR spectra
+Resonance Field Calculations: Advanced algorithms for finding resonance conditions
+Machine Learning Integration: Neural network-based spectra generation and analysis
+Optimization Framework: Parameter fitting using multiple optimization algorithms
 
-1) spin_system.py. Можно задать любые электронные спины, любые ядерные спины и A тензор между ними. Внутри есть примеры: system_1(), system_2(). Кажется, эта функциональность работает.
+import spin_system
+import particles
 
-2) res_field.py. Самая главная функция get_resonance_intervals - возвращает интервал, где возможны резонансы в соотвествии со статью Штоля. Мало протестирована, и ооочень костыльно выглядит. 
+# Create a spin system with electron and nucleus
+electron = particles.Electron(g_tensor=torch.tensor([[2.002, 0, 0], 
+                                                     [0, 2.002, 0], 
+                                                     [0, 0, 2.002]]))
+nucleus = particles.Nucleus(spin=1))
+system = spin_system.SpinSystem([electron, nucleus])
+
+
