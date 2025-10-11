@@ -80,12 +80,15 @@ def init_tensor(
 ):
     if isinstance(components, torch.Tensor):
         tensor = components.to(device=device, dtype=dtype)
-        if tensor.shape[-1] == 3:
+        if tensor.shape and tensor.shape[-1] == 3:
             return tensor
-        elif tensor.shape[-1] == 2:
+        elif tensor.shape and tensor.shape[-1] == 2:
             axis_val, z_val = tensor[0], tensor[1]
             return torch.tensor([axis_val, axis_val, z_val], device=device, dtype=dtype)
-        elif tensor.shape[-1] == 1:
+        elif tensor.shape and tensor.shape[-1] == 1:
+            value = tensor.item()
+            return torch.full((3,), value, device=device, dtype=dtype)
+        elif not tensor.shape:
             value = tensor.item()
             return torch.full((3,), value, device=device, dtype=dtype)
         else:
@@ -917,10 +920,10 @@ class BaseSample(nn.Module):
     def _init_gauss_lorentz(self, width: tp.Optional[torch.Tensor]):
         if width is None:
             width = torch.zeros(
-                (*self.base_spin_system.config_shape,  1), device=self.device, dtype=self.dtype)
+                self.base_spin_system.config_shape, device=self.device, dtype=self.dtype)
         else:
             width = torch.tensor(width, device=self.device)
-            if width.shape[:-1] != self.base_spin_system.config_shape:
+            if width.shape != self.base_spin_system.config_shape:
                 raise ValueError(f"width batch shape must be equel to base_spin_system config shape")
         return width
 
@@ -1255,7 +1258,7 @@ class MultiOrientedSample(BaseSample):
         """
 
         super().__init__(spin_system, ham_strain, gauss, lorentz, device=device, dtype=dtype)
-        self.mesh = self._init_mesh(mesh, device=device)
+        self.mesh = self._init_mesh(mesh, device=device, dtype=dtype)
         rotation_matrices = self.mesh.rotation_matrices
 
         self._ham_strain = self._expand_hamiltonian_strain(
@@ -1264,11 +1267,11 @@ class MultiOrientedSample(BaseSample):
         )
         self.modified_spin_system = SpinSystemOrientator()(spin_system, rotation_matrices)
 
-    def _init_mesh(self, mesh: tp.Optional[BaseMesh], device: torch.device):
+    def _init_mesh(self, mesh: tp.Optional[BaseMesh], device: torch.device, dtype: torch.dtype):
         if mesh is None:
             mesh = mesher.DelaunayMeshNeighbour(interpolate=True,
                                                 initial_grid_frequency=20,
-                                                interpolation_grid_frequency=40, device=device)
+                                                interpolation_grid_frequency=40, device=device, dtype=dtype)
         return mesh
 
     def _expand_hamiltonian_strain(self, ham_strain: torch.Tensor, orientation_vector: torch.Tensor):

@@ -157,12 +157,12 @@ class SpectraIntegratorEasySpinLike(BaseSpectraIntegrator):
 
 class AxialSpectraIntegratorEasySpinLike(SpectraIntegratorEasySpinLike):
     def __init__(self, harmonic: int = 1, natural_width: float = 1e-6, chunk_size=128,
-                 device: torch.device = torch.device("cpu")):
-        super().__init__(harmonic, natural_width, chunk_size, device=device)
+                 device: torch.device = torch.device("cpu"), dtype: torch.dtype = torch.float32):
+        super().__init__(harmonic, natural_width, chunk_size, device=device, dtype=dtype)
         """
         :param harmonic: The harmonic of the spectra. 0 is an absorptions, 1 is derivative
         """
-        self.register_buffer("two", torch.tensor(2.0, device=device))
+        self.register_buffer("two", torch.tensor(2.0, device=device, dtype=dtype))
 
 
     def forward(self, res_fields: torch.Tensor,

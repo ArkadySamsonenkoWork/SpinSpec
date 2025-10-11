@@ -77,18 +77,25 @@ def rotation_matrix_to_euler_angles(R: torch.Tensor, convention: str = "zyz"):
     beta = torch.acos(torch.clamp(r33, -1.0, 1.0))
     sin_beta = torch.sin(beta)
 
-    if torch.abs(sin_beta) > 1e-6:
-        alpha = torch.atan2(r23, r13)
+    alpha_general = torch.atan2(r23, r13)
+    gamma_general = torch.atan2(r32, -r31)
 
-        gamma = torch.atan2(r32, -r31)
-    else:
-        if torch.abs(beta) < 1e-6:
-            alpha = torch.atan2(r12, r11)
-            gamma = torch.tensor(0.0, dtype=R.dtype, device=R.device)
-        else:
-            alpha = torch.atan2(-r12, r11)
-            gamma = torch.tensor(0.0, dtype=R.dtype, device=R.device)
-    return torch.tensor([alpha, beta, gamma])
+    alpha_beta0 = torch.atan2(r12, r11)
+    gamma_beta0 = torch.zeros_like(alpha_beta0)
+
+    alpha_betapi = torch.atan2(-r12, r11)
+    gamma_betapi = torch.zeros_like(alpha_betapi)
+
+    eps = 1e-6
+    mask_general = (sin_beta.abs() > eps)
+    mask_beta0 = (~mask_general) & (beta.abs() < eps)
+
+    alpha = torch.where(mask_general, alpha_general,
+             torch.where(mask_beta0, alpha_beta0, alpha_betapi))
+    gamma = torch.where(mask_general, gamma_general,
+             torch.where(mask_beta0, gamma_beta0, gamma_betapi))
+
+    return torch.stack([alpha, beta, gamma], dim=-1)
 
 
 def euler_angles_to_matrix(angles: torch.Tensor, convention: str = "zyz"):
@@ -208,3 +215,42 @@ def euler_angles_to_matrix(angles: torch.Tensor, convention: str = "zyz"):
 
     R = R.view(*batch_shape, 3, 3)
     return R
+
+
+def mean_rotation_svd(Rs: torch.Tensor):
+    """
+    Compute mean rotation matrix as SVD projection of mean value of rotation matrices
+    :param Rs: rotation matrices with shape [..., n, 3, 3], where n is number for mean computation.
+    :return: R_mean - mean rotation matrix with shape [..., 3, 3]
+    """
+    M = Rs.sum(dim=-3)
+    U, S, Vh = torch.linalg.svd(M)
+    R = U @ Vh
+    detR = torch.det(R)
+    neg_mask = detR < 0
+    if neg_mask.any():
+        U_alt = U.clone()
+        U_alt[..., :, -1] *= -1.0
+        R_alt = U_alt @ Vh
+        mask_mat = neg_mask.unsqueeze(-1).unsqueeze(-1)
+        R = torch.where(mask_mat, R_alt, R)
+    return R
+
+
+def get_canonical_orientations(angles: torch.Tensor):
+    """
+    Compute Canonical angles for set of angles using SVD mean projection
+    :param angles: euler angles in convention zyz. The shape is [..., n, 3], where n is set size
+    :return: Canonical angles
+    """
+    Rs = euler_angles_to_matrix(angles)
+    R_mean = mean_rotation_svd(Rs)
+    R_align = R_mean.transpose(-2, -1)
+
+    n = Rs.shape[-3]
+    batch_shape = R_align.shape[:-2]
+    expand_shape = tuple(batch_shape) + (n, 3, 3)
+    R_align_expanded = R_align.unsqueeze(-3).expand(expand_shape)
+    new_Rs = torch.matmul(R_align_expanded, Rs)
+
+    return rotation_matrix_to_euler_angles(new_Rs)

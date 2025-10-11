@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 
 from spectral_integration import BaseSpectraIntegrator,\
     SpectraIntegratorEasySpinLike,\
-    SpectraIntegratorEasySpinLikeTimeResolved, MeanIntegrator
+    SpectraIntegratorEasySpinLikeTimeResolved, MeanIntegrator, AxialSpectraIntegratorEasySpinLike
 from population import BaseTimeDependantPopulator, StationaryPopulator
 
 import torch
@@ -25,11 +25,12 @@ def compute_matrix_element(vector_down: torch.Tensor, vector_up: torch.Tensor, G
     tmp = torch.matmul(G.unsqueeze(-3), vector_down.unsqueeze(-1))
     return (vector_up.conj() * tmp.squeeze(-1)).sum(dim=-1)
 
+
 class PostSpectraProcessing(nn.Module):
     def __init__(self, *args, **kwargs):
         """
         :param gauss: The gauss parameter. The shape is [batch_size] or []
-        :param lorentz: The gauss parameter. The shape is [batch_size] or []
+        :param lorentz: The lorentz parameter. The shape is [batch_size] or []
         """
         super().__init__()
         pass
@@ -38,51 +39,103 @@ class PostSpectraProcessing(nn.Module):
         return spec
 
     def _broading_fabric(self, gauss: torch.Tensor, lorentz: torch.Tensor):
-        if (gauss.any() == 0) and (lorentz.any() == 0):
+        # Check if all values are zero (not just any)
+        gauss_zero = (gauss == 0).all()
+        lorentz_zero = (lorentz == 0).all()
+
+        if gauss_zero and lorentz_zero:
             return self._skip_broader
-
-        elif (gauss.all() != 0) and (lorentz.any() == 0):
+        elif not gauss_zero and lorentz_zero:
             return self._gauss_broader
-
-        elif (gauss.any() == 0) and (lorentz.all() != 0):
+        elif gauss_zero and not lorentz_zero:
             return self._lorentz_broader
-
         else:
             return self._voigt_broader
 
     def forward(self, gauss: torch.Tensor, lorentz: torch.Tensor,
-                 magnetic_field: torch.Tensor, spec: torch.Tensor) -> torch.Tensor:
+                magnetic_field: torch.Tensor, spec: torch.Tensor) -> torch.Tensor:
         """
-        :param magnetic_field: Tensor of shape [batch, N]
-        :param spec: Spectrum tensor of shape [batch, ..., N]
-        :return: Broadended spectrum, same shape as spec
+        :param gauss: Tensor of shape [] or [*batch_dims]
+        :param lorentz: Tensor of shape [] or [*batch_dims]
+        :param magnetic_field: Tensor of shape [N] or [*batch_dims, N]
+        :param spec: Spectrum tensor of shape [N] or [*batch_dims, N]
+        :return: Broadened spectrum, same shape as spec
         """
+        squeeze_output = False
+        if gauss.dim() == 0:
+            gauss = gauss.unsqueeze(0)
+        if lorentz.dim() == 0:
+            lorentz = lorentz.unsqueeze(0)
+        if magnetic_field.dim() == 1:
+            magnetic_field = magnetic_field.unsqueeze(0)
+            squeeze_output = True
+        if spec.dim() == 1:
+            spec = spec.unsqueeze(0)
+
         _broading_method = self._broading_fabric(gauss, lorentz)
-        return _broading_method(gauss, lorentz, magnetic_field, spec)
+        result = _broading_method(gauss, lorentz, magnetic_field, spec)
+
+        if squeeze_output:
+            result = result.squeeze(0)
+
+        return result
 
     def _build_lorentz_kernel(self, magnetic_field: torch.Tensor, fwhm_lorentz: torch.Tensor):
+        """
+        :param magnetic_field: Shape [*batch_dims, N]
+        :param fwhm_lorentz: Shape [*batch_dims]
+        :return: Kernel of shape [*batch_dims, N]
+        """
         dH = magnetic_field[..., 1] - magnetic_field[..., 0]
         N = magnetic_field.shape[-1]
-        idx = torch.arange(N, device=magnetic_field.device) - N//2
+        idx = torch.arange(N, device=magnetic_field.device) - N // 2
+
+        # Reshape for broadcasting: idx -> [1, ..., 1, N]
+        batch_dims = magnetic_field.dim() - 1
+        idx_shape = [1] * batch_dims + [N]
+        idx = idx.view(*idx_shape)
+
+        # dH and fwhm_lorentz -> [*batch_dims, 1]
+        dH = dH.unsqueeze(-1)
+        gamma = (fwhm_lorentz.unsqueeze(-1) / 2)
+
         x = idx * dH
-        gamma = fwhm_lorentz / 2
         L = (gamma / torch.pi) / (x ** 2 + gamma ** 2)
         return L
 
     def _build_gauss_kernel(self, magnetic_field: torch.Tensor, fwhm_gauss: torch.Tensor):
+        """
+        :param magnetic_field: Shape [*batch_dims, N]
+        :param fwhm_gauss: Shape [*batch_dims]
+        :return: Kernel of shape [*batch_dims, N]
+        """
         dH = magnetic_field[..., 1] - magnetic_field[..., 0]
         N = magnetic_field.shape[-1]
-        idx = torch.arange(N, device=magnetic_field.device) - N//2
+        idx = torch.arange(N, device=magnetic_field.device) - N // 2
+
+        # Reshape for broadcasting: idx -> [1, ..., 1, N]
+        batch_dims = magnetic_field.dim() - 1
+        idx_shape = [1] * batch_dims + [N]
+        idx = idx.view(*idx_shape)
+
+        # dH and fwhm_gauss -> [*batch_dims, 1]
+        dH = dH.unsqueeze(-1)
+        sigma = fwhm_gauss.unsqueeze(-1) / (2 * (2 * torch.log(torch.tensor(2.0, device=magnetic_field.device))) ** 0.5)
+
         x = idx * dH
-        sigma = fwhm_gauss / (2 * (2 * torch.log(torch.tensor(2.0)))**0.5)
-        G = torch.exp(-0.5 * (x / sigma)**2) / (sigma * (2 * torch.pi)**0.5)
+        G = torch.exp(-0.5 * (x / sigma) ** 2) / (sigma * (2 * torch.pi) ** 0.5)
         return G
 
     def _build_voigt_kernel(self,
                             magnetic_field: torch.Tensor,
                             fwhm_gauss: torch.Tensor,
-                            fwhm_lorentz: torch.Tensor
-                            ):
+                            fwhm_lorentz: torch.Tensor):
+        """
+        :param magnetic_field: Shape [*batch_dims, N]
+        :param fwhm_gauss: Shape [*batch_dims]
+        :param fwhm_lorentz: Shape [*batch_dims]
+        :return: Kernel of shape [*batch_dims, N]
+        """
         N = magnetic_field.shape[-1]
         G = self._build_gauss_kernel(magnetic_field, fwhm_gauss)
         L = self._build_lorentz_kernel(magnetic_field, fwhm_lorentz)
@@ -96,8 +149,12 @@ class PostSpectraProcessing(nn.Module):
         return V
 
     def _apply_convolution(self, spec: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
-        """Apply convolution via FFT per batch."""
-
+        """
+        Apply convolution via FFT.
+        :param spec: Shape [*batch_dims, N]
+        :param kernel: Shape [*batch_dims, N]
+        :return: Convolved spectrum of shape [*batch_dims, N]
+        """
         S = fft.rfft(spec, dim=-1)
         K = fft.rfft(torch.fft.ifftshift(kernel, dim=-1), dim=-1)
         out = fft.irfft(S * K, n=spec.shape[-1], dim=-1)
@@ -106,25 +163,34 @@ class PostSpectraProcessing(nn.Module):
     def _gauss_broader(self,
                        gauss: torch.Tensor, lorentz: torch.Tensor,
                        magnetic_field: torch.Tensor, spec: torch.Tensor) -> torch.Tensor:
-        batch = magnetic_field.shape[0]
-        fwhm_gauss = gauss.expand(batch)
-        kernel = self._build_gauss_kernel(magnetic_field, fwhm_gauss)
+        """
+        :param gauss: Shape [*batch_dims]
+        :param magnetic_field: Shape [*batch_dims, N]
+        :param spec: Shape [*batch_dims, N]
+        """
+        kernel = self._build_gauss_kernel(magnetic_field, gauss)
         return self._apply_convolution(spec, kernel)
 
     def _lorentz_broader(self,
                          gauss: torch.Tensor, lorentz: torch.Tensor,
                          magnetic_field: torch.Tensor, spec: torch.Tensor) -> torch.Tensor:
-        batch = magnetic_field.shape[0]
-        fwhm_lorentz = lorentz.expand(batch)
-        kernel = self._build_lorentz_kernel(magnetic_field, fwhm_lorentz)
+        """
+        :param lorentz: Shape [*batch_dims]
+        :param magnetic_field: Shape [*batch_dims, N]
+        :param spec: Shape [*batch_dims, N]
+        """
+        kernel = self._build_lorentz_kernel(magnetic_field, lorentz)
         return self._apply_convolution(spec, kernel)
 
     def _voigt_broader(self, gauss: torch.Tensor, lorentz: torch.Tensor,
                        magnetic_field: torch.Tensor, spec: torch.Tensor) -> torch.Tensor:
-        batch = magnetic_field.shape[0]
-        fwhm_gauss = gauss.expand(batch)
-        fwhm_lorentz = lorentz.expand(batch)
-        kernel = self._build_voigt_kernel(magnetic_field, fwhm_gauss, fwhm_lorentz)
+        """
+        :param gauss: Shape [*batch_dims]
+        :param lorentz: Shape [*batch_dims]
+        :param magnetic_field: Shape [*batch_dims, N]
+        :param spec: Shape [*batch_dims, N]
+        """
+        kernel = self._build_voigt_kernel(magnetic_field, gauss, lorentz)
         return self._apply_convolution(spec, kernel)
 
 
@@ -617,6 +683,7 @@ class BaseSpectraCreator(nn.Module, ABC):
         self.register_buffer("resonance_parameter", torch.tensor(resonance_parameter, device=device, dtype=dtype))
         self.register_buffer("threshold", torch.tensor(1e-2, device=device, dtype=dtype))
         self.register_buffer("tolerancy", torch.tensor(1e-10, device=device, dtype=dtype))
+        self.register_buffer("intensity_std", torch.tensor(1e-7, device=device, dtype=dtype))
 
         self.spin_system_dim, self.batch_dims, self.mesh =\
             self._init_sample_parameters(sample, spin_system_dim, batch_dims, mesh)
@@ -883,7 +950,7 @@ class BaseSpectraCreator(nn.Module, ABC):
 
         freq_to_field = self._freq_to_field(vector_u, vector_v, Gz)
         intensities *= freq_to_field
-        intensities = intensities / intensities.abs().max()
+        intensities = intensities / self.intensity_std
         width = self.broader(sample, vector_u, vector_v, res_fields) * freq_to_field
 
         extras = self._compute_additional(
@@ -1446,7 +1513,7 @@ class StationarySpectraCreatorFreq(StationarySpectraCreator):
         vector_u = vector_down[..., intensities_mask, :]
         vector_v = vector_up[..., intensities_mask, :]
 
-        #intensities = intensities / intensities.abs().max()
+        intensities = intensities / self.intensity_std
         width = self.broader(sample, vector_u, vector_v, res_fields)
 
         extras = self._compute_additional(

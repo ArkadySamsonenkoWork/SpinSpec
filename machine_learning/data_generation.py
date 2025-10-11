@@ -659,13 +659,13 @@ class MultiDimensionalTensorGenerator:
         """Update the generator with new random levels"""
         active_levels = self.rng.choices(self.levels, weights=self.probabilities, k=num_examples)
 
-        if self.mode == GenerationMode.UNCORRELATED:
+        if self.mode.value == GenerationMode.UNCORRELATED.value:
             self.uniform_dists = self._generate_uncorrelated(active_levels, device, dtype)
-        elif self.mode == GenerationMode.ISOTROPIC:
+        elif self.mode.value == GenerationMode.ISOTROPIC.value:
             self.uniform_dists = self._generate_isotropic(active_levels, device, dtype)
-        elif self.mode == GenerationMode.AXIAL:
+        elif self.mode.value == GenerationMode.AXIAL.value:
             self.uniform_dists = self._generate_axial(active_levels, device, dtype)
-        elif self.mode == GenerationMode.DE:
+        elif self.mode.value == GenerationMode.DE.value:
             self.uniform_dists = self._generate_de(active_levels, device, dtype)
 
         return self
@@ -675,7 +675,7 @@ class MultiDimensionalTensorGenerator:
         if self.uniform_dists is None:
             raise RuntimeError("Must call update() before generating samples")
 
-        if self.mode == GenerationMode.ISOTROPIC and self.output_dims == 3:
+        if self.mode.value == GenerationMode.ISOTROPIC.value and self.output_dims == 3:
             iso_samples = self.uniform_dists[0].sample((batch_size,)).transpose(0, 1)
             var_samples = [dist.sample((batch_size,)).transpose(0, 1) for dist in self.uniform_dists[1:]]
             results = []
@@ -684,7 +684,7 @@ class MultiDimensionalTensorGenerator:
 
             return torch.stack(results, dim=0)
 
-        elif self.mode == GenerationMode.DE and self.output_dims == 2:
+        elif self.mode.value == GenerationMode.DE.value and self.output_dims == 2:
             D_samples = self.uniform_dists[0].sample((batch_size,)).transpose(0, 1)
             E_attitude_samples = self.uniform_dists[1].sample((batch_size,)).transpose(0, 1)
             E_samples = D_samples * E_attitude_samples
@@ -1079,6 +1079,7 @@ class DataFullGenerator:
 
                  num_temperature_points: int = 4,
                  num_hamiltonian_strains: int = 3,
+                 same_freq_for_structure: bool = True,
                  fields_base_range: tuple[float, float] = (
                  (constants.PLANCK / (1.9 * constants.BOHR)) / 4, (constants.PLANCK / (2.4 * constants.BOHR)) * 4),
                  device: torch.device = torch.device("cpu"),
@@ -1104,6 +1105,7 @@ class DataFullGenerator:
         self.nuclear_orientation_gen = nuclear_orientation_generator
         self.num_temp_points = num_temperature_points
         self.num_ham_strains = num_hamiltonian_strains
+        self.same_freq_for_structure = same_freq_for_structure
 
         self.mesh = mesh
         self.alarm_time = alarm_time
@@ -1204,6 +1206,10 @@ class DataFullGenerator:
         """
         self.fields_base_range.to(device=device)
         for s_idx in range(struct_iterations):
+            if self.same_freq_for_structure:
+                self.freq_generator.update(1, device=device, dtype=dtype)
+                freq, fields = self._get_freq_field(batch_size=batch_size)
+
             print(f"structure_iteration {s_idx} / {struct_iterations}")
             sample_gen, struct_folder, struct_obj = self._first_level_generation(s_idx, batch_size)
             print(f"generation_structure {struct_obj}")
@@ -1215,21 +1221,20 @@ class DataFullGenerator:
 
                 mean_folder = struct_folder / f"mean_{m_idx:04d}"
                 self._ensure_dir(mean_folder)
-
-                # Update generators for this mean iteration
                 sample_gen.update(device=device, dtype=dtype)
-                self.freq_generator.update(1, device=device, dtype=dtype)
+                if not self.same_freq_for_structure:
+                    self.freq_generator.update(1, device=device, dtype=dtype)
 
                 for v_idx in tqdm.tqdm(range(vary_iterations)):
                     sample_folder = mean_folder / f"sample_{v_idx:04d}"
                     self._ensure_dir(sample_folder)
+                    if not self.same_freq_for_structure:
+                        freq, fields = self._get_freq_field(batch_size=batch_size)
 
-                    def heavy_block():
+                    def spectra_generation():
                         multi_oriented_sample, temperatures, system_meta = sample_gen(
                             batch_size=batch_size, device=device, dtype=dtype
                         )
-
-                        freq, fields = self._get_freq_field(batch_size=batch_size)
                         creator = GenerationCreator(
                             freq=freq,
                             sample=multi_oriented_sample,
@@ -1253,7 +1258,7 @@ class DataFullGenerator:
                             pickle.dump(system_meta["meta"], f)
 
                     try:
-                        func_timeout(self.alarm_time, heavy_block)
+                        func_timeout(self.alarm_time, spectra_generation)
 
                     except FunctionTimedOut:
                         error_msg = (

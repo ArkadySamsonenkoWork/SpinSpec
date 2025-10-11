@@ -2,7 +2,8 @@ import typing as tp
 import pathlib
 import sys
 import pickle
-
+import random
+import math
 sys.path.append("..")
 
 import torch
@@ -12,6 +13,7 @@ import torch.nn as nn
 import spin_system
 import constants
 import particles
+import spectra_manager
 
 from .data_generation import SpinSystemStructure
 
@@ -242,10 +244,11 @@ class FileParser:
         batch_size = generation_summary["batch_size"]
 
         spec = generation_data["out"]
-        max_pos_batch = generation_data["max_field_pos"]
-        min_pos_batch = generation_data["min_field_pos"]
-        steps = torch.linspace(0, 1, spec.shape[-1])
-        fields = steps * (max_pos_batch - min_pos_batch).unsqueeze(-1) + min_pos_batch.unsqueeze(-1)
+        max_field_pos = generation_data["max_field_pos"]
+        min_field_pos = generation_data["min_field_pos"]
+
+        #steps = torch.linspace(0, 1, spec.shape[-1])
+        #fields = steps * (max_field_pos - min_field_pos).unsqueeze(-1) + min_field_pos.unsqueeze(-1)
 
         hamiltonian_strain = generation_data["hamiltonian_strain"].expand(
             num_hamiltonian_strains, num_temperature_points, batch_size, 3
@@ -268,16 +271,16 @@ class FileParser:
         hyperfine_coupling_components, hyperfine_coupling_orientations, hyperfine_pairs = self._parse_electron_nuclei(
             structure, generation_summary, sample_meta, generation_data)
 
-        return (fields, spec, freq, hamiltonian_strain, temperatures), (
+        return ((min_field_pos, max_field_pos), spec, freq, hamiltonian_strain, temperatures), (
         electrons_spins, g_tensor_components, g_tensor_orientations), nuclei, (
-        electron_electron_components, electron_angles, electron_pairs),(
+        electron_electron_components, electron_angles, electron_pairs), (
             hyperfine_coupling_components, hyperfine_coupling_orientations, hyperfine_pairs)
 
     def to_sample_data(self, structure: SpinSystemStructure, generation_summary: dict[str, tp.Any],
                        path: tp.Union[str, pathlib.Path],
                        lorentz: tp.Optional[torch.Tensor], gauss: tp.Optional[torch.Tensor]):
 
-        (fields, spec, freq, hamiltonian_strain, temperatures), (
+        ((min_field_pos, max_field_pos), spec, freq, hamiltonian_strain, temperatures), (
             electrons_spins, g_tensor_components, g_tensor_orientations), nuclei, (
             electron_electron_components, electron_angles, electron_pairs), (
             hyperfine_coupling_components, hyperfine_coupling_orientations, hyperfine_pairs)\
@@ -313,7 +316,8 @@ class FileParser:
 
         return {
             "sample": sample,
-            "fields": fields,
+            "min_field_pos": min_field_pos,
+            "max_field_pos": max_field_pos,
             "temperatures": temperatures,
             "spec": spec,
             "freq": freq
@@ -323,7 +327,7 @@ class FileParser:
                        path: tp.Union[str, pathlib.Path],
                        lorentz: tp.Optional[torch.Tensor], gauss: tp.Optional[torch.Tensor]):
 
-        (fields, spec, freq, hamiltonian_strain, temperatures), (
+        ((min_field_pos, max_field_pos), spec, freq, hamiltonian_strain, temperatures), (
             electrons_spins, g_tensor_components, g_tensor_orientations), nuclei, (
             electron_electron_components, electron_angles, electron_pairs), (
             hyperfine_coupling_components, hyperfine_coupling_orientations, hyperfine_pairs)\
@@ -400,13 +404,6 @@ class FileParser:
         spins = spins.view(-1, *[1] * len(config_shape)).expand(-1, *config_shape)
         types = types.view(-1, *[1] * len(config_shape)).expand(-1, *config_shape)
 
-        if lorentz is None:
-            lorentz = torch.zeros_like(hamiltonian_strain)
-        if gauss is None:
-            gauss = torch.zeros_like(hamiltonian_strain)
-
-        node_data = torch.cat((hamiltonian_strain, lorentz, gauss, temperatures), dim=-1)
-
         return {
             "components": components,
             "angles": angles,
@@ -418,7 +415,8 @@ class FileParser:
             "lorentz": lorentz,
             "gauss": gauss,
             "temperatures": temperatures,
-            "fields": fields,
+            "min_field_pos": min_field_pos,
+            "max_field_pos": max_field_pos,
             "spec": spec,
             "freq": freq
         }
