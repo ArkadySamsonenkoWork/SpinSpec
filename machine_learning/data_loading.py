@@ -17,6 +17,9 @@ import spectra_manager
 
 from .data_generation import SpinSystemStructure
 
+from .transforms import ComponentsAnglesTransform, SpectraModifier,\
+    SpecTransformField, BroadTransform, SpecTransformSpecIntensity
+
 
 class SampleGraphData:
     """
@@ -250,7 +253,7 @@ class FileParser:
         #steps = torch.linspace(0, 1, spec.shape[-1])
         #fields = steps * (max_field_pos - min_field_pos).unsqueeze(-1) + min_field_pos.unsqueeze(-1)
 
-        hamiltonian_strain = generation_data["hamiltonian_strain"].expand(
+        ham_strain = generation_data["ham_strain"].expand(
             num_hamiltonian_strains, num_temperature_points, batch_size, 3
         )
 
@@ -271,7 +274,7 @@ class FileParser:
         hyperfine_coupling_components, hyperfine_coupling_orientations, hyperfine_pairs = self._parse_electron_nuclei(
             structure, generation_summary, sample_meta, generation_data)
 
-        return ((min_field_pos, max_field_pos), spec, freq, hamiltonian_strain, temperatures), (
+        return ((min_field_pos, max_field_pos), spec, freq, ham_strain, temperatures), (
         electrons_spins, g_tensor_components, g_tensor_orientations), nuclei, (
         electron_electron_components, electron_angles, electron_pairs), (
             hyperfine_coupling_components, hyperfine_coupling_orientations, hyperfine_pairs)
@@ -280,7 +283,7 @@ class FileParser:
                        path: tp.Union[str, pathlib.Path],
                        lorentz: tp.Optional[torch.Tensor], gauss: tp.Optional[torch.Tensor]):
 
-        ((min_field_pos, max_field_pos), spec, freq, hamiltonian_strain, temperatures), (
+        ((min_field_pos, max_field_pos), spec, freq, ham_strain, temperatures), (
             electrons_spins, g_tensor_components, g_tensor_orientations), nuclei, (
             electron_electron_components, electron_angles, electron_pairs), (
             hyperfine_coupling_components, hyperfine_coupling_orientations, hyperfine_pairs)\
@@ -311,7 +314,7 @@ class FileParser:
             electron_nuclei=el_nuc,
             electron_electron=el_el,
         )
-        sample = spin_system.MultiOrientedSample(spin_system=base_spin_system, ham_strain=hamiltonian_strain,
+        sample = spin_system.MultiOrientedSample(spin_system=base_spin_system, ham_strain=ham_strain,
                                                  lorentz=lorentz, gauss=gauss)
 
         return {
@@ -327,7 +330,7 @@ class FileParser:
                        path: tp.Union[str, pathlib.Path],
                        lorentz: tp.Optional[torch.Tensor], gauss: tp.Optional[torch.Tensor]):
 
-        ((min_field_pos, max_field_pos), spec, freq, hamiltonian_strain, temperatures), (
+        ((min_field_pos, max_field_pos), spec, freq, ham_strain, temperatures), (
             electrons_spins, g_tensor_components, g_tensor_orientations), nuclei, (
             electron_electron_components, electron_angles, electron_pairs), (
             hyperfine_coupling_components, hyperfine_coupling_orientations, hyperfine_pairs)\
@@ -346,8 +349,8 @@ class FileParser:
             components_list.append(g_comp * constants.BOHR / constants.PLANCK)
             angles_list.append(g_orient)
 
-        config_shape = hamiltonian_strain.shape[:-1]  # Get config shape from hamiltonian_strain
-        device = hamiltonian_strain.device
+        config_shape = ham_strain.shape[:-1]  # Get config shape from hamiltonian_strain
+        device = ham_strain.device
         nuclei = [particles.Nucleus(nucleus) for nucleus in nuclei]
 
         for nucleus in nuclei:
@@ -411,7 +414,7 @@ class FileParser:
             "source": sources,
             "spins": spins,
             "types": types,
-            "hamiltonian_strain": hamiltonian_strain,
+            "ham_strain": ham_strain,
             "lorentz": lorentz,
             "gauss": gauss,
             "temperatures": temperatures,
@@ -420,3 +423,161 @@ class FileParser:
             "spec": spec,
             "freq": freq
         }
+
+
+class EPRDataset(torch.utils.data.Dataset):
+    def __init__(self, root_dir: str, rng_generator=random.Random(None)):
+        self.components_angles_transform = ComponentsAnglesTransform()
+        self.spectra_modifier = SpectraModifier(rng_generator)
+        self.file_parser = FileParser()
+        self.root_dir = pathlib.Path(root_dir)
+
+        self._structure_info = self._scan_directory()
+        self._structure_data = self._get_samples(self._structure_info)
+
+        self._spectra_modifier = SpectraModifier(rng_generator=rng_generator)
+        self._spectra_g_transform = SpecTransformField()
+        self._broad_transform = BroadTransform()
+        self._spectra_transform_intenisty = SpecTransformSpecIntensity()
+
+    def _get_samples(self, _structure_info: list[dict[str, tp.Any]]):
+        self.cache = []
+        for idx in range(len(_structure_info)):
+            self.cache.append(self._load_sample(idx))
+
+    def _scan_directory(self) -> list[tp.Dict[str, str]]:
+        _samples_data = []
+        structure_dirs = sorted(self.root_dir.glob("structure_*"))
+        structure_data = []
+        num_nodes = 0
+        for structure_dir in structure_dirs:
+            structure_id = structure_dir.name
+            structure, generator_summary = self.file_parser.open_structure(
+                str(structure_dir)
+            )
+            mean_dirs = sorted(structure_dir.glob("mean_*"))
+
+            mean_data = []
+            for mean_dir in mean_dirs:
+                mean_id = mean_dir.name
+                sample_dirs = sorted(mean_dir.glob("sample_*"))
+
+                sample_data = []
+                for sample_dir in sample_dirs:
+                    sample_id = sample_dir.name
+                    num_nodes = structure.num_electrons + structure.num_nuclei + \
+                                len(structure.electron_nuclei) + len(structure.electron_electron) + len(
+                        structure.nuclei_nuclei)
+
+                    sample_data.append({
+                        "sample_path": str(sample_dir),
+                        "mean_id": mean_id,
+                        "sample_id": sample_id,
+                    })
+                mean_data.append(sample_data)
+
+            structure_data.append({
+                "structure_path": str(structure_dir),
+                "structure_id": structure_id,
+                "num_nodes": num_nodes,
+                "mean_data": mean_data
+            }
+            )
+
+            return structure_data
+
+    def __len__(self) -> int:
+        return len(self._structure_info)
+
+    def _prepare_out(self, structure_out):
+        ham_strain = structure_out.pop("ham_strain")
+
+        spec_out = self._spectra_modifier(
+            structure_out.pop("min_field_pos"), structure_out.pop("max_field_pos"), structure_out.pop("spec"),
+            ham_strain
+        )
+        g_feature, freq_feature = self._spectra_g_transform(spec_out["field"], structure_out["freq"])
+        spec = self._spectra_transform_intenisty(spec_out["spec"])
+        spec_distorted = self._spectra_transform_intenisty(spec_out["spec_distorted"])
+        broad_features = self._broad_transform(ham_strain, spec_out.pop("lorentz"), spec_out.pop("gauss"))
+
+        return structure_out, broad_features, g_feature, freq_feature, spec, spec_distorted
+
+    def __getitem__(self, idx):
+        structure_out = self.cache[idx]
+        structure_out, broad_features, g_feature, freq_feature, spec, spec_distorted = self._prepare_out(structure_out)
+
+    def _load_sample(self, idx: int) -> tp.Dict[str, tp.Any]:
+        """Load a single sample"""
+        structure_info = self._structure_info[idx]
+
+        structure, generator_summary = self.file_parser.open_structure(
+            structure_info["structure_path"]
+        )
+        structure_out = {}
+        tensor_embedings = []
+        min_field_pos = []
+        max_field_pos = []
+        ham_strain = []
+        spec = []
+        freq = []
+        for mean_data in structure_info["mean_data"]:
+            for sample_info in mean_data:
+                out = self.file_parser.to_graph_data(
+                    structure,
+                    generator_summary,
+                    sample_info["sample_path"],
+                    None,
+                    None
+                )
+                components = out.pop("components")
+                angles = out.pop("angles")
+                temperature = out.pop("temperatures")
+
+                tensor_embeding = self.components_angles_transform(components, temperature, angles)
+                tensor_embedings.append(
+                    torch.flatten(tensor_embeding, start_dim=1, end_dim=-2)
+                )
+
+                min_field_pos.append(
+                    torch.flatten(out.pop("min_field_pos"))
+                )
+                max_field_pos.append(
+                    torch.flatten(out.pop("max_field_pos"))
+                )
+
+                ham_strain.append(
+                    torch.flatten(out.pop("ham_strain"), end_dim=-2)
+                )
+                freq.append(
+                    torch.flatten(out.pop("freq").expand(ham_strain[0].shape[0]))
+                )
+                spec.append(
+                    torch.flatten(out.pop("spec"), end_dim=-2)
+                )
+        tensor_embedings = torch.cat(tensor_embedings, dim=-2)
+        spec = torch.cat(spec, dim=-2)
+        freq = torch.cat(freq, dim=-1)
+        max_field_pos = torch.cat(max_field_pos)
+        min_field_pos = torch.cat(min_field_pos)
+        ham_strain = torch.cat(ham_strain, dim=-2)
+
+        source = out["source"]
+        destinations = out["destinations"]
+
+        types = out["types"]
+
+        structure_out["types"] = types
+        structure_out["destinations"] = destinations
+        structure_out["source"] = source
+
+        structure_out["tensor_embedings"] = tensor_embedings
+        structure_out["spec"] = spec
+        structure_out["freq"] = freq
+
+        structure_out["max_field_pos"] = max_field_pos
+        structure_out["min_field_pos"] = min_field_pos
+        structure_out["num_nudes"] = structure_info["num_nodes"]
+        structure_out["ham_strain"] = ham_strain
+
+        return structure_out

@@ -1026,11 +1026,11 @@ class SampleGenerator:
         base_spin_system, system_data = self._assemble_spin_system(batch_size, device, dtype)
         system_inf["data"] = system_data
 
-        hamiltonian_strain = self.hamiltonian_strain_gen(1)[:, :, 0]
-        hamiltonian_strain = hamiltonian_strain.transpose(-2, -1)
+        ham_strain = self.hamiltonian_strain_gen(1)[:, :, 0]
+        ham_strain = ham_strain.transpose(-2, -1)
         temperatures = self.temperature_gen(1)[:, 0]
 
-        system_inf["data"]['hamiltonian_strain'] = hamiltonian_strain[:, None, None, :].contiguous().to(torch.float32)
+        system_inf["data"]['ham_strain'] = ham_strain[:, None, None, :].contiguous().to(torch.float32)
         system_inf["data"]['temperatures'] = temperatures[None, :, None, None].contiguous().to(torch.float32)
 
         system_inf["meta"] = {}
@@ -1044,7 +1044,7 @@ class SampleGenerator:
 
         multi_oriented_sample = MultiOrientedSampleGen(
             spin_system=base_spin_system,
-            ham_strain=hamiltonian_strain,
+            ham_strain=ham_strain,
             mesh=self.mesh,
             device=device,
             dtype=dtype
@@ -1259,6 +1259,7 @@ class DataFullGenerator:
 
                     try:
                         func_timeout(self.alarm_time, spectra_generation)
+                        torch.cuda.empty_cache()
 
                     except FunctionTimedOut:
                         error_msg = (

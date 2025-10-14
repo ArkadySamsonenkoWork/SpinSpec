@@ -29,8 +29,7 @@ class ComponentsTransform:
     def __call__(self, components, temperature):
         components = vector_to_de(components)
         components_feat_freq = constants.PLANCK * components / (2.00 * constants.BOHR)
-        components_feat_temp = components / constants.unit_converter(components, "K_to_Hz").unsqueeze(0)
-
+        components_feat_temp = components / constants.unit_converter(temperature, "K_to_Hz").unsqueeze(0)
         return components_feat_freq / self.freq_factor, components_feat_temp / self.temp_factor
 
 
@@ -54,19 +53,26 @@ class ComponentsAnglesTransform:
         return torch.cat((components_feat_freq, components_feat_temp, angles), dim=-1)
 
 
-class SpecTrnsformField:
+class SpecTransformField:
     def __init__(self, g_tensor_shift: float = 2.0, freq_shift: float = 20.0 * 1e9, freq_deriv: float = 20.0 * 1e9):
         self.g_tensor_shift = torch.tensor(g_tensor_shift)
         self.freq_shift = freq_shift
         self.freq_deriv = freq_deriv
 
-    def __call__(self, spec: torch.Tensor, field: torch.Tensor, freq: torch.Tensor):
-        g_tensors = (constants.PLANCK * freq) / (constants.BOHR * field)
+    def __call__(self, field: torch.Tensor, freq: torch.Tensor):
+
+        g_tensors = (constants.PLANCK * freq.unsqueeze(-1)) / (constants.BOHR * field)
         g_tensors = torch.flip(g_tensors, dims=(-1,))
+        g_feature = g_tensors - self.g_tensor_shift
+        freq_feature = (freq - self.freq_shift) / self.freq_deriv
+        return g_feature, freq_feature
+
+
+class SpecTransformSpecIntensity:
+    def __call__(self, spec: torch.Tensor):
         spec = torch.flip(spec, dims=(-1,))
         spec = spec / torch.max(spec, dim=-1, keepdim=True)[0]
-        g_feature = g_tensors - self.g_tensor_shift
-        return g_feature, spec
+        return spec
 
 
 class SpinTranform:
@@ -85,13 +91,12 @@ class BroadTransform:
         self.shift = torch.tensor(shift)
         self.std = torch.tensor(std)
 
-    def __call__(self, hamiltonian_strain: torch.Tensor, lorentz: torch.Tensor, gauss: torch.Tensor):
-        hamiltonian_strain = vector_to_de(hamiltonian_strain)
+    def __call__(self, ham_strain: torch.Tensor, lorentz: torch.Tensor, gauss: torch.Tensor):
+        ham_strain = vector_to_de(ham_strain)
         lorentz = lorentz * constants.BOHR / constants.PLANCK
         gauss = gauss * constants.BOHR / constants.PLANCK
 
-        return (torch.cat((hamiltonian_strain, lorentz, gauss), dim=-1) - self.shift) / self.std
-
+        return (torch.cat((ham_strain, lorentz.unsqueeze(-1), gauss.unsqueeze(-1)), dim=-1) - self.shift) / self.std
 
 
 class SpecFieldPrepare(nn.Module):
@@ -311,15 +316,15 @@ class SpectraDistortion(nn.Module):
         baseline = (self.baseline_quadratic * field_norm ** 2 +
                     self.baseline_linear * field_norm +
                     self.baseline_constant)
+
         noise_max_level = torch.rand((spec.shape[:-1]), dtype=spec.dtype, device=spec.device) * self.noise_max_level
         noise = torch.randn_like(spec) * noise_max_level.unsqueeze(-1)
         distorted_spec = spec + baseline + noise
         if self.correct_baseline:
-            dims = list(range(distorted_spec.dim() - 1))
+            dims = list(range(1, distorted_spec.dim()))
             baseline = (torch.mean(distorted_spec[..., :self.baseline_points], dim=dims) + torch.mean(
                 distorted_spec[..., -self.baseline_points:], dim=dims)) / 2
             distorted_spec = distorted_spec - baseline.unsqueeze(-1)
-
         return distorted_spec
 
 
@@ -352,7 +357,7 @@ class SpectraModifier(nn.Module):
             Shape: [...]
         :param spec: Initial magnetic resonance spectrum intensities.
             Shape: [..., num_initial_points]
-        :param ham_strain: Hamiltonian strain tensor affecting linewidth constraints.
+        :param ham_strain: Hamiltonian strain tensor affecting linewidth constraints measured in Hz.
             Shape: [..., 3]
         :return: Dictionary containing:
             - field (torch.Tensor): Interpolated magnetic field grid in Tesla (T).
