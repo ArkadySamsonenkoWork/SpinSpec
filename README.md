@@ -25,13 +25,20 @@ Employ neural networks for spectra generation, prediction, and feature extractio
 Fit simulation parameters using state-of-the-art optimization libraries like Optuna and Nevergrad.
 
 ⚙️ Features
+
 🧠 General Capabilities
+
 -Construction of Hamiltonians for spin systems, including:
 Zeeman, Exchange, Hyperfine, Dipole–Dipole, and Zero-Field Splitting interactions
+
 -Support for common strain distributions
+
 -Simulation of disordered samples (powder, glassy states)
+
 -Simulation of oriented samples
+
 -Powerful spectra simulation and parameter search using Optuna / Nevergrad
+
 -Full support for:
 float32 / complex64 and float64 / complex128 data types
 CPU and GPU computation backends
@@ -39,14 +46,19 @@ CPU and GPU computation backends
 ⏱️ Time-Resolved Capabilities
 
 -Define arbitrary relaxation processes based on eigenvectors and eigenvalues
+
 -General framework for basis transformations
+
 -Support for temperature-dependent effects
+
 -Partial support for density matrix formalism
 
 🤖 Machine Learning Features
 
 -Extensive tools for spectra and dataset generation
+
 -Encoding methods for spin systems and spectra
+
 -Integrated training workflows for ML-based analysis and prediction
 
 📂 Examples
