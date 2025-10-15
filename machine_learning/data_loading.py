@@ -14,11 +14,12 @@ import spin_system
 import constants
 import particles
 import spectra_manager
+import tqdm
 
 from .data_generation import SpinSystemStructure
 
 from .transforms import ComponentsAnglesTransform, SpectraModifier,\
-    SpecTransformField, BroadTransform, SpecTransformSpecIntensity
+    SpecTransformField, BroadTransform, SpecTransformSpecIntensity, SpinTranform
 
 
 class SampleGraphData:
@@ -438,11 +439,11 @@ class EPRDataset(torch.utils.data.Dataset):
         self._spectra_modifier = SpectraModifier(rng_generator=rng_generator)
         self._spectra_g_transform = SpecTransformField()
         self._broad_transform = BroadTransform()
-        self._spectra_transform_intenisty = SpecTransformSpecIntensity()
+        self._spectra_transform_intensity = SpecTransformSpecIntensity()
 
     def _get_samples(self, _structure_info: list[dict[str, tp.Any]]):
         self.cache = []
-        for idx in range(len(_structure_info)):
+        for idx in tqdm.tqdm(range(len(_structure_info))):
             self.cache.append(self._load_sample(idx))
 
     def _scan_directory(self) -> list[tp.Dict[str, str]]:
@@ -497,8 +498,8 @@ class EPRDataset(torch.utils.data.Dataset):
             ham_strain
         )
         g_feature, freq_feature = self._spectra_g_transform(spec_out["field"], structure_out["freq"])
-        spec = self._spectra_transform_intenisty(spec_out["spec"])
-        spec_distorted = self._spectra_transform_intenisty(spec_out["spec_distorted"])
+        spec = self._spectra_transform_intensity(spec_out["spec"])
+        spec_distorted = self._spectra_transform_intensity(spec_out["spec_distorted"])
         broad_features = self._broad_transform(ham_strain, spec_out.pop("lorentz"), spec_out.pop("gauss"))
 
         return structure_out, broad_features, g_feature, freq_feature, spec, spec_distorted
@@ -510,6 +511,7 @@ class EPRDataset(torch.utils.data.Dataset):
     def _load_sample(self, idx: int) -> tp.Dict[str, tp.Any]:
         """Load a single sample"""
         structure_info = self._structure_info[idx]
+        samples_number = 0
 
         structure, generator_summary = self.file_parser.open_structure(
             structure_info["structure_path"]
@@ -523,61 +525,67 @@ class EPRDataset(torch.utils.data.Dataset):
         freq = []
         for mean_data in structure_info["mean_data"]:
             for sample_info in mean_data:
-                out = self.file_parser.to_graph_data(
-                    structure,
-                    generator_summary,
-                    sample_info["sample_path"],
-                    None,
-                    None
-                )
-                components = out.pop("components")
-                angles = out.pop("angles")
-                temperature = out.pop("temperatures")
+                try:
+                    out = self.file_parser.to_graph_data(
+                        structure,
+                        generator_summary,
+                        sample_info["sample_path"],
+                        None,
+                        None
+                    )
+                    components = out.pop("components")
+                    angles = out.pop("angles")
+                    temperature = out.pop("temperatures")
+                    spins = out.pop("spins")
+                    types = out["types"]
 
-                tensor_embeding = self.components_angles_transform(components, temperature, angles)
-                tensor_embedings.append(
-                    torch.flatten(tensor_embeding, start_dim=1, end_dim=-2)
-                )
+                    tensor_embeding = self.components_angles_transform(components, temperature, angles, types, spins)
+                    tensor_embedings.append(
+                        torch.flatten(tensor_embeding, start_dim=1, end_dim=-2)
+                    )
 
-                min_field_pos.append(
-                    torch.flatten(out.pop("min_field_pos"))
-                )
-                max_field_pos.append(
-                    torch.flatten(out.pop("max_field_pos"))
-                )
+                    min_field_pos.append(
+                        torch.flatten(out.pop("min_field_pos"))
+                    )
+                    max_field_pos.append(
+                        torch.flatten(out.pop("max_field_pos"))
+                    )
 
-                ham_strain.append(
-                    torch.flatten(out.pop("ham_strain"), end_dim=-2)
-                )
-                freq.append(
-                    torch.flatten(out.pop("freq").expand(ham_strain[0].shape[0]))
-                )
-                spec.append(
-                    torch.flatten(out.pop("spec"), end_dim=-2)
-                )
-        tensor_embedings = torch.cat(tensor_embedings, dim=-2)
-        spec = torch.cat(spec, dim=-2)
-        freq = torch.cat(freq, dim=-1)
-        max_field_pos = torch.cat(max_field_pos)
-        min_field_pos = torch.cat(min_field_pos)
-        ham_strain = torch.cat(ham_strain, dim=-2)
+                    ham_strain.append(
+                        torch.flatten(out.pop("ham_strain"), end_dim=-2)
+                    )
+                    freq.append(
+                        torch.flatten(out.pop("freq").expand(ham_strain[0].shape[0]))
+                    )
+                    spec.append(
+                        torch.flatten(out.pop("spec"), end_dim=-2)
+                    )
+                except FileNotFoundError:
+                    continue
+        if tensor_embedings:
+            tensor_embedings = torch.cat(tensor_embedings, dim=-2)
+            spec = torch.cat(spec, dim=-2)
+            freq = torch.cat(freq, dim=-1)
+            max_field_pos = torch.cat(max_field_pos)
+            min_field_pos = torch.cat(min_field_pos)
+            ham_strain = torch.cat(ham_strain, dim=-2)
 
-        source = out["source"]
-        destinations = out["destinations"]
+            source = out["source"]
+            destinations = out["destinations"]
 
-        types = out["types"]
+            types = out["types"]
 
-        structure_out["types"] = types
-        structure_out["destinations"] = destinations
-        structure_out["source"] = source
+            structure_out["types"] = types
+            structure_out["destinations"] = destinations
+            structure_out["source"] = source
 
-        structure_out["tensor_embedings"] = tensor_embedings
-        structure_out["spec"] = spec
-        structure_out["freq"] = freq
+            structure_out["tensor_embedings"] = tensor_embedings
+            structure_out["spec"] = spec
+            structure_out["freq"] = freq
 
-        structure_out["max_field_pos"] = max_field_pos
-        structure_out["min_field_pos"] = min_field_pos
-        structure_out["num_nudes"] = structure_info["num_nodes"]
-        structure_out["ham_strain"] = ham_strain
+            structure_out["max_field_pos"] = max_field_pos
+            structure_out["min_field_pos"] = min_field_pos
+            structure_out["num_nudes"] = structure_info["num_nodes"]
+            structure_out["ham_strain"] = ham_strain
 
-        return structure_out
+            return structure_out

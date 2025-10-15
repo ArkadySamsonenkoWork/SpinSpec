@@ -42,15 +42,36 @@ class AnglesTransform:
         return angles
 
 
+class SpinTranform:
+    def __init__(self, shift: float = 1.0, std: float = 2.0):
+        self.shift = torch.tensor(shift)
+        self.std = torch.tensor(std)
+
+    def __call__(self, spins: torch.Tensor, types: torch.Tensor):
+        spins_feature = torch.zeros_like(types, dtype=torch.float32)
+
+        types_batched = types[(slice(None),) + (0,) * (types.ndim - 1)]
+        mask_particles = (types_batched != 2)
+        spins_feature[mask_particles, ...] = spins
+
+        spins_feature = (spins_feature - self.shift) / self.std
+        return spins_feature
+
+
 class ComponentsAnglesTransform:
     def __init__(self):
         self.angles_transform = AnglesTransform()
         self.components_transform = ComponentsTransform()
+        self.spin_transform = SpinTranform()
 
-    def __call__(self, components: torch.Tensor, temperature: torch.Tensor, angles: torch.Tensor):
+    def __call__(
+            self, components: torch.Tensor, temperature: torch.Tensor,
+            angles: torch.Tensor, types: torch.Tensor, spins: torch.Tensor
+    ):
         components_feat_freq, components_feat_temp = self.components_transform(components, temperature)
         angles = self.angles_transform(angles)
-        return torch.cat((components_feat_freq, components_feat_temp, angles), dim=-1)
+        spins = self.spin_transform(spins, types).unsqueeze(-1)
+        return torch.cat((components_feat_freq, components_feat_temp, angles, spins), dim=-1)
 
 
 class SpecTransformField:
@@ -74,15 +95,6 @@ class SpecTransformSpecIntensity:
         spec = spec / torch.max(spec, dim=-1, keepdim=True)[0]
         return spec
 
-
-class SpinTranform:
-    def __init__(self, shift: float = 1.0, std: float = 2.0):
-        self.shift = torch.tensor(shift)
-        self.std = torch.tensor(std)
-
-    def __call__(self, spins: torch.Tensor, types: torch.Tensor):
-        spins = (spins - self.shift) / self.std
-        return spins
 
 
 class BroadTransform:
