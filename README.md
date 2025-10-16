@@ -1,10 +1,10 @@
-MarZ
+MarS
 
 A toolkit for researchers to simulate, analyze, and explore EPR systems efficiently.
 
 🚀 Overview
 
-MarZ is a comprehensive toolkit designed for modeling, simulation, and analysis of Electron Paramagnetic Resonance (EPR) systems.
+MarS is a comprehensive toolkit designed for modeling, simulation, and analysis of Electron Paramagnetic Resonance (EPR) systems.
 It enables researchers to efficiently study quantum spin dynamics, generate spectra, and integrate machine learning methods into EPR analysis.
 
 Core Capabilities
