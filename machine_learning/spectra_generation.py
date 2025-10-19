@@ -53,27 +53,30 @@ class GenerationIntegrationProcessorPowder(IntegrationProcessorPowder):
                  device: torch.device = torch.device("cpu"),
                  dtype: torch.dtype = torch.float32,
                  num_points: int = 4_000,
-                 spectral_width_part: float = 0.5,
-                 min_spectral_width: float = 0.01,
+                 spectral_width_part: float = 0.6,
+                 width_factor: float = 3.0,
                  ):
         super().__init__(mesh, spectra_integrator, harmonic, post_spectra_processor,
                          chunk_size=chunk_size, device=device, dtype=dtype)
         self.register_buffer("num_points", torch.tensor(num_points, device=device))
         self.register_buffer("spectral_width_part", torch.tensor(spectral_width_part, device=device, dtype=dtype))
-        self.register_buffer("min_spectral_width", torch.tensor(min_spectral_width, device=device, dtype=dtype))
+        self.register_buffer("width_factor", torch.tensor(width_factor, device=device, dtype=dtype))
 
         self.to(device)
 
-    def _get_new_field(self, res_fields: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _get_new_field(self, res_fields: torch.Tensor, width: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         dims = res_fields.dim()
         batch_dims = tuple(range(max(dims-2, 0), dims))
 
-        min_pos_batch = torch.amax(res_fields, dim=batch_dims)
+        min_pos_batch = torch.amin(res_fields, dim=batch_dims)
         max_pos_batch = torch.amax(res_fields, dim=batch_dims)
+        mean_pos = (max_pos_batch + min_pos_batch) / 2
 
-        nature_spectra_width = torch.max(max_pos_batch - min_pos_batch, self.min_spectral_width)
-        min_pos_batch = min_pos_batch * (1.0 - self.spectral_width_part * nature_spectra_width)
-        max_pos_batch = max_pos_batch * (1.0 + self.spectral_width_part * nature_spectra_width)
+        max_orient_width = torch.amax(width, dim=-1)
+        nature_spectra_width = torch.max(max_pos_batch - min_pos_batch, max_orient_width * self.width_factor)
+
+        min_pos_batch = mean_pos - nature_spectra_width / (2 * self.spectral_width_part)
+        max_pos_batch = mean_pos + nature_spectra_width / (2 * self.spectral_width_part)
 
         steps = torch.linspace(0, 1, self.num_points, device=res_fields.device, dtype=res_fields.dtype)
         fields = steps * (max_pos_batch - min_pos_batch).unsqueeze(-1) + min_pos_batch.unsqueeze(-1)
@@ -93,8 +96,8 @@ class GenerationIntegrationProcessorPowder(IntegrationProcessorPowder):
                 res_fields, intensities, width
             )
         )
+        fields, min_pos_batch, max_pos_batch = self._get_new_field(res_fields, width)
         res_fields, width, intensities, areas = self._final_mask(res_fields, width, intensities, areas)
-        fields, min_pos_batch, max_pos_batch = self._get_new_field(res_fields)
         spec = self.spectra_integrator(
             res_fields, width, intensities, areas, fields
         )
@@ -282,3 +285,53 @@ class GenerationCreator(StationarySpectraCreator):
         width = width.expand(target_shape)
         return res_fields, intensities, width, *extras
 
+    def forward(self,
+                 sample: spin_system.MultiOrientedSample,
+                 fields: torch.Tensor, time: tp.Optional[torch.Tensor] = None, **kwargs):
+        """
+        :param sample: MultiOrientedSample object
+        :param fields: The magnetic fields in Tesla units
+        :param time: It is used only for time resolved spectra
+        :param kwargs:
+        :return:
+        """
+        B_low = fields[..., 0]
+        B_high = fields[..., -1]
+        B_low = B_low.unsqueeze(-1).repeat(*([1] * B_low.ndim), *self.mesh_size)
+        B_high = B_high.unsqueeze(-1).repeat(*([1] * B_high.ndim), *self.mesh_size)
+
+        F, Gx, Gy, Gz = sample.get_hamiltonian_terms()
+
+        (vectors_u, vectors_v), (valid_lvl_down, valid_lvl_up), res_fields, \
+            resonance_energies, full_eigen_vectors = self._resfield_method(sample, B_low, B_high, F, Gz)
+
+
+        if (vectors_u.shape[-2] == 0):
+            temperature_shape = self.intensity_calculator.temperature.shape
+            ham_shape = sample.base_ham_strain.shape
+            width_size = ham_shape[0]
+            temp_size = temperature_shape[0]
+            common_shape = resonance_energies.shape[:-3]
+            target_shape = [width_size, temp_size, *common_shape]
+            
+            min_pos_batch = fields[..., 0].expand(target_shape)
+            max_pos_batch = fields[..., 1].expand(target_shape)
+            spec = torch.zeros((*target_shape, self.spectra_processor.num_points), dtype=min_pos_batch.dtype,
+                               device=min_pos_batch.device)
+
+            return spec, (min_pos_batch, max_pos_batch)
+        res_fields, intensities, width, *extras = self.compute_parameters(sample, F, Gx, Gy, Gz,
+                                              vectors_u, vectors_v,
+                                              valid_lvl_down, valid_lvl_up,
+                                              res_fields,
+                                              resonance_energies,
+                                              full_eigen_vectors)
+
+        res_fields, intensities, width = self._postcompute_batch_data(
+            res_fields, intensities, width, F, Gx, Gy, Gz, time, *extras, **kwargs
+        )
+
+        gauss = sample.gauss
+        lorentz = sample.lorentz
+
+        return self._finalize(res_fields, intensities, width, gauss, lorentz, fields)
