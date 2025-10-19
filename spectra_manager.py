@@ -824,7 +824,8 @@ class BaseSpectraCreator(nn.Module, ABC):
 
         (vectors_u, vectors_v), (valid_lvl_down, valid_lvl_up), res_fields, \
             resonance_energies, full_eigen_vectors = self._resfield_method(sample, B_low, B_high, F, Gz)
-
+        if (vectors_u.shape[-2] == 0):
+            return torch.zeros_like(fields)
         res_fields, intensities, width, *extras = self.compute_parameters(sample, F, Gx, Gy, Gz,
                                               vectors_u, vectors_v,
                                               valid_lvl_down, valid_lvl_up,
