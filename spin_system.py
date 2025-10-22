@@ -372,17 +372,7 @@ class Interaction(BaseInteraction):
         self.register_buffer("_rot_matrix", _rot_matrix)
 
     def euler_to_rotmat(self, euler_angles: torch.Tensor):
-        alpha, beta, gamma = euler_angles[..., 0], euler_angles[..., 1], euler_angles[..., 2]
-
-        ca, cb, cg = torch.cos(alpha), torch.cos(beta), torch.cos(gamma)
-        sa, sb, sg = torch.sin(alpha), torch.sin(beta), torch.sin(gamma)
-
-        R = torch.stack([
-            torch.stack([ca * cb, ca * sb * sg - sa * cg, ca * sb * cg + sa * sg], dim=-1),
-            torch.stack([sa * cb, sa * sb * sg + ca * cg, sa * sb * cg - ca * sg], dim=-1),
-            torch.stack([-sb, cb * sg, cb * cg], dim=-1)
-        ], dim=-2)
-        return R.to(torch.complex64)
+        return utils.euler_angles_to_matrix(euler_angles).to(torch.complex64)
 
     def _tensor(self):
         """
