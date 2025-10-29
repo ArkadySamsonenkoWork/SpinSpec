@@ -43,6 +43,8 @@ class CrystalMesh(BaseMesh):
         :return: torch.Tensor of shape (..., 3, 3) containing rotation matrices
         """
         super().__init__(device=device)
+        if euler_angles.dim() == 1:
+            euler_angles = euler_angles.unsqueeze(0)
         self.register_buffer("_rotation_matrices",
                              utils.euler_angles_to_matrix(euler_angles.to(device=device, dtype=dtype), convention)
                              )
