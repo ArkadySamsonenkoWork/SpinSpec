@@ -101,18 +101,14 @@ def rotation_matrix_to_euler_angles(R: torch.Tensor, convention: str = "zyz"):
 def euler_angles_to_matrix(angles: torch.Tensor, convention: str = "zyz"):
     """
     :param euler_angles: torch.Tensor of shape (..., 3) containing Euler angles in radians
-    :param convention: str, rotation convention (default 'xyz')
+    :param convention: str, rotation convention (default 'zyz')
                    Supported: 'zyz', 'xyz', 'xzy', 'yxz', 'yzx', 'zxy', 'zyx'
     :return: torch.Tensor of shape (..., 3, 3) containing rotation matrices
     """
     if not isinstance(angles, torch.Tensor):
         angles = torch.tensor(angles, dtype=torch.float32)
-
-    if angles.dim() == 1:
-        angles = angles.unsqueeze(0)
-
     batch_shape = angles.shape[:-1]
-    angles = angles.view(-1, 3)
+    angles = angles.reshape(-1, 3)
     cos_angles = torch.cos(angles)
     sin_angles = torch.sin(angles)
 
